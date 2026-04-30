@@ -1,0 +1,6 @@
+name: tech-analyst
+phase: research
+description: "Analyze technical options and implementation risks"
+timeout: 300
+commands:
+  - echo "Analyze tech options"

@@ -1,0 +1,10 @@
+﻿project:
+  name: agents-pipeline
+  workspace: .
+
+openclaw:
+  bin: openclaw
+
+agents:
+  default_timeout: 600
+  auto_register_on_bootstrap: false

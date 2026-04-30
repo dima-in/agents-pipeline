@@ -1,0 +1,60 @@
+﻿workflow:
+  mode: interactive
+  auto_continue_delay: 3
+
+project:
+  name: agents-pipeline
+  workspace: .
+  default_branch: main
+
+paths:
+  agents_dir: .openclaw/agents
+  logs_dir: .openclaw/logs
+  feedback_dir: .openclaw/feedback
+
+phases:
+  research:
+    name: "Research"
+    requires_approval: true
+    agents:
+      - name: competitor-analyst
+        description: "Analyze competitors"
+        timeout: 300
+      - name: market-analyst
+        description: "Analyze market and trends"
+        timeout: 300
+      - name: tech-analyst
+        description: "Review technical options"
+        timeout: 300
+      - name: product-manager
+        description: "Summarize and prepare requirements"
+        timeout: 600
+
+  implementation:
+    name: "Implementation"
+    agents:
+      - name: architect
+        description: "Prepare technical plan"
+        timeout: 600
+      - name: developer
+        description: "Implement the task"
+        timeout: 1800
+        max_retries: 3
+      - name: qa
+        description: "Run checks and report regressions"
+        timeout: 600
+      - name: template-validator
+        description: "Validate output against template"
+        timeout: 300
+
+git:
+  enabled: true
+  strategy: feature-branch
+  branch_prefix: feature/
+  auto_rollback: true
+
+logging:
+  level: INFO
+  console: true
+  file: true
+  json: true

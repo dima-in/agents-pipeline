@@ -1,0 +1,6 @@
+name: template-validator
+phase: implementation
+description: "Validate structure against the target template"
+timeout: 300
+commands:
+  - echo "Validate template"

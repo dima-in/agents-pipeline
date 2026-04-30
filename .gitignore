@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.log
+.pytest_cache/
+.coverage
+htmlcov/
+venv/
+env/
+.env
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+.openclaw/logs/
+.openclaw/feedback/

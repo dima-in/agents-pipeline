@@ -1,0 +1,6 @@
+name: competitor-analyst
+phase: research
+description: "Analyze competitors and comparable workflows"
+timeout: 300
+commands:
+  - echo "Analyze competitors"

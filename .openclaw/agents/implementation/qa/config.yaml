@@ -1,0 +1,6 @@
+name: qa
+phase: implementation
+description: "Run checks, report failures, and gate merges"
+timeout: 600
+commands:
+  - echo "Run QA checks"

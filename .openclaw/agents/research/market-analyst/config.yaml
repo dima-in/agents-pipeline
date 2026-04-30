@@ -1,0 +1,6 @@
+name: market-analyst
+phase: research
+description: "Analyze demand, market fit, and messaging"
+timeout: 300
+commands:
+  - echo "Analyze market"

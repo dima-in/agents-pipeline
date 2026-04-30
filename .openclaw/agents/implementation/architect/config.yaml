@@ -1,0 +1,6 @@
+name: architect
+phase: implementation
+description: "Prepare the architecture and task breakdown"
+timeout: 600
+commands:
+  - echo "Plan architecture"

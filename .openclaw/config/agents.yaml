@@ -1,0 +1,33 @@
+﻿agents:
+  - name: competitor-analyst
+    phase: research
+    description: Analyze competitors and compare workflows
+    timeout: 300
+  - name: market-analyst
+    phase: research
+    description: Analyze market demand and trends
+    timeout: 300
+  - name: tech-analyst
+    phase: research
+    description: Compare technical approaches and risks
+    timeout: 300
+  - name: product-manager
+    phase: research
+    description: Consolidate findings into a product brief
+    timeout: 600
+  - name: architect
+    phase: implementation
+    description: Prepare the technical plan and delivery steps
+    timeout: 600
+  - name: developer
+    phase: implementation
+    description: Implement the requested changes
+    timeout: 1800
+  - name: qa
+    phase: implementation
+    description: Run validation and produce retry feedback
+    timeout: 600
+  - name: template-validator
+    phase: implementation
+    description: Check structure against the target template
+    timeout: 300

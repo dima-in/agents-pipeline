@@ -1,0 +1,10 @@
+version: "3.8"
+
+services:
+  neuralhub:
+    build: .
+    container_name: neuralhub
+    working_dir: /app
+    volumes:
+      - .:/app
+    command: python start.py --mode auto

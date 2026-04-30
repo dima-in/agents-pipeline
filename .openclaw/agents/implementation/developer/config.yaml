@@ -1,0 +1,7 @@
+name: developer
+phase: implementation
+description: "Implement the requested change"
+timeout: 1800
+max_retries: 3
+commands:
+  - echo "Implement change"

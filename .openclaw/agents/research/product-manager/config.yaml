@@ -1,0 +1,6 @@
+name: product-manager
+phase: research
+description: "Consolidate research into approved requirements"
+timeout: 600
+commands:
+  - echo "Summarize research"
