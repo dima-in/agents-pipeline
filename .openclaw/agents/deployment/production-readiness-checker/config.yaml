@@ -1,0 +1,6 @@
+name: production-readiness-checker
+phase: deployment
+description: "Audit production readiness, release blockers, and operational gaps"
+timeout: 600
+commands:
+  - echo "Check production readiness"

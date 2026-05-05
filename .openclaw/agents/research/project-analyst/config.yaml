@@ -1,0 +1,6 @@
+name: project-analyst
+phase: research
+description: "Analyze the current repository, active constraints, and the most important next questions"
+timeout: 300
+commands:
+  - echo "Analyze local project context"

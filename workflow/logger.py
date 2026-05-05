@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import logging
@@ -33,7 +33,7 @@ class WorkflowLogger:
         self.logger.propagate = False
 
     def phase_start(self, phase_name: str, description: str = "") -> None:
-        self._console(Fore.CYAN + Style.BRIGHT, f"== Phase: {phase_name} ==")
+        self._console(Fore.CYAN + Style.BRIGHT, f"== Фаза: {phase_name} ==")
         if description:
             self._console(Fore.CYAN, description)
         self.logger.info("PHASE_START: %s", phase_name)
@@ -41,14 +41,15 @@ class WorkflowLogger:
 
     def phase_end(self, phase_name: str, status: str = "success") -> None:
         color = Fore.GREEN if status == "success" else Fore.RED
-        self._console(color, f"== Phase done: {phase_name} [{status}] ==")
+        status_label = self._translate_status(status)
+        self._console(color, f"== Фаза завершена: {phase_name} [{status_label}] ==")
         self.logger.info("PHASE_END: %s - %s", phase_name, status)
         self._log_json("phase_end", {"phase": phase_name, "status": status})
 
     def agent_start(self, agent_name: str, task: str = "") -> None:
-        self._console(Fore.YELLOW + Style.BRIGHT, f"Agent start: {agent_name}")
+        self._console(Fore.YELLOW + Style.BRIGHT, f"Агент запущен: {agent_name}")
         if task:
-            self._console(Fore.YELLOW, f"  Task: {task}")
+            self._console(Fore.YELLOW, f"  Задача: {task}")
         self.logger.info("AGENT_START: %s - %s", agent_name, task)
         self._log_json("agent_start", {"agent": agent_name, "task": task})
 
@@ -58,9 +59,10 @@ class WorkflowLogger:
 
     def agent_end(self, agent_name: str, status: str = "success", result: str = "") -> None:
         color = Fore.GREEN if status == "success" else Fore.RED if status == "failed" else Fore.YELLOW
-        self._console(color, f"Agent end: {agent_name} [{status}]")
+        status_label = self._translate_status(status)
+        self._console(color, f"Агент завершен: {agent_name} [{status_label}]")
         if result:
-            self._console(color, f"  Result: {result}")
+            self._console(color, f"  Результат: {result}")
         self.logger.info("AGENT_END: %s - %s", agent_name, status)
         self._log_json("agent_end", {"agent": agent_name, "status": status, "result": result})
 
@@ -92,7 +94,7 @@ class WorkflowLogger:
         summary.write_text(
             "\n".join(
                 [
-                    "agents-pipeline workflow summary",
+                    "Сводка workflow agents-pipeline",
                     f"phases={len(phases)}",
                     f"agents={len(agents)}",
                     f"errors={len(errors)}",
@@ -116,6 +118,15 @@ class WorkflowLogger:
         )
 
     @staticmethod
+    def _translate_status(status: str) -> str:
+        mapping = {
+            "success": "успех",
+            "failed": "ошибка",
+            "rejected": "отклонено",
+            "timeout": "таймаут",
+        }
+        return mapping.get(status, status)
+
+    @staticmethod
     def _console(color: str, message: str) -> None:
         print(color + message + Style.RESET_ALL)
-

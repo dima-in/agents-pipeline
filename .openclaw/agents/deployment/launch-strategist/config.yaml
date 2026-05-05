@@ -1,0 +1,6 @@
+name: launch-strategist
+phase: deployment
+description: "Prepare launch plan, channels, messaging, and rollout checklist"
+timeout: 600
+commands:
+  - echo "Prepare launch strategy"

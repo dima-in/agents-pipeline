@@ -1,0 +1,3191 @@
+NeuralHub
+
+Новый чат
+хочу настроить такую систему разработки и доработк…
+
+30 апр.
+
+как тебе этот вариант настройки?
+
+26 апр.
+
+как посмотреть счетчик копий epson 15160, найди в …
+
+26 апр.
+
+Epson EcoTank M15140 МФУ A3 монохромное, печать/ко…
+
+25 апр.
+
+📎 Снимок экрана 2025-07-11 140607.png
+
+23 апр.
+
+я имл в виду например как openclaw, установил его …
+
+23 апр.
+
+📎 требования стат расчет ветровые нагрузки.pdf
+
+21 апр.
+
+человек захотел в 45 лет выучит ьпрограммирование …
+
+21 апр.
+
+В целом для организма в 43 года достаточно обычной…
+
+20 апр.
+
+как разработать cli самому для моделей через api?
+
+19 апр.
+
+как разработать свой cli для любой модели
+
+19 апр.
+
+Дашборд
+Админ
+
+Баланс
+$1.66
+A
+admin@mail.ru
+
+pro план
+
+
+
+
+Claude Sonnet
+· Pro
+онлайн
+Вы
+10:07
+хочу настроить такую систему разработки и доработки
+openclaw agents add architect --agent-dir .openclaw\agents\architect --workspace .
+openclaw agents add developer --agent-dir .openclaw\agents\developer --workspace .
+openclaw agents add qa --agent-dir .openclaw\agents\qa --workspace .
+надо вводить автоматику,  "дубинка" для агентов это git? Например developer изменил чтото лишнее или сломал, тогда QA(расшифруй) берет и откатывает к исходному состоянию и запускает заново... но он должен чтото сделать, чтобы это не повторилось, добавить к заданию свои замечания? и должна быть какая то общая сверка с итоговым шаблоном. В идеале тоже несколько агентов должны им заниматся, один сравнивать с лучшими конкурентами, другой смотреть маркетинг, третий еще чтонибудь и четвертый это суммирует и согласовывает со мной. потом из этого архитектор формирует новую задачу и дальше по списку начинается реализация. как то так?
+
+
+
+NeuralHub
+10:07
+· claude-sonnet-4-5 · $0.02244
+Система многоагентной разработки с контролем качества
+Отличная идея! Давайте структурируем вашу систему.
+
+QA расшифровка
+QA = Quality Assurance (Обеспечение качества)
+
+Предлагаемая архитектура
+1. Цикл разработки (Development Loop)
+code
+Копировать
+Architect → Developer → QA → [успех/откат]
+Автоматика через Git:
+
+Каждый агент работает в своей ветке
+QA проверяет изменения и либо мерджит, либо откатывает
+При откате QA добавляет комментарии в задачу
+Для QA агента:
+
+yaml
+Копировать
+# .openclaw/agents/qa/config.yaml
+git_control:
+  - run_tests: true
+  - rollback_on_fail: true
+  - add_feedback_to_task: true
+  - create_issue_report: true
+2. Исследовательский слой (Research Layer)
+code
+Копировать
+openclaw agents add competitor-analyst --agent-dir .openclaw\agents\research\competitor
+openclaw agents add market-analyst --agent-dir .openclaw\agents\research\market
+openclaw agents add tech-analyst --agent-dir .openclaw\agents\research\tech
+openclaw agents add product-manager --agent-dir .openclaw\agents\research\pm
+Workflow:
+
+code
+Копировать
+competitor-analyst ─┐
+market-analyst     ─┤
+tech-analyst       ─┼→ product-manager → ВЫ (утверждение) → architect
+3. Полная схема взаимодействия
+code
+Копировать
+┌─────────────────────────────────────────┐
+│   ИССЛЕДОВАНИЕ (Research Phase)         │
+├─────────────────────────────────────────┤
+│ 1. Competitor Analyst (анализ конкурентов)
+│ 2. Market Analyst (маркетинг/тренды)    │
+│ 3. Tech Analyst (технологии/инновации)  │
+│         ↓                                │
+│ 4. Product Manager (суммирует)          │
+│         ↓                                │
+│ 5. ЧЕЛОВЕК (вы) - финальное решение     │
+└─────────────────────────────────────────┘
+              ↓
+┌─────────────────────────────────────────┐
+│   РЕАЛИЗАЦИЯ (Implementation Phase)     │
+├─────────────────────────────────────────┤
+│ 6. Architect (техническое задание)      │
+│         ↓                                │
+│ 7. Developer (код)                       │
+│         ↓                                │
+│ 8. QA (проверка + git control)          │
+│         ↓                                │
+│    [PASS] → merge                        │
+│    [FAIL] → rollback + feedback → 7      │
+└─────────────────────────────────────────┘
+4. Механизм обучения на ошибках
+QA должен:
+
+Откатить через git reset --hard или git revert
+Создать файл с фидбеком: .openclaw/feedback/task_{id}.md
+Обновить задачу Developer с конкретными требованиями
+Добавить проверку в тесты, чтобы ошибка не повторилась
+Пример автоматики:
+
+python
+Копировать
+# Псевдокод для QA агента
+if tests_failed:
+    git.rollback()
+    feedback = analyze_failure()
+    task.add_requirements(feedback)
+    tests.add_regression_test()
+    notify_developer(task_id, feedback)
+5. Шаблон для сверки (Template Validation)
+Создайте отдельного агента:
+
+code
+Копировать
+
+
+
+
+
+NeuralHub
+10:07
+· claude-sonnet-4-5 · $0.02454
+code
+Копировать
+openclaw agents add template-validator --agent-dir .openclaw\agents\template-validator
+Его задачи:
+
+Сравнивать текущее состояние с эталонным шаблоном
+Проверять соответствие архитектурным принципам
+Валидировать структуру проекта
+6. Практическая реализация
+Создайте главный конфиг:
+
+yaml
+Копировать
+# .openclaw/workflow.yaml
+phases:
+  research:
+    agents:
+      - competitor-analyst
+      - market-analyst  
+      - tech-analyst
+    coordinator: product-manager
+    approval_required: true  # Ваше утверждение
+    
+  implementation:
+    agents:
+      - architect
+      - developer
+      - qa
+      - template-validator
+    git_strategy: feature-branch
+    max_retry: 3
+    
+git_rules:
+  developer_branch: "feature/{task_id}"
+  qa_checks: ["tests", "linting", "template"]
+  rollback_strategy: "hard-reset"
+  feedback_storage: ".openclaw/feedback/"
+7. Скрипт запуска полного цикла
+bash
+Копировать
+# start-cycle.sh
+echo "=== ФАЗА ИССЛЕДОВАНИЯ ==="
+openclaw run competitor-analyst
+openclaw run market-analyst
+openclaw run tech-analyst
+openclaw run product-manager
+
+echo "Ожидание вашего утверждения..."
+read -p "Утвердить план? (y/n): " approval
+
+if [ "$approval" = "y" ]; then
+  echo "=== ФАЗА РЕАЛИЗАЦИИ ==="
+  openclaw run architect
+  
+  for i in {1..3}; do
+    git checkout -b feature/task_$i
+    openclaw run developer
+    openclaw run qa
+    openclaw run template-validator
+    
+    if [ $? -eq 0 ]; then
+      git checkout main
+      git merge feature/task_$i
+      break
+    else
+      echo "Попытка $i не удалась, повтор..."
+      git checkout main
+    fi
+  done
+fi
+8. Ключевые моменты
+✅ Git как "дубинка" - правильный подход
+✅ QA добавляет фидбек - предотвращает повторение ошибок
+✅ Несколько аналитиков - многосторонний взгляд
+✅ Вы как финальный утверждающий - контроль стратегии
+✅ Template-validator - соответствие стандартам
+
+9. Защита от зацикливания
+yaml
+Копировать
+# В конфиге QA агента
+safety:
+  max_rollbacks: 3
+  escalate_to_human: true  # После 3 неудач - вам на решение
+  save_debug_info: true
+  notify_architect: true   # Возможно задача некорректна
+Итого: Получается самообучающаяся система с человеком в роли стратега, а агенты - исполнители с автоматическим контролем качества и защитой от деградации через Git.
+
+Хотите детализировать какую-то конкретную часть?
+
+
+
+
+
+
+Вы
+10:27
+надо сделать эту систему. должно быть логирование и наверное печать в консоль, чтобы я видел какие этапы запускаются, можно в каждый этап добавить ручное или автопродолжение
+
+
+
+NeuralHub
+10:27
+· claude-sonnet-4-5 · $0.03222
+Реализация системы многоагентной разработки с логированием
+Создам полноценную систему с визуализацией, логированием и контролем выполнения.
+
+Структура проекта
+code
+Копировать
+project/
+├── .openclaw/
+│   ├── agents/
+│   │   ├── research/
+│   │   │   ├── competitor/
+│   │   │   ├── market/
+│   │   │   ├── tech/
+│   │   │   └── pm/
+│   │   └── implementation/
+│   │       ├── architect/
+│   │       ├── developer/
+│   │       ├── qa/
+│   │       └── validator/
+│   ├── logs/
+│   ├── feedback/
+│   └── config/
+├── workflow/
+│   ├── orchestrator.py
+│   ├── logger.py
+│   └── config.yaml
+└── start.py
+1. Система логирования
+python
+Копировать
+# workflow/logger.py
+import logging
+from datetime import datetime
+from pathlib import Path
+from colorama import Fore, Back, Style, init
+import json
+
+init(autoreset=True)
+
+class WorkflowLogger:
+    def __init__(self, log_dir=".openclaw/logs"):
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Создаем уникальный файл лога для сессии
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_file = self.log_dir / f"workflow_{timestamp}.log"
+        self.json_log = self.log_dir / f"workflow_{timestamp}.json"
+        
+        # Настройка логгера
+        self.logger = logging.getLogger("WorkflowOrchestrator")
+        self.logger.setLevel(logging.DEBUG)
+        
+        # Файловый handler
+        fh = logging.FileHandler(self.log_file, encoding='utf-8')
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter(
+            '%(asctime)s | %(levelname)-8s | %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        ))
+        self.logger.addHandler(fh)
+        
+        # JSON лог для структурированных данных
+        self.json_events = []
+    
+    def _print_box(self, text, color=Fore.WHITE, style="="):
+        """Красивая рамка вокруг текста"""
+        width = len(text) + 4
+        print(color + style * width)
+        print(f"{style} {text} {style}")
+        print(style * width + Style.RESET_ALL)
+    
+    def phase_start(self, phase_name, description=""):
+        """Начало фазы"""
+        self._print_box(f"🚀 ФАЗА: {phase_name}", Fore.CYAN + Style.BRIGHT, "═")
+        if description:
+            print(Fore.CYAN + f"   {description}\n")
+        
+        self.logger.info(f"PHASE_START: {phase_name}")
+        self._log_json("phase_start", {"phase": phase_name, "description": description})
+    
+    def phase_end(self, phase_name, status="success"):
+        """Конец фазы"""
+        color = Fore.GREEN if status == "success" else Fore.RED
+        icon = "✅" if status == "success" else "❌"
+        self._print_box(f"{icon} ЗАВЕРШЕНО: {phase_name}", color, "═")
+        print()
+        
+        self.logger.info(f"PHASE_END: {phase_name} - {status}")
+        self._log_json("phase_end", {"phase": phase_name, "status": status})
+    
+    def agent_start(self, agent_name, task=""):
+        
+
+
+
+
+
+NeuralHub
+10:29
+· claude-sonnet-4-5 · $0.03752
+python
+Копировать
+    def agent_start(self, agent_name, task=""):
+        """Запуск агента"""
+        print(Fore.YELLOW + Style.BRIGHT + f"\n┌─ 🤖 Агент: {agent_name}")
+        if task:
+            print(Fore.YELLOW + f"│  Задача: {task}")
+        print(Fore.YELLOW + "│  Статус: Запущен..." + Style.RESET_ALL)
+        
+        self.logger.info(f"AGENT_START: {agent_name} - {task}")
+        self._log_json("agent_start", {"agent": agent_name, "task": task})
+    
+    def agent_progress(self, agent_name, message):
+        """Прогресс работы агента"""
+        print(Fore.YELLOW + f"│  ⚙️  {message}")
+        self.logger.debug(f"AGENT_PROGRESS: {agent_name} - {message}")
+    
+    def agent_end(self, agent_name, status="success", result=""):
+        """Завершение работы агента"""
+        if status == "success":
+            icon = "✅"
+            color = Fore.GREEN
+        elif status == "failed":
+            icon = "❌"
+            color = Fore.RED
+        else:
+            icon = "⚠️"
+            color = Fore.YELLOW
+        
+        print(color + f"└─ {icon} {agent_name}: {status}")
+        if result:
+            print(color + f"   Результат: {result}")
+        print(Style.RESET_ALL)
+        
+        self.logger.info(f"AGENT_END: {agent_name} - {status}")
+        self._log_json("agent_end", {"agent": agent_name, "status": status, "result": result})
+    
+    def git_operation(self, operation, details=""):
+        """Git операция"""
+        print(Fore.MAGENTA + f"   🔀 Git: {operation}")
+        if details:
+            print(Fore.MAGENTA + f"      {details}" + Style.RESET_ALL)
+        
+        self.logger.info(f"GIT: {operation} - {details}")
+        self._log_json("git_operation", {"operation": operation, "details": details})
+    
+    def user_input_required(self, prompt):
+        """Требуется ввод пользователя"""
+        print(Fore.CYAN + Back.BLUE + Style.BRIGHT + f"\n⏸️  {prompt}" + Style.RESET_ALL)
+        self.logger.info(f"USER_INPUT: {prompt}")
+    
+    def error(self, message, details=""):
+        """Ошибка"""
+        print(Fore.RED + Style.BRIGHT + f"\n❌ ОШИБКА: {message}")
+        if details:
+            print(Fore.RED + f"   Детали: {details}" + Style.RESET_ALL)
+        
+        self.logger.error(f"ERROR: {message} - {details}")
+        self._log_json("error", {"message": message, "details": details})
+    
+    def warning(self, message):
+        """Предупреждение"""
+        print(Fore.YELLOW + f"⚠️  ВНИМАНИЕ: {message}" + Style.RESET_ALL)
+        self.logger.warning(f"WARNING: {message}")
+    
+    def info(self, message):
+        """Информационное сообщение"""
+        print(Fore.WHITE + f"ℹ️  {message}" + Style.RESET_ALL)
+        self.logger.info(f"INFO: {message}")
+    
+    def success(self, message):
+        """Успешное выполнение"""
+        print(Fore.GREEN + Style.BRIGHT + f"✅ {message}" + Style.RESET_ALL)
+        self.logger.info(f"SUCCESS: {message}")
+    
+    def _log_json(self, event_type, data):
+        """Логирование в
+
+
+
+
+Вы
+10:29
+продолжай
+
+
+
+NeuralHub
+10:32
+· claude-sonnet-4-5 · $0.04251
+python
+Копировать
+    def _log_json(self, event_type, data):
+        """Логирование в JSON формат"""
+        event = {
+            "timestamp": datetime.now().isoformat(),
+            "type": event_type,
+            "data": data
+        }
+        self.json_events.append(event)
+        
+        # Сохраняем в файл
+        with open(self.json_log, 'w', encoding='utf-8') as f:
+            json.dump(self.json_events, f, indent=2, ensure_ascii=False)
+    
+    def save_summary(self):
+        """Сохранение итогового отчета"""
+        summary_file = self.log_dir / f"summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        
+        with open(summary_file, 'w', encoding='utf-8') as f:
+            f.write("=" * 60 + "\n")
+            f.write("ИТОГОВЫЙ ОТЧЕТ WORKFLOW\n")
+            f.write("=" * 60 + "\n\n")
+            
+            phases = [e for e in self.json_events if e['type'] == 'phase_start']
+            agents = [e for e in self.json_events if e['type'] == 'agent_end']
+            errors = [e for e in self.json_events if e['type'] == 'error']
+            
+            f.write(f"Всего фаз: {len(phases)}\n")
+            f.write(f"Всего агентов: {len(agents)}\n")
+            f.write(f"Ошибок: {len(errors)}\n\n")
+            
+            if errors:
+                f.write("ОШИБКИ:\n")
+                for err in errors:
+                    f.write(f"  - {err['data']['message']}\n")
+        
+        self.info(f"Отчет сохранен: {summary_file}")
+2. Конфигурация системы
+python
+Копировать
+# workflow/config.yaml
+workflow:
+  mode: "interactive"  # interactive или auto
+  auto_continue_delay: 5  # секунд для авто-продолжения
+  
+phases:
+  research:
+    name: "Исследование и анализ"
+    agents:
+      - name: "competitor-analyst"
+        description: "Анализ конкурентов"
+        timeout: 300
+      - name: "market-analyst"
+        description: "Анализ рынка и трендов"
+        timeout: 300
+      - name: "tech-analyst"
+        description: "Технологический анализ"
+        timeout: 300
+      - name: "product-manager"
+        description: "Формирование требований"
+        timeout: 600
+    requires_approval: true
+    
+  implementation:
+    name: "Реализация"
+    agents:
+      - name: "architect"
+        description: "Архитектурное решение"
+        timeout: 600
+      - name: "developer"
+        description: "Разработка кода"
+        timeout: 1800
+        max_retries: 3
+      - name: "qa"
+        description: "Тестирование и проверка"
+        timeout: 600
+      - name: "template-validator"
+        description: "Валидация шаблона"
+        timeout: 300
+    git_enabled: true
+    
+git:
+  strategy: "feature-branch"
+  branch_prefix: "feature/"
+  auto_rollback: true
+  
+logging:
+  level: "DEBUG"
+  console: true
+  file: true
+  json: true
+3. Оркестратор системы
+python
+Копировать
+# workflow/orchestrator.py
+import subprocess
+import time
+import yaml
+from pathlib import Path
+from logger import WorkflowLogger
+import git
+from typing import Dict, List, Optional
+
+class WorkflowOrchestrator:
+    def __init__(self, config_path="workflow/config.yaml"):
+        self.config =
+
+
+
+
+
+NeuralHub
+10:36
+· claude-sonnet-4-5 · $0.04782
+python
+Копировать
+# workflow/orchestrator.py
+import subprocess
+import time
+import yaml
+from pathlib import Path
+from logger import WorkflowLogger
+import git
+from typing import Dict, List, Optional
+
+class WorkflowOrchestrator:
+    def __init__(self, config_path="workflow/config.yaml"):
+        self.config = self._load_config(config_path)
+        self.logger = WorkflowLogger()
+        self.repo = git.Repo('.')
+        self.current_branch = None
+        self.task_counter = 0
+        
+    def _load_config(self, config_path):
+        """Загрузка конфигурации"""
+        with open(config_path, 'r', encoding='utf-8') as f:
+            return yaml.safe_load(f)
+    
+    def _wait_for_user(self, prompt="Продолжить?", auto_mode=False):
+        """Ожидание подтверждения пользователя"""
+        if auto_mode or self.config['workflow']['mode'] == 'auto':
+            delay = self.config['workflow']['auto_continue_delay']
+            self.logger.info(f"Авто-продолжение через {delay} секунд...")
+            time.sleep(delay)
+            return True
+        
+        self.logger.user_input_required(prompt)
+        while True:
+            response = input(f"  [{prompt}] (y/n/auto): ").lower().strip()
+            if response == 'y':
+                return True
+            elif response == 'n':
+                return False
+            elif response == 'auto':
+                self.config['workflow']['mode'] = 'auto'
+                return True
+            else:
+                print("  Введите 'y' (да), 'n' (нет) или 'auto' (автоматически)")
+    
+    def _run_agent(self, agent_config: Dict, phase: str) -> bool:
+        """Запуск отдельного агента"""
+        agent_name = agent_config['name']
+        description = agent_config.get('description', '')
+        timeout = agent_config.get('timeout', 600)
+        
+        self.logger.agent_start(agent_name, description)
+        
+        try:
+            # Команда запуска агента
+            agent_dir = f".openclaw/agents/{phase}/{agent_name}"
+            cmd = [
+                "openclaw", "run", agent_name,
+                "--agent-dir", agent_dir,
+                "--workspace", "."
+            ]
+            
+            self.logger.agent_progress(agent_name, f"Выполнение команды: {' '.join(cmd)}")
+            
+            # Запуск процесса
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8'
+            )
+            
+            # Читаем вывод в реальном времени
+            for line in process.stdout:
+                self.logger.agent_progress(agent_name, line.strip())
+            
+            # Ожидаем завершения
+            return_code = process.wait(timeout=timeout)
+            
+            if return_code == 0:
+                self.logger.agent_end(agent_name, "success", "Задача выполнена успешно")
+                return True
+            else:
+                stderr = process.stderr.read()
+                self.logger.agent_end(agent_name, "failed", stderr)
+                return False
+                
+        except subprocess.TimeoutExpired:
+            self.logger.error(f"Агент {agent_name} превысил таймаут {timeout}с")
+            process.kill()
+            self.logger.agent_end(agent_name, "failed", "Timeout")
+            return False
+        except Exception as e:
+            self.logger.error(f"Ошибка при запуске агента {agent_name}", str(e))
+            self.logger.agent_end(agent_name, "failed", str(e))
+            return False
+    
+    def _create_git_branch(self
+
+
+
+
+Вы
+10:37
+продоллжай
+
+
+
+NeuralHub
+10:42
+· claude-sonnet-4-5 · $0.05280
+python
+Копировать
+    def _create_git_branch(self, task_id: int) -> str:
+        """Создание git ветки для задачи"""
+        branch_name = f"{self.config['git']['branch_prefix']}task_{task_id}"
+        
+        try:
+            self.logger.git_operation("Создание ветки", branch_name)
+            
+            # Проверяем, что нет незакоммиченных изменений
+            if self.repo.is_dirty():
+                self.logger.warning("Есть незакоммиченные изменения, коммитим...")
+                self.repo.git.add(A=True)
+                self.repo.index.commit(f"Auto-commit before branch {branch_name}")
+            
+            # Создаем и переключаемся на новую ветку
+            new_branch = self.repo.create_head(branch_name)
+            new_branch.checkout()
+            
+            self.current_branch = branch_name
+            self.logger.success(f"Ветка {branch_name} создана и активна")
+            return branch_name
+            
+        except Exception as e:
+            self.logger.error("Ошибка создания ветки", str(e))
+            return None
+    
+    def _rollback_git(self, reason: str = ""):
+        """Откат изменений в git"""
+        try:
+            self.logger.git_operation("Откат изменений", reason)
+            
+            # Возвращаемся на main
+            main_branch = self.repo.heads.main
+            main_branch.checkout()
+            
+            # Удаляем ветку с ошибкой
+            if self.current_branch:
+                self.repo.delete_head(self.current_branch, force=True)
+                self.logger.git_operation("Ветка удалена", self.current_branch)
+            
+            self.current_branch = None
+            self.logger.success("Откат выполнен успешно")
+            return True
+            
+        except Exception as e:
+            self.logger.error("Ошибка отката", str(e))
+            return False
+    
+    def _merge_git(self) -> bool:
+        """Слияние ветки с main"""
+        try:
+            self.logger.git_operation("Слияние с main", self.current_branch)
+            
+            # Переключаемся на main
+            main_branch = self.repo.heads.main
+            main_branch.checkout()
+            
+            # Мержим
+            self.repo.git.merge(self.current_branch)
+            
+            # Удаляем ветку
+            self.repo.delete_head(self.current_branch)
+            
+            self.logger.success(f"Ветка {self.current_branch} успешно смержена")
+            self.current_branch = None
+            return True
+            
+        except Exception as e:
+            self.logger.error("Ошибка слияния", str(e))
+            return False
+    
+    def _save_feedback(self, task_id: int, agent: str, feedback: str):
+        """Сохранение фидбека от агента"""
+        feedback_dir = Path(".openclaw/feedback")
+        feedback_dir.mkdir(parents=True, exist_ok=True)
+        
+        feedback_file = feedback_dir / f"task_{task_id}_{agent}.md"
+        
+        with open(feedback_file, 'w', encoding='utf-8') as f:
+            f.write(f"# Фидбек от {agent}\n\n")
+            f.write(f"**Дата:** {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            f.write(f"## Замечания\n\n{feedback}\n")
+        
+        self.logger.info(f"Фидбек сохранен: {feedback_file}")
+    
+    def run_research_phase(self) -> bool:
+        """Запуск фазы исследования"""
+        
+
+
+
+
+NeuralHub
+10:48
+· claude-sonnet-4-5 · $0.05810
+python
+Копировать
+    def run_research_phase(self) -> bool:
+        """Запуск фазы исследования"""
+        phase_config = self.config['phases']['research']
+        self.logger.phase_start(phase_config['name'])
+        
+        results = {}
+        
+        # Запускаем всех агентов исследования
+        for agent_config in phase_config['agents']:
+            if not self._wait_for_user(f"Запустить {agent_config['name']}?"):
+                self.logger.warning(f"Агент {agent_config['name']} пропущен")
+                continue
+            
+            success = self._run_agent(agent_config, 'research')
+            results[agent_config['name']] = success
+            
+            if not success:
+                self.logger.error(f"Агент {agent_config['name']} завершился с ошибкой")
+                if not self._wait_for_user("Продолжить несмотря на ошибку?"):
+                    self.logger.phase_end(phase_config['name'], "failed")
+                    return False
+        
+        # Требуется ли утверждение пользователя
+        if phase_config.get('requires_approval', False):
+            self.logger.user_input_required("Утвердить результаты исследования?")
+            print("\n" + "="*60)
+            print("РЕЗУЛЬТАТЫ ФАЗЫ ИССЛЕДОВАНИЯ:")
+            print("="*60)
+            for agent, status in results.items():
+                status_icon = "✅" if status else "❌"
+                print(f"  {status_icon} {agent}")
+            print("="*60 + "\n")
+            
+            if not self._wait_for_user("Утвердить и перейти к реализации?"):
+                self.logger.phase_end(phase_config['name'], "rejected")
+                return False
+        
+        self.logger.phase_end(phase_config['name'], "success")
+        return True
+    
+    def run_implementation_phase(self) -> bool:
+        """Запуск фазы реализации"""
+        phase_config = self.config['phases']['implementation']
+        self.logger.phase_start(phase_config['name'])
+        
+        self.task_counter += 1
+        task_id = self.task_counter
+        
+        # Создаем git ветку если включено
+        if self.config['git']['git_enabled']:
+            if not self._create_git_branch(task_id):
+                self.logger.phase_end(phase_config['name'], "failed")
+                return False
+        
+        max_retries = phase_config['agents'][1].get('max_retries', 3)  # Developer agent
+        
+        for attempt in range(1, max_retries + 1):
+            self.logger.info(f"Попытка {attempt} из {max_retries}")
+            
+            all_success = True
+            failed_agent = None
+            
+            # Запускаем агентов реализации
+            for agent_config in phase_config['agents']:
+                if not self._wait_for_user(f"Запустить {agent_config['name']}?"):
+                    self.logger.warning(f"Агент {agent_config['name']} пропущен")
+                    continue
+                
+                success = self._run_agent(agent_config, 'implementation')
+                
+                if not success:
+                    all_success = False
+                    failed_agent = agent_config['name']
+                    
+                    # QA агент обнаружил проблему
+                    if agent_config['name'] == 'qa':
+                        self.logger.error("QA обнаружил проблемы")
+                        
+                        # Сохраняем фидбек
+                        feedback = input("\n  Введите фидбек для разработчика (или Enter для авто): ")
+                        if not feedback:
+                            feedback = "Тесты не прошли. Проверьте логи и исправьте ошиб
+
+
+
+
+Вы
+10:49
+продолжай
+
+
+
+NeuralHub
+11:05
+· claude-sonnet-4-5 · $0.06309
+python
+Копировать
+                        if not feedback:
+                            feedback = "Тесты не прошли. Проверьте логи и исправьте ошибки."
+                        
+                        self._save_feedback(task_id, 'qa', feedback)
+                        
+                        # Откатываем изменения
+                        if self.config['git']['auto_rollback']:
+                            self._rollback_git(f"QA failed at attempt {attempt}")
+                            
+                            if attempt < max_retries:
+                                self.logger.warning(f"Повтор попытки {attempt + 1}...")
+                                # Создаем новую ветку для следующей попытки
+                                self._create_git_branch(task_id)
+                                break
+                        else:
+                            manual_rollback = self._wait_for_user("Откатить изменения?")
+                            if manual_rollback:
+                                self._rollback_git(f"Manual rollback at attempt {attempt}")
+                                break
+                    
+                    break  # Прерываем цикл агентов при ошибке
+            
+            # Если все агенты успешно завершились
+            if all_success:
+                self.logger.success("Все агенты завершились успешно!")
+                
+                # Мержим ветку
+                if self.config['git']['git_enabled']:
+                    if self._wait_for_user("Смержить изменения в main?"):
+                        if self._merge_git():
+                            self.logger.phase_end(phase_config['name'], "success")
+                            return True
+                        else:
+                            self.logger.error("Ошибка при слиянии")
+                            self._rollback_git("Merge failed")
+                else:
+                    self.logger.phase_end(phase_config['name'], "success")
+                    return True
+        
+        # Все попытки исчерпаны
+        self.logger.error(f"Исчерпаны все попытки ({max_retries})")
+        self.logger.phase_end(phase_config['name'], "failed")
+        return False
+    
+    def run_full_cycle(self):
+        """Запуск полного цикла разработки"""
+        self.logger._print_box(
+            "СИСТЕМА МНОГОАГЕНТНОЙ РАЗРАБОТКИ",
+            Fore.CYAN + Style.BRIGHT,
+            "═"
+        )
+        
+        print(f"\n📋 Режим работы: {self.config['workflow']['mode']}")
+        print(f"🔀 Git стратегия: {self.config['git']['strategy']}")
+        print(f"🔄 Авто-откат: {'Включен' if self.config['git']['auto_rollback'] else 'Выключен'}\n")
+        
+        if not self._wait_for_user("Начать выполнение?"):
+            self.logger.info("Выполнение отменено пользователем")
+            return
+        
+        try:
+            # Фаза 1: Исследование
+            if not self.run_research_phase():
+                self.logger.error("Фаза исследования провалена")
+                return
+            
+            # Фаза 2: Реализация
+            if not self.run_implementation_phase():
+                self.logger.error("Фаза реализации провалена")
+                return
+            
+            # Успешное завершение
+            self.logger._print_box(
+                "🎉 ЦИКЛ РАЗРАБОТКИ ЗАВЕРШЕН УСПЕШНО",
+                Fore.GREEN + Style.BRIGHT,
+                "═"
+            )
+            
+        except KeyboardInterrupt:
+            self.logger.warning("\n\n⏸️  Выполнение прервано пользователем")
+            if self.current_branch:
+                if self._wait_for_user("Откатить незавершенные изменения?"):
+                    self._rollback_git("User interrupted")
+        
+        except
+
+
+
+
+NeuralHub
+11:09
+· claude-sonnet-4-5 · $0.06840
+python
+Копировать
+        except Exception as e:
+            self.logger.error("Критическая ошибка в workflow", str(e))
+            if self.current_branch:
+                self.logger.warning("Откатываем изменения из-за ошибки...")
+                self._rollback_git(f"Critical error: {str(e)}")
+        
+        finally:
+            # Сохраняем итоговый отчет
+            self.logger.save_summary()
+            self.logger.info("Все логи сохранены в .openclaw/logs/")
+4. Главный файл запуска
+python
+Копировать
+# start.py
+#!/usr/bin/env python3
+"""
+Главный файл запуска системы многоагентной разработки
+"""
+
+from workflow.orchestrator import WorkflowOrchestrator
+from colorama import Fore, Style
+import sys
+
+def print_banner():
+    """Красивый баннер при запуске"""
+    banner = f"""
+{Fore.CYAN}{Style.BRIGHT}
+╔═══════════════════════════════════════════════════════════╗
+║                                                           ║
+║     🤖 СИСТЕМА МНОГОАГЕНТНОЙ РАЗРАБОТКИ 🤖               ║
+║                                                           ║
+║  Research → Analysis → Architecture → Development → QA   ║
+║                                                           ║
+╚═══════════════════════════════════════════════════════════╝
+{Style.RESET_ALL}
+"""
+    print(banner)
+
+def main():
+    print_banner()
+    
+    try:
+        orchestrator = WorkflowOrchestrator()
+        orchestrator.run_full_cycle()
+        
+    except FileNotFoundError as e:
+        print(f"{Fore.RED}❌ Ошибка: Файл конфигурации не найден{Style.RESET_ALL}")
+        print(f"   {e}")
+        sys.exit(1)
+        
+    except KeyboardInterrupt:
+        print(f"\n\n{Fore.YELLOW}👋 Работа прервана пользователем{Style.RESET_ALL}")
+        sys.exit(0)
+        
+    except Exception as e:
+        print(f"{Fore.RED}❌ Критическая ошибка: {e}{Style.RESET_ALL}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+5. Скрипт установки зависимостей
+bash
+Копировать
+# setup.sh
+#!/bin/bash
+
+echo "🔧 Установка зависимостей для системы многоагентной разработки..."
+
+# Создаем виртуальное окружение
+python3 -m venv venv
+source venv/bin/activate  # Для Windows: venv\Scripts\activate
+
+# Устанавливаем зависимости
+pip install colorama pyyaml gitpython
+
+# Создаем структуру директорий
+mkdir -p .openclaw/agents/research/{competitor,market,tech,pm}
+mkdir -p .openclaw/agents/implementation/{architect,developer,qa,validator}
+mkdir -p .openclaw/logs
+mkdir -p .openclaw/feedback
+mkdir -p .openclaw/config
+mkdir -p workflow
+
+echo "✅ Установка завершена!"
+echo ""
+echo "Для запуска используйте:"
+echo "  python start.py"
+6. Requirements.txt
+txt
+Копировать
+# requirements.txt
+colorama>=0.4.6
+PyYAML>=6.0
+GitPython>=3.1.40
+7. Пример использования с расширенными опциями
+python
+Копировать
+# start_advanced.py
+"""
+Расширенный запуск с дополнительными опциями
+"""
+
+import argparse
+from workflow.orchestrator import WorkflowOrchestrator
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Система многоагентной разработки'
+    )
+    
+    parser.add_argument(
+        
+
+
+
+
+
+Вы
+11:14
+продолжай
+
+
+
+NeuralHub
+11:35
+· claude-sonnet-4-5 · $0.07338
+python
+Копировать
+    parser.add_argument(
+        '--mode',
+        choices=['interactive', 'auto'],
+        default='interactive',
+        help='Режим работы: interactive (с подтверждениями) или auto (автоматический)'
+    )
+    
+    parser.add_argument(
+        '--phase',
+        choices=['research', 'implementation', 'full'],
+        default='full',
+        help='Какую фазу запустить'
+    )
+    
+    parser.add_argument(
+        '--config',
+        default='workflow/config.yaml',
+        help='Путь к файлу конфигурации'
+    )
+    
+    parser.add_argument(
+        '--skip-git',
+        action='store_true',
+        help='Пропустить git операции'
+    )
+    
+    parser.add_argument(
+        '--max-retries',
+        type=int,
+        default=3,
+        help='Максимальное количество попыток при ошибке'
+    )
+    
+    parser.add_argument(
+        '--log-level',
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+        default='INFO',
+        help='Уровень логирования'
+    )
+    
+    args = parser.parse_args()
+    
+    # Создаем оркестратор
+    orchestrator = WorkflowOrchestrator(config_path=args.config)
+    
+    # Применяем аргументы командной строки
+    orchestrator.config['workflow']['mode'] = args.mode
+    orchestrator.config['git']['git_enabled'] = not args.skip_git
+    orchestrator.config['logging']['level'] = args.log_level
+    
+    # Запускаем нужную фазу
+    if args.phase == 'research':
+        orchestrator.run_research_phase()
+    elif args.phase == 'implementation':
+        orchestrator.run_implementation_phase()
+    else:
+        orchestrator.run_full_cycle()
+
+if __name__ == "__main__":
+    main()
+8. Скрипт для мониторинга логов в реальном времени
+python
+Копировать
+# monitor_logs.py
+"""
+Утилита для мониторинга логов в реальном времени
+"""
+
+import time
+from pathlib import Path
+from colorama import Fore, Style, init
+import json
+
+init(autoreset=True)
+
+def get_latest_log():
+    """Получить последний файл лога"""
+    log_dir = Path(".openclaw/logs")
+    if not log_dir.exists():
+        return None
+    
+    log_files = list(log_dir.glob("workflow_*.log"))
+    if not log_files:
+        return None
+    
+    return max(log_files, key=lambda p: p.stat().st_mtime)
+
+def get_latest_json_log():
+    """Получить последний JSON лог"""
+    log_dir = Path(".openclaw/logs")
+    if not log_dir.exists():
+        return None
+    
+    json_files = list(log_dir.glob("workflow_*.json"))
+    if not json_files:
+        return None
+    
+    return max(json_files, key=lambda p: p.stat().st_mtime)
+
+def monitor_text_log():
+    """Мониторинг текстового лога"""
+    print(f"{Fore.CYAN}📊 Мониторинг логов (Ctrl+C для выхода){Style.RESET_ALL}\n")
+    
+    log_file = get_latest_log()
+    if not log_file:
+        print(f"{Fore.RED}Логи не найдены{Style.RESET_ALL}")
+        return
+    
+    print(f"Отслеживаем: {log_file}\n")
+    
+    with open(log_file, 'r', encoding='utf-8') as f:
+        # Переходим в конец файла
+        f.seek(0, 2)
+        
+        while True:
+            line = f.readline()
+            if line:
+
+
+
+
+
+NeuralHub
+11:48
+· claude-sonnet-4-5 · $0.07869
+python
+Копировать
+            if line:
+                # Раскрашиваем вывод в зависимости от уровня
+                if 'ERROR' in line:
+                    print(Fore.RED + line.strip())
+                elif 'WARNING' in line:
+                    print(Fore.YELLOW + line.strip())
+                elif 'SUCCESS' in line:
+                    print(Fore.GREEN + line.strip())
+                elif 'PHASE_START' in line or 'PHASE_END' in line:
+                    print(Fore.CYAN + Style.BRIGHT + line.strip())
+                elif 'AGENT_START' in line or 'AGENT_END' in line:
+                    print(Fore.MAGENTA + line.strip())
+                else:
+                    print(line.strip())
+            else:
+                time.sleep(0.1)
+
+def show_json_summary():
+    """Показать сводку из JSON лога"""
+    json_file = get_latest_json_log()
+    if not json_file:
+        print(f"{Fore.RED}JSON логи не найдены{Style.RESET_ALL}")
+        return
+    
+    with open(json_file, 'r', encoding='utf-8') as f:
+        events = json.load(f)
+    
+    print(f"\n{Fore.CYAN}{'='*60}")
+    print(f"СВОДКА ПО ПОСЛЕДНЕМУ ЗАПУСКУ")
+    print(f"{'='*60}{Style.RESET_ALL}\n")
+    
+    # Статистика по фазам
+    phases = [e for e in events if e['type'] == 'phase_start']
+    print(f"{Fore.YELLOW}Фазы:{Style.RESET_ALL}")
+    for phase in phases:
+        print(f"  • {phase['data']['phase']}")
+    
+    # Статистика по агентам
+    agents_start = [e for e in events if e['type'] == 'agent_start']
+    agents_end = [e for e in events if e['type'] == 'agent_end']
+    
+    print(f"\n{Fore.YELLOW}Агенты:{Style.RESET_ALL}")
+    for agent_end in agents_end:
+        agent_name = agent_end['data']['agent']
+        status = agent_end['data']['status']
+        
+        if status == 'success':
+            icon = f"{Fore.GREEN}✅"
+        elif status == 'failed':
+            icon = f"{Fore.RED}❌"
+        else:
+            icon = f"{Fore.YELLOW}⚠️"
+        
+        print(f"  {icon} {agent_name}: {status}{Style.RESET_ALL}")
+    
+    # Git операции
+    git_ops = [e for e in events if e['type'] == 'git_operation']
+    if git_ops:
+        print(f"\n{Fore.YELLOW}Git операции:{Style.RESET_ALL}")
+        for op in git_ops:
+            print(f"  🔀 {op['data']['operation']}: {op['data']['details']}")
+    
+    # Ошибки
+    errors = [e for e in events if e['type'] == 'error']
+    if errors:
+        print(f"\n{Fore.RED}Ошибки:{Style.RESET_ALL}")
+        for err in errors:
+            print(f"  ❌ {err['data']['message']}")
+            if err['data']['details']:
+                print(f"     └─ {err['data']['details']}")
+    
+    print(f"\n{Fore.CYAN}{'='*60}{Style.RESET_ALL}\n")
+
+if __name__ == "__main__":
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == 'summary':
+        show_json_summary()
+    else:
+        try:
+            monitor_text_log()
+        except KeyboardInterrupt:
+            print(f"\n\n{Fore.YELLOW}Мониторин
+
+
+
+
+Вы
+11:53
+ghjljk;fq
+
+
+
+Вы
+12:15
+Продолжай
+
+
+
+NeuralHub
+12:49
+· claude-sonnet-4-5 · $0.08367
+python
+Копировать
+            print(f"\n\n{Fore.YELLOW}Мониторинг остановлен{Style.RESET_ALL}")
+9. Утилита для управления агентами
+python
+Копировать
+# manage_agents.py
+"""
+Утилита для управления агентами
+"""
+
+import argparse
+import subprocess
+from pathlib import Path
+from colorama import Fore, Style, init
+
+init(autoreset=True)
+
+class AgentManager:
+    def __init__(self):
+        self.base_dir = Path(".openclaw/agents")
+    
+    def list_agents(self):
+        """Список всех агентов"""
+        print(f"\n{Fore.CYAN}{'='*60}")
+        print("СПИСОК АГЕНТОВ")
+        print(f"{'='*60}{Style.RESET_ALL}\n")
+        
+        for phase_dir in self.base_dir.iterdir():
+            if phase_dir.is_dir():
+                print(f"{Fore.YELLOW}📁 {phase_dir.name.upper()}{Style.RESET_ALL}")
+                
+                for agent_dir in phase_dir.iterdir():
+                    if agent_dir.is_dir():
+                        status = "✅" if (agent_dir / "config.yaml").exists() else "⚠️"
+                        print(f"  {status} {agent_dir.name}")
+                print()
+    
+    def create_agent(self, name, phase, description=""):
+        """Создать нового агента"""
+        agent_dir = self.base_dir / 
+
+
+
+
+
+Вы
+12:50
+продолжай
+
+
+
+NeuralHub
+13:01
+· claude-sonnet-4-5 · $0.08572
+python
+Копировать
+    def create_agent(self, name, phase, description=""):
+        """Создать нового агента"""
+        agent_dir = self.base_dir / phase / name
+        
+        if agent_dir.exists():
+            print(f"{Fore.RED}❌ Агент {name} уже существует в фазе {phase}{Style.RESET_ALL}")
+            return False
+        
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Создаем базовую конфигурацию
+        config_content = f"""# Конфигурация агента {name}
+name: {name}
+phase: {phase}
+description: {description}
+
+# Параметры выполнения
+timeout: 600
+max_retries: 3
+
+# Зависимости от других агентов
+depends_on: []
+
+# Команды для выполнения
+commands:
+  - echo "Запуск агента {name}"
+  # Добавьте свои команды здесь
+
+# Проверки успешности
+success_conditions:
+  - type: exit_code
+    value: 0
+"""
+        
+        config_file = agent_dir / "config.yaml"
+        with open(config_file, 'w', encoding='utf-8') as f:
+            f.write(config_content)
+        
+        # Создаем README
+        readme_content = f"""# Агент: {name}
+
+## Описание
+{description}
+
+## Фаза
+{phase}
+
+## Использование
+```bash
+openclaw agents add {name} --agent-dir {agent_dir} --workspace .
+Настройка
+Отредактируйте config.yaml для настройки поведения агента. """
+
+code
+Копировать
+    readme_file = agent_dir / "README.md"
+    with open(readme_file, 'w', encoding='utf-8') as f:
+        f.write(readme_content)
+    
+    # Регистрируем агента в openclaw
+    try:
+        cmd = [
+            "openclaw", "agents", "add", name,
+            "--agent-dir", str(agent_dir),
+            "--workspace", "."
+        ]
+        subprocess.run(cmd, check=True)
+        
+        print(f"{Fore.GREEN}✅ Агент {name} создан успешно!{Style.RESET_ALL}")
+        print(f"   Директория: {agent_dir}")
+        return True
+        
+    except subprocess.CalledProcessError as e:
+        print(f"{Fore.RED}❌ Ошибка регистрации агента: {e}{Style.RESET_ALL}")
+        return False
+
+def delete_agent(self, name, phase):
+    """Удалить агента"""
+    agent_dir = self.base_dir / phase / name
+    
+    if not agent_dir.exists():
+        print(f"{Fore.RED}❌ Агент {name} не найден в фазе {phase}{Style.RESET_ALL}")
+        return False
+    
+    # Подтверждение
+    response = input(f"{Fore.YELLOW}⚠️  Удалить агента {name}? (yes/no): {Style.RESET_ALL}")
+    if response.lower() != 'yes':
+        print("Отменено")
+        return False
+    
+    # Удаляем директорию
+    import shutil
+    shutil.rmtree(agent_dir)
+    
+    print(f"{Fore.GREEN}✅ Агент {name} удален{Style.RESET_ALL}")
+    return True
+
+def test_agent(self, name, phase):
+    """Тестовый запуск агента"""
+    agent_dir = self.base_dir / phase / name
+    
+    if not agent_dir.exists():
+        print(f"{Fore.RED}❌ Агент {name} не найден{Style.RESET_ALL}")
+        return False
+    
+    print(f"{Fore.CYAN}🧪 Тест
+
+
+
+
+
+NeuralHub
+13:10
+· claude-sonnet-4-5 · $0.09104
+python
+Копировать
+        print(f"{Fore.CYAN}🧪 Тестовый запуск агента {name}{Style.RESET_ALL}\n")
+        
+        try:
+            cmd = [
+                "openclaw", "run", name,
+                "--agent-dir", str(agent_dir),
+                "--workspace", "."
+            ]
+            
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8'
+            )
+            
+            if result.returncode == 0:
+                print(f"{Fore.GREEN}✅ Агент выполнен успешно{Style.RESET_ALL}")
+                print(f"\n{Fore.CYAN}Вывод:{Style.RESET_ALL}")
+                print(result.stdout)
+            else:
+                print(f"{Fore.RED}❌ Агент завершился с ошибкой{Style.RESET_ALL}")
+                print(f"\n{Fore.RED}Ошибка:{Style.RESET_ALL}")
+                print(result.stderr)
+            
+            return result.returncode == 0
+            
+        except Exception as e:
+            print(f"{Fore.RED}❌ Ошибка запуска: {e}{Style.RESET_ALL}")
+            return False
+
+def main():
+    parser = argparse.ArgumentParser(description='Управление агентами')
+    subparsers = parser.add_subparsers(dest='command', help='Команды')
+    
+    # Команда list
+    subparsers.add_parser('list', help='Список всех агентов')
+    
+    # Команда create
+    create_parser = subparsers.add_parser('create', help='Создать нового агента')
+    create_parser.add_argument('name', help='Имя агента')
+    create_parser.add_argument('phase', choices=['research', 'implementation'], help='Фаза')
+    create_parser.add_argument('--description', default='', help='Описание агента')
+    
+    # Команда delete
+    delete_parser = subparsers.add_parser('delete', help='Удалить агента')
+    delete_parser.add_argument('name', help='Имя агента')
+    delete_parser.add_argument('phase', choices=['research', 'implementation'], help='Фаза')
+    
+    # Команда test
+    test_parser = subparsers.add_parser('test', help='Тестовый запуск агента')
+    test_parser.add_argument('name', help='Имя агента')
+    test_parser.add_argument('phase', choices=['research', 'implementation'], help='Фаза')
+    
+    args = parser.parse_args()
+    manager = AgentManager()
+    
+    if args.command == 'list':
+        manager.list_agents()
+    elif args.command == 'create':
+        manager.create_agent(args.name, args.phase, args.description)
+    elif args.command == 'delete':
+        manager.delete_agent(args.name, args.phase)
+    elif args.command == 'test':
+        manager.test_agent(args.name, args.phase)
+    else:
+        parser.print_help()
+
+if __name__ == "__main__":
+    main()
+10. Финальный скрипт быстрой установки
+bash
+Копировать
+#!/bin/bash
+# install.sh - Полная установка системы
+
+echo "╔═══════════════════════════════════════════════════════════╗"
+echo "║   🚀 УСТАНОВКА СИСТЕМЫ МНОГОАГЕНТНОЙ РАЗРАБОТКИ 🚀       ║"
+echo "╚═══════════════════════════════════════════════════════════╝"
+echo ""
+
+# Проверка Python
+if ! command -v python3 &> /dev/null; then
+    echo "❌ Python 3 не найден. Установите Python 3.8 или выше"
+    exit 1
+
+
+
+
+
+Вы
+13:52
+продолжай
+
+
+
+NeuralHub
+13:56
+· claude-sonnet-4-5 · $0.09602
+bash
+Копировать
+fi
+
+echo "✓ Python найден: $(python3 --version)"
+
+# Создание виртуального окружения
+echo ""
+echo "📦 Создание виртуального окружения..."
+python3 -m venv venv
+
+# Активация виртуального окружения
+if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "win32" ]]; then
+    source venv/Scripts/activate
+else
+    source venv/bin/activate
+fi
+
+echo "✓ Виртуальное окружение активировано"
+
+# Установка зависимостей
+echo ""
+echo "📥 Установка зависимостей..."
+pip install --upgrade pip
+pip install -r requirements.txt
+
+echo "✓ Зависимости установлены"
+
+# Создание структуры директорий
+echo ""
+echo "📁 Создание структуры директорий..."
+
+mkdir -p .openclaw/agents/research/{competitor,market,tech,pm}
+mkdir -p .openclaw/agents/implementation/{architect,developer,qa,validator}
+mkdir -p .openclaw/logs
+mkdir -p .openclaw/feedback
+mkdir -p .openclaw/config
+mkdir -p workflow
+
+echo "✓ Структура директорий создана"
+
+# Инициализация Git репозитория
+echo ""
+echo "🔀 Инициализация Git..."
+
+if [ ! -d ".git" ]; then
+    git init
+    git checkout -b main
+    echo "✓ Git репозиторий инициализирован"
+else
+    echo "✓ Git репозиторий уже существует"
+fi
+
+# Создание .gitignore
+cat > .gitignore << 'EOF'
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+*.egg-info/
+
+# Логи
+.openclaw/logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+EOF
+
+echo "✓ .gitignore создан"
+
+# Создание начальных конфигураций для агентов
+echo ""
+echo "⚙️  Создание конфигураций агентов..."
+
+# Competitor Analyst
+cat > .openclaw/agents/research/competitor/config.yaml << 'EOF'
+name: competitor-analyst
+description: "Анализ конкурентов и их решений"
+timeout: 300
+commands:
+  - echo "Анализ конкурентов..."
+  - echo "Сбор данных о конкурентах завершен"
+EOF
+
+# Market Analyst
+cat > .openclaw/agents/research/market/config.yaml << 'EOF'
+name: market-analyst
+description: "Анализ рынка и трендов"
+timeout: 300
+commands:
+  - echo "Анализ рыночных трендов..."
+  - echo "Маркетинговый анализ завершен"
+EOF
+
+# Tech Analyst
+cat > .openclaw/agents/research/tech/config.yaml << 'EOF'
+name: tech-analyst
+description: "Технологический анализ и инновации"
+timeout: 300
+commands:
+  - echo "Анализ технологий..."
+  - echo "Технологический анализ завершен"
+EOF
+
+# Product Manager
+cat > .openclaw/agents/research/pm/config.yaml << 'EOF'
+name: product-manager
+description: "Формирование требований на основе анализа"
+timeout: 600
+depends_on:
+  - competitor-analyst
+  - market-analyst
+  - tech-analyst
+commands:
+  - echo "Формирование требований..."
+  - echo "Требования сформированы"
+EOF
+
+# Architect
+cat > .openclaw/agents/implementation/architect/config.yaml << 'EOF'
+name: architect
+description: "Создание архитектурного решения"
+timeout: 600
+commands:
+  - echo "Проектирование арх
+
+
+
+
+NeuralHub
+14:00
+· claude-sonnet-4-5 · $0.10133
+bash
+Копировать
+# Architect
+cat > .openclaw/agents/implementation/architect/config.yaml << 'EOF'
+name: architect
+description: "Создание архитектурного решения"
+timeout: 600
+commands:
+  - echo "Проектирование архитектуры..."
+  - echo "Архитектурное решение готово"
+EOF
+
+# Developer
+cat > .openclaw/agents/implementation/developer/config.yaml << 'EOF'
+name: developer
+description: "Разработка кода"
+timeout: 1800
+max_retries: 3
+commands:
+  - echo "Разработка функционала..."
+  - echo "Код написан"
+EOF
+
+# QA
+cat > .openclaw/agents/implementation/qa/config.yaml << 'EOF'
+name: qa
+description: "Тестирование и проверка качества"
+timeout: 600
+commands:
+  - echo "Запуск тестов..."
+  - echo "Проверка качества кода..."
+  - echo "Все тесты пройдены"
+EOF
+
+# Template Validator
+cat > .openclaw/agents/implementation/validator/config.yaml << 'EOF'
+name: template-validator
+description: "Валидация соответствия шаблону"
+timeout: 300
+commands:
+  - echo "Проверка соответствия шаблону..."
+  - echo "Валидация успешна"
+EOF
+
+echo "✓ Конфигурации агентов созданы"
+
+# Первый коммит
+echo ""
+echo "💾 Создание первого коммита..."
+git add .
+git commit -m "Initial commit: Multi-agent development system setup"
+echo "✓ Первый коммит создан"
+
+# Создание вспомогательных скриптов
+echo ""
+echo "📝 Создание вспомогательных скриптов..."
+
+# Скрипт быстрого запуска
+cat > run.sh << 'EOF'
+#!/bin/bash
+source venv/bin/activate
+python start.py "$@"
+EOF
+chmod +x run.sh
+
+# Скрипт для Windows
+cat > run.bat << 'EOF'
+@echo off
+call venv\Scripts\activate
+python start.py %*
+EOF
+
+# Скрипт мониторинга
+cat > monitor.sh << 'EOF'
+#!/bin/bash
+source venv/bin/activate
+python monitor_logs.py
+EOF
+chmod +x monitor.sh
+
+# Скрипт управления агентами
+cat > agents.sh << 'EOF'
+#!/bin/bash
+source venv/bin/activate
+python manage_agents.py "$@"
+EOF
+chmod +x agents.sh
+
+echo "✓ Вспомогательные скрипты созданы"
+
+# Создание README
+echo ""
+echo "📄 Создание документации..."
+
+cat > README.md << 'EOF'
+# Система многоагентной разработки
+
+## Описание
+Автоматизированная система разработки с использованием множества специализированных агентов.
+
+## Структура
+
+### Фаза исследования (Research)
+- **competitor-analyst** - Анализ конкурентов
+- **market-analyst** - Анализ рынка
+- **tech-analyst** - Технологический анализ
+- **product-manager** - Формирование требований
+
+### Фаза реализации (Implementation)
+- **architect** - Архитектурное проектирование
+- **developer** - Разработка кода
+- **qa** - Тестирование и контроль качества
+- **template-validator** - Валидация шаблона
+
+## Установка
+
+```bash
+./install.sh
+Использование
+Запуск полного цикла
+bash
+Копировать
+./run.sh
+Запуск в автоматическом режиме
+bash
+Копировать
+./run.sh --mode auto
+Запуск только фазы исследования
+bash
+Копировать
+./run.sh --phase research
+Запу
+
+
+
+
+
+Вы
+14:06
+продолжай
+
+
+
+NeuralHub
+14:12
+· claude-sonnet-4-5 · $0.10632
+markdown
+Копировать
+### Запуск только фазы реализации
+```bash
+./run.sh --phase implementation
+Пропуск Git операций
+bash
+Копировать
+./run.sh --skip-git
+Мониторинг логов в реальном времени
+bash
+Копировать
+./monitor.sh
+Просмотр сводки последнего запуска
+bash
+Копировать
+python monitor_logs.py summary
+Управление агентами
+Список всех агентов
+bash
+Копировать
+./agents.sh list
+Создание нового агента
+bash
+Копировать
+./agents.sh create my-agent research --description "Мой кастомный агент"
+Тестирование агента
+bash
+Копировать
+./agents.sh test developer implementation
+Удаление агента
+bash
+Копировать
+./agents.sh delete my-agent research
+Конфигурация
+Основная конфигурация находится в workflow/config.yaml
+
+Режимы работы
+interactive - С подтверждением каждого шага
+auto - Автоматическое выполнение
+Git стратегии
+feature-branch - Каждая задача в отдельной ветке
+auto_rollback - Автоматический откат при ошибках
+Логи
+Все логи сохраняются в .openclaw/logs/:
+
+workflow_*.log - Текстовые логи
+workflow_*.json - Структурированные логи в JSON
+summary_*.txt - Итоговые отчеты
+Фидбек
+При ошибках QA агент сохраняет фидбек в .openclaw/feedback/
+
+Примеры
+Интерактивный режим с паузами
+bash
+Копировать
+python start.py --mode interactive
+Полностью автоматический запуск
+bash
+Копировать
+python start.py --mode auto --max-retries 5
+Запуск с кастомной конфигурацией
+bash
+Копировать
+python start.py --config my_config.yaml
+Расширение системы
+Добавление нового агента
+Создайте директорию агента:
+bash
+Копировать
+mkdir -p .openclaw/agents/research/my-agent
+Создайте конфигурацию config.yaml:
+yaml
+Копировать
+name: my-agent
+description: "Описание агента"
+timeout: 600
+commands:
+  - echo "Команда 1"
+  - echo "Команда 2"
+Зарегистрируйте агента:
+bash
+Копировать
+openclaw agents add my-agent --agent-dir .openclaw/agents/research/my-agent --workspace .
+Добавьте в workflow/config.yaml:
+yaml
+Копировать
+phases:
+  research:
+    agents:
+      - name: "my-agent"
+        description: "Описание"
+        timeout: 600
+Troubleshooting
+Агент зависает
+Проверьте timeout в конфигурации
+Увеличьте значение timeout для агента
+Git конфликты
+Система автоматически откатывает изменения при ошибках
+Вручную: git reset --hard origin/main
+Ошибки в логах
+Проверьте .openclaw/logs/workflow_*.log
+Используйте python monitor_logs.py summary для анализа
+Архитектура
+code
+Копировать
+┌─────────────────────────────────────────┐
+│         RESEARCH PHASE                  │
+│  ┌─────────────────────────────────┐   │
+│  │ Competitor → Market → Tech      │   │
+│  │         ↓                        │   │
+│  │   Product Manager                │   │
+│  └─────────────────────────────────┘   │
+│              ↓                          │
+│      
+
+
+
+
+
+NeuralHub
+14:41
+· claude-sonnet-4-5 · $0.11163
+markdown
+Копировать
+│              ↓                          │
+│      [USER APPROVAL]                    │
+└─────────────────────────────────────────┘
+              ↓
+┌─────────────────────────────────────────┐
+│      IMPLEMENTATION PHASE               │
+│  ┌─────────────────────────────────┐   │
+│  │ Architect → Developer           │   │
+│  │         ↓                        │   │
+│  │    QA + Validator                │   │
+│  │         ↓                        │   │
+│  │  [PASS] → Merge                  │   │
+│  │  [FAIL] → Rollback → Retry       │   │
+│  └─────────────────────────────────┘   │
+└─────────────────────────────────────────┘
+Workflow процесс
+Исследование - Агенты собирают информацию
+Утверждение - Вы принимаете решение
+Архитектура - Проектирование решения
+Разработка - Написание кода
+Тестирование - QA проверка
+Валидация - Соответствие стандартам
+Merge/Rollback - Принятие или откат
+Лицензия
+MIT License EOF
+
+echo "✓ README.md создан"
+
+Финальное сообщение
+echo "" echo "╔═══════════════════════════════════════════════════════════╗" echo "║ ✅ УСТАНОВКА ЗАВЕРШЕНА УСПЕШНО! ✅ ║" echo "╚═══════════════════════════════════════════════════════════╝" echo "" echo "📚 Следующие шаги:" echo "" echo "1. Активируйте виртуальное окружение:" echo " source venv/bin/activate # Linux/Mac" echo " venv\Scripts\activate # Windows" echo "" echo "2. Запустите систему:" echo " ./run.sh # Linux/Mac" echo " run.bat # Windows" echo "" echo "3. Или используйте напрямую:" echo " python start.py" echo "" echo "4. Для мониторинга логов:" echo " ./monitor.sh" echo "" echo "5. Управление агентами:" echo " ./agents.sh list" echo "" echo "📖 Документация: README.md" echo "📊 Логи: .openclaw/logs/" echo "" echo "Удачной работы! 🚀"
+
+code
+Копировать
+
+## 11. Создание Makefile для удобства
+
+```makefile
+# Makefile
+.PHONY: help install run monitor agents clean test
+
+help:
+	@echo "╔═══════════════════════════════════════════════════════════╗"
+	@echo "║     Система многоагентной разработки - Команды           ║"
+	@echo "╚═══════════════════════════════════════════════════════════╝"
+	@echo ""
+	@echo "  make install    - Установка системы"
+	@echo "  make run        - Запуск полного цикла"
+	@echo "  make run-auto   - Запуск в автоматическом режиме"
+	@echo "  make research   - Только фаза исследования"
+	@echo "  make implement  - Только фаза реализации"
+	@echo "  make monitor    - Мониторинг логов"
+	@echo "  make summary    - Сводка последнего запуска"
+	@echo "  make agents     - Список агентов"
+	@echo "  make test       - Тестирование всех агентов"
+	@echo "  make clean      - Очистка логов и временных файлов"
+
+
+
+
+
+Вы
+14:54
+продолжай
+
+
+
+Вы
+15:03
+продолжай
+
+
+
+NeuralHub
+15:07
+· claude-sonnet-4-5 · $0.05427
+makefile
+Копировать
+	@echo "  make reset      - Полный сброс (осторожно!)"
+	@echo ""
+
+install:
+	@echo "🚀 Запуск установки..."
+	@chmod +x install.sh
+	@./install.sh
+
+run:
+	@echo "▶️  Запуск системы в интерактивном режиме..."
+	@source venv/bin/activate && python start.py --mode interactive
+
+run-auto:
+	@echo "▶️  Запуск системы в автоматическом режиме..."
+	@source venv/bin/activate && python start.py --mode auto
+
+research:
+	@echo "🔍 Запуск фазы исследования..."
+	@source venv/bin/activate && python start.py --phase research
+
+implement:
+	@echo "🔨 Запуск фазы реализации..."
+	@source venv/bin/activate && python start.py --phase implementation
+
+monitor:
+	@echo "📊 Запуск мониторинга логов..."
+	@source venv/bin/activate && python monitor_logs.py
+
+summary:
+	@echo "📋 Сводка последнего запуска..."
+	@source venv/bin/activate && python monitor_logs.py summary
+
+agents:
+	@echo "👥 Список агентов..."
+	@source venv/bin/activate && python manage_agents.py list
+
+test:
+	@echo "🧪 Тестирование всех агентов..."
+	@source venv/bin/activate && python -m pytest tests/ -v
+
+test-agent:
+	@echo "🧪 Тестирование агента $(AGENT) в фазе $(PHASE)..."
+	@source venv/bin/activate && python manage_agents.py test $(AGENT) $(PHASE)
+
+create-agent:
+	@echo "➕ Создание агента $(NAME) в фазе $(PHASE)..."
+	@source venv/bin/activate && python manage_agents.py create $(NAME) $(PHASE) --description "$(DESC)"
+
+delete-agent:
+	@echo "➖ Удаление агента $(NAME) из фазы $(PHASE)..."
+	@source venv/bin/activate && python manage_agents.py delete $(NAME) $(PHASE)
+
+clean:
+	@echo "🧹 Очистка логов и временных файлов..."
+	@rm -rf .openclaw/logs/*
+	@rm -rf .openclaw/feedback/*
+	@rm -rf __pycache__
+	@find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+	@find . -type f -name "*.pyc" -delete
+	@echo "✅ Очистка завершена"
+
+reset:
+	@echo "⚠️  ВНИМАНИЕ: Это удалит все данные!"
+	@read -p "Вы уверены? (yes/no): " confirm && [ "$$confirm" = "yes" ] || exit 1
+	@echo "🔄 Полный сброс системы..."
+	@rm -rf .openclaw/
+	@rm -rf venv/
+	@rm -rf .git/
+	@echo "✅ Система сброшена. Запустите 'make install' для переустановки"
+
+logs:
+	@echo "📄 Последние 50 строк логов..."
+	@tail -n 50 .openclaw/logs/workflow_*.log 2>/dev/null || echo "Логи не найдены"
+
+status:
+	@echo "📊 Статус системы:"
+	@echo ""
+	@echo "Python: $$(python3 --version 2>/dev/null || echo 'не установлен')"
+	@echo "Git: $$(git --version 2>/dev/null || echo 'не установлен')"
+	@echo "OpenClaw: $$(openclaw --version 2>/dev/null || echo 'не установлен')"
+	@echo ""
+	@echo "Виртуальное
+
+
+
+
+NeuralHub
+15:29
+· claude-sonnet-4-5 · $0.05440
+makefile
+Копировать
+	@echo "Виртуальное окружение: $$([ -d venv ] && echo '✅ создано' || echo '❌ не создано')"
+	@echo "Агенты: $$([ -d .openclaw/agents ] && find .openclaw/agents -name 'config.yaml' | wc -l || echo '0') шт."
+	@echo "Логи: $$([ -d .openclaw/logs ] && ls -1 .openclaw/logs/*.log 2>/dev/null | wc -l || echo '0') файлов"
+	@echo ""
+
+backup:
+	@echo "💾 Создание резервной копии..."
+	@mkdir -p backups
+	@tar -czf backups/backup_$$(date +%Y%m%d_%H%M%S).tar.gz \
+		.openclaw/agents \
+		.openclaw/config \
+		workflow/ \
+		*.py \
+		*.yaml \
+		*.md \
+		2>/dev/null
+	@echo "✅ Резервная копия создана в backups/"
+
+restore:
+	@echo "♻️  Восстановление из резервной копии..."
+	@ls -1t backups/*.tar.gz | head -1 | xargs -I {} tar -xzf {}
+	@echo "✅ Восстановление завершено"
+
+update:
+	@echo "🔄 Обновление зависимостей..."
+	@source venv/bin/activate && pip install --upgrade pip
+	@source venv/bin/activate && pip install --upgrade -r requirements.txt
+	@echo "✅ Зависимости обновлены"
+
+docs:
+	@echo "📚 Генерация документации..."
+	@source venv/bin/activate && python -m pydoc -w start monitor_logs manage_agents
+	@mkdir -p docs
+	@mv *.html docs/ 2>/dev/null || true
+	@echo "✅ Документация сгенерирована в docs/"
+
+lint:
+	@echo "🔍 Проверка кода..."
+	@source venv/bin/activate && pylint *.py || true
+	@source venv/bin/activate && flake8 *.py || true
+	@echo "✅ Проверка завершена"
+
+format:
+	@echo "✨ Форматирование кода..."
+	@source venv/bin/activate && black *.py
+	@echo "✅ Код отформатирован"
+
+# Пример использования:
+# make run
+# make create-agent NAME=my-agent PHASE=research DESC="Мой агент"
+# make test-agent AGENT=developer PHASE=implementation
+12. Создание файла docker-compose.yml (опционально)
+yaml
+Копировать
+# docker-compose.yml
+version: '3.8'
+
+services:
+  openclaw-system:
+    build: .
+    container_name: openclaw-multiagent
+    volumes:
+      - .:/app
+      - ./venv:/app/venv
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: python start.py --mode auto
+    restart: unless-stopped
+    
+  monitor:
+    build: .
+    container_name: openclaw-monitor
+    volumes:
+      - .:/app
+    command: python monitor_logs.py
+    depends_on:
+      - openclaw-system
+    restart: unless-stopped
+
+networks:
+  default:
+    name: openclaw-network
+13. Dockerfile
+dockerfile
+Копировать
+# Dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Установка системных зависимостей
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Копирование файлов
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+# Создание необходимых директорий
+RUN mkdir -p .openclaw/logs .openc
+
+
+
+
+
+Вы
+15:46
+продолжай
+
+
+
+NeuralHub
+15:56
+· claude-sonnet-4-5 · $0.05427
+dockerfile
+Копировать
+RUN mkdir -p .openclaw/logs .openclaw/feedback .openclaw/config
+
+# Установка прав
+RUN chmod +x *.sh 2>/dev/null || true
+
+# Переменные окружения
+ENV PYTHONUNBUFFERED=1
+ENV OPENCLAW_HOME=/app/.openclaw
+
+# Точка входа
+ENTRYPOINT ["python", "start.py"]
+CMD ["--mode", "auto"]
+14. Создание .dockerignore
+code
+Копировать
+# .dockerignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+*.egg-info/
+.git/
+.gitignore
+*.log
+.openclaw/logs/*
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+backups/
+docs/
+tests/__pycache__/
+15. Создание тестов (tests/test_workflow.py)
+python
+Копировать
+# tests/test_workflow.py
+import unittest
+import sys
+from pathlib import Path
+
+# Добавляем корневую директорию в путь
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from start import WorkflowOrchestrator
+from monitor_logs import LogMonitor
+from manage_agents import AgentManager
+
+class TestWorkflowOrchestrator(unittest.TestCase):
+    """Тесты для WorkflowOrchestrator"""
+    
+    def setUp(self):
+        self.config_path = Path("workflow/config.yaml")
+        self.orchestrator = WorkflowOrchestrator(self.config_path)
+    
+    def test_config_loading(self):
+        """Тест загрузки конфигурации"""
+        self.assertIsNotNone(self.orchestrator.config)
+        self.assertIn('phases', self.orchestrator.config)
+    
+    def test_phases_exist(self):
+        """Тест наличия фаз"""
+        phases = self.orchestrator.config['phases']
+        self.assertIn('research', phases)
+        self.assertIn('implementation', phases)
+    
+    def test_git_initialization(self):
+        """Тест инициализации Git"""
+        result = self.orchestrator._init_git()
+        self.assertTrue(result)
+    
+    def test_branch_creation(self):
+        """Тест создания ветки"""
+        branch_name = "test-branch"
+        result = self.orchestrator._create_branch(branch_name)
+        self.assertTrue(result)
+        
+        # Очистка
+        import subprocess
+        subprocess.run(["git", "checkout", "main"], 
+                      capture_output=True, text=True)
+        subprocess.run(["git", "branch", "-D", branch_name], 
+                      capture_output=True, text=True)
+
+class TestLogMonitor(unittest.TestCase):
+    """Тесты для LogMonitor"""
+    
+    def setUp(self):
+        self.monitor = LogMonitor()
+    
+    def test_log_directory_exists(self):
+        """Тест существования директории логов"""
+        self.assertTrue(self.monitor.log_dir.exists())
+    
+    def test_get_latest_logs(self):
+        """Тест получения последних логов"""
+        logs = self.monitor.get_latest_logs()
+        self.assertIsInstance(logs, dict)
+
+class TestAgentManager(unittest.TestCase):
+    """Тесты для AgentManager"""
+    
+    def setUp(self):
+        self.manager = AgentManager()
+    
+    def test_list_agents(self):
+        """Тест получения списка агентов"""
+        agents = self.manager.list_agents()
+        self.assertIsInstance(agents, dict)
+        self.assertIn('research', agents)
+        self.assertIn('implementation', agents)
+    
+    def test_agent_configs_exist(self):
+        """Тест наличия конфигураций агентов"""
+        for phase_dir in self.manager.base_
+
+
+
+
+
+NeuralHub
+16:08
+· claude-sonnet-4-5 · $0.05440
+python
+Копировать
+    def test_agent_configs_exist(self):
+        """Тест наличия конфигураций агентов"""
+        for phase_dir in self.manager.base_dir.iterdir():
+            if phase_dir.is_dir():
+                for agent_dir in phase_dir.iterdir():
+                    if agent_dir.is_dir():
+                        config_file = agent_dir / "config.yaml"
+                        self.assertTrue(config_file.exists(), 
+                                      f"Config not found for {agent_dir.name}")
+
+class TestAgentExecution(unittest.TestCase):
+    """Тесты выполнения агентов"""
+    
+    def test_research_agents(self):
+        """Тест агентов исследования"""
+        orchestrator = WorkflowOrchestrator(Path("workflow/config.yaml"))
+        
+        # Тестируем каждого агента исследования
+        research_agents = [
+            "competitor-analyst",
+            "market-analyst", 
+            "tech-analyst",
+            "product-manager"
+        ]
+        
+        for agent_name in research_agents:
+            with self.subTest(agent=agent_name):
+                # Проверяем что агент существует
+                agent_path = Path(f".openclaw/agents/research/{agent_name}")
+                self.assertTrue(agent_path.exists())
+    
+    def test_implementation_agents(self):
+        """Тест агентов реализации"""
+        implementation_agents = [
+            "architect",
+            "developer",
+            "qa",
+            "validator"
+        ]
+        
+        for agent_name in implementation_agents:
+            with self.subTest(agent=agent_name):
+                agent_path = Path(f".openclaw/agents/implementation/{agent_name}")
+                self.assertTrue(agent_path.exists())
+
+if __name__ == '__main__':
+    unittest.main()
+16. Создание requirements-dev.txt
+code
+Копировать
+# requirements-dev.txt
+# Основные зависимости
+openclaw>=0.1.0
+pyyaml>=6.0
+colorama>=0.4.6
+
+# Тестирование
+pytest>=7.4.0
+pytest-cov>=4.1.0
+pytest-mock>=3.11.1
+
+# Линтеры и форматтеры
+pylint>=2.17.0
+flake8>=6.0.0
+black>=23.7.0
+isort>=5.12.0
+
+# Документация
+pydoc-markdown>=4.8.0
+sphinx>=7.1.0
+
+# Утилиты разработки
+ipython>=8.14.0
+ipdb>=0.13.13
+watchdog>=3.0.0
+17. Создание pre-commit хука
+bash
+Копировать
+# .git/hooks/pre-commit
+#!/bin/bash
+
+echo "🔍 Запуск pre-commit проверок..."
+
+# Активация виртуального окружения
+source venv/bin/activate
+
+# Проверка форматирования
+echo "📝 Проверка форматирования кода..."
+black --check *.py
+if [ $? -ne 0 ]; then
+    echo "❌ Код не отформатирован. Запустите: make format"
+    exit 1
+fi
+
+# Линтинг
+echo "🔍 Проверка качества кода..."
+flake8 *.py --max-line-length=100 --ignore=E203,W503
+if [ $? -ne 0 ]; then
+    echo "⚠️  Обнаружены проблемы в коде"
+    read -p "Продолжить коммит? (y/n): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        exit 1
+    fi
+fi
+
+# Запуск тестов
+echo "🧪 Запуск тестов..."
+pytest tests/ -v
+if [ $? -ne 0 ]; then
+    echo "❌
+
+
+
+
+
+Вы
+16:14
+продолжай
+
+
+
+NeuralHub
+16:14
+bash
+Копировать
+    echo "❌ Тесты не прошли!"
+    read -p "Продолжить коммит? (y/n): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        exit 1
+    fi
+fi
+
+echo "✅ Все проверки пройдены!"
+exit 0
+18. Создание GitHub Actions workflow
+yaml
+Копировать
+# .github/workflows/ci.yml
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        python-version: [3.9, 3.10, 3.11]
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Cache pip packages
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install -r requirements-dev.txt
+    
+    - name: Lint with flake8
+      run: |
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=100 --statistics
+    
+    - name: Check code formatting
+      run: |
+        black --check .
+    
+    - name: Run tests with coverage
+      run: |
+        pytest tests/ -v --cov=. --cov-report=xml --cov-report=html
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+
+  lint:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: 3.11
+    
+    - name: Install dependencies
+      run: |
+        pip install pylint
+    
+    - name: Run pylint
+      run: |
+        pylint *.py --exit-zero
+
+  security:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Run security checks
+      uses: pypa/gh-action-pip-audit@v1.0.0
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: [test, lint]
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Build Docker image
+      run: |
+        docker build -t openclaw-system:${{ github.sha }} .
+    
+    - name: Test Docker image
+      run: |
+        docker run --rm openclaw-system:${{ github.sha }} --help
+19. Создание скрипта для CI/CD
+bash
+Копировать
+# ci.sh
+#!/bin/bash
+
+set -e
+
+echo "╔═══════════════════════════════════════════════════════════╗"
+echo "║           CI/CD Pipeline - Local Execution                ║"
+echo "╚═══════════════════════════════════════════════════════════╝"
+echo ""
+
+# Цвета для вывода
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Функция для логирования
+log_info() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+log_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+# Проверка Python
+log_info "Проверка Python..."
+if ! command -v python3 &> /dev/null; then
+    log_error "Python3 не установлен!"
+    exit 1
+fi
+python_version=$(python3 --version)
+log_info "Python версия: $python_version"
+
+# Активация виртуального окружения
+log_info "Активация виртуального окружения..."
+if [ ! -d "venv" ]; then
+    log_error "Виртуальное окружение не найдено! Запустите: make install"
+    exit 1
+fi
+source venv/bin/activate
+
+# Установка зависимостей для разработки
+log_info "Установка dev-зависимостей..."
+pip install -q -r requirements-dev.txt
+
+# Проверка форматирования
+log_info "Проверка форматирования кода..."
+if black --check . 2>/dev/null; then
+    log_info "✅ Форматирование кода: OK"
+else
+    log_warning "⚠️  Код требует форматирования"
+    read -p "Автоматически отформатировать? (y/n): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        black .
+        log_info "✅ Код отформатирован"
+    fi
+fi
+
+# Проверка импортов
+log_info "Проверка сортировки импортов..."
+if isort --check-only . 2>/dev/null; then
+    log_info "✅ Импорты: OK"
+else
+    log_warning "⚠️  Импорты требуют сортировки"
+    isort .
+    log_info "✅ Импорты отсортированы"
+fi
+
+# Линтинг
+log_info "Запуск flake8..."
+if flake8 . --max-line-length=100 --ignore=E203,W503 --exclude=venv; then
+    log_info "✅ Flake8: OK"
+else
+    log_warning "⚠️  Обнаружены проблемы в коде"
+fi
+
+log_info "Запуск pylint..."
+pylint *.py --exit-zero --max-line-length=100 || true
+
+# Проверка безопасности
+log_info "Проверка безопасности зависимостей..."
+if command -v safety &> /dev/null; then
+    safety check --json || log_warning "⚠️  Обнаружены уязвимости"
+else
+    log_warning "⚠️  safety не установлен, пропускаем проверку безопасности"
+fi
+
+# Запуск тестов
+log_info "Запуск тестов..."
+if pytest tests/ -v --cov=. --cov-report=term --cov-report=html; then
+    log_info "✅ Все тесты пройдены!"
+    
+    # Показываем покрытие
+    log_info "Покрытие кода:"
+    coverage report --skip-covered
+    
+    log_info "HTML отчет сохранен в: htmlcov/index.html"
+else
+    log_error "❌ Тесты не прошли!"
+    exit 1
+fi
+
+# Проверка типов (если установлен mypy)
+if command -v mypy &> /dev/null; then
+    log_info "Проверка типов..."
+    mypy . --ignore-missing-imports || log_warning "⚠️  Проблемы с типами"
+fi
+
+# Создание отчета
+log_info "Создание отчета..."
+cat > ci_report.txt << EOF
+╔═══════════════════════════════════════════════════════════╗
+║              CI/CD Pipeline Report                        ║
+╚═══════════════════════════════════════════════════════════╝
+
+Дата: $(date)
+Python: $python_version
+
+✅ Проверки:
+- Форматирование кода
+- Сортировка импортов
+- Линтинг (flake8, pylint)
+- Безопасность зависимостей
+- Юнит-тесты
+- Покрытие кода
+
+Результаты тестов:
+$(pytest tests/ --tb=no -q)
+
+Покрытие:
+$(coverage report --skip-covered)
+
+EOF
+
+log_info "Отчет сохранен в: ci_report.txt"
+
+echo ""
+echo "╔═══════════════════════════════════════════════════════════╗"
+echo "║            ✅ CI/CD PIPELINE УСПЕШНО ЗАВЕРШЕН! ✅        ║"
+echo "╚═══════════════════════════════════════════════════════════╝"
+20. Создание скрипта для деплоя
+bash
+Копировать
+# deploy.sh
+#!/bin/bash
+
+set -e
+
+echo "╔═══════════════════════════════════════════════════════════╗"
+echo "║              Deployment Script                            ║"
+echo "╚═══════════════════════════════════════════════════════════╝"
+echo ""
+
+# Переменные
+VERSION=${1:-"latest"}
+REGISTRY=${DOCKER_REGISTRY:-""}
+IMAGE_NAME="openclaw-system"
+
+echo "📦 Версия: $VERSION"
+echo "🐳 Registry: ${REGISTRY:-"local"}"
+echo ""
+
+# Функция для логирования
+log_info() {
+    echo -e "\033[0;32m[INFO]\033[0m $1"
+}
+
+log_error() {
+    echo -e "\033[0;31m[ERROR]\033[0m $1"
+}
+
+# Проверка Docker
+if ! command -v docker &> /dev/null; then
+    log_error "Docker не установлен!"
+    exit 1
+fi
+
+# Запуск CI проверок
+log_info "Запуск CI проверок..."
+./ci.sh
+
+# Сборка Docker образа
+log_info "Сборка Docker образа..."
+docker build -t ${IMAGE_NAME}:${VERSION} .
+
+if [ $? -ne 0 ]; then
+    log_error "Ошибка сборки Docker образа!"
+    exit 1
+fi
+
+log_info "✅ Docker образ собран: ${IMAGE_NAME}:${VERSION}"
+
+# Тестирование образа
+log_info "Тестирование Docker образа..."
+docker run --rm ${IMAGE_NAME}:${VERSION} --help
+
+# Тегирование
+if [ -n "$REGISTRY" ]; then
+    log_info "Тегирование для registry..."
+    docker tag ${IMAGE_NAME}:${VERSION} ${REGISTRY}/${IMAGE_NAME}:${VERSION}
+    docker tag ${IMAGE_NAME}:${VERSION} ${REGISTRY}/${IMAGE_NAME}:latest
+    
+    # Push в registry
+    log_info "Отправка в registry..."
+    docker push ${REGISTRY}/${IMAGE_NAME}:${VERSION}
+    docker push ${REGISTRY}/${IMAGE_NAME}:latest
+    
+    log_info "✅ Образ отправлен в registry"
+fi
+
+# Создание release notes
+log_info "Создание release notes..."
+cat > RELEASE_NOTES_${VERSION}.md << EOF
+# Release ${VERSION}
+
+## Дата
+$(date)
+
+## Изменения
+- См. git log для деталей
+
+## Docker образ
+\`\`\`bash
+docker pull ${REGISTRY}${IMAGE_NAME}:${VERSION}
+\`\`\`
+
+## Запуск
+\`\`\`bash
+docker run -it ${REGISTRY}${IMAGE_NAME}:${VERSION}
+\`\`\`
+
+## Тесты
+Все тесты пройдены ✅
+
+## Покрытие кода
+См. htmlcov/index.html
+EOF
+
+log_info "✅ Release notes созданы: RELEASE_NOTES_${VERSION}.md"
+
+echo ""
+echo "╔═══════════════════════════════════════════════════════════╗"
+echo "║            ✅ DEPLOYMENT УСПЕШНО ЗАВЕРШЕН! ✅            ║"
+echo "╚═══════════════════════════════════════════════════════════╝"
+echo ""
+echo "📦 Версия: $VERSION"
+echo "🐳 Образ: ${REGISTRY}${IMAGE_NAME}:${VERSION}"
+echo ""
+21. Обновление Makefile с новыми командами
+makefile
+Копировать
+# Добавляем в существующий Makefile
+
+ci:
+	@echo "🔄 Запуск CI pipeline..."
+	@chmod +x ci.sh
+	@./ci.sh
+
+deploy:
+	@echo "🚀 Запуск deployment..."
+	@chmod +x deploy.sh
+	@./deploy.sh $(VERSION)
+
+docker-build:
+	@echo "🐳 Сборка Docker образа..."
+	@docker build -t openclaw-system:latest .
+
+docker-run:
+	@echo "▶️  Запуск в Docker..."
+	@docker run -it --rm \
+		-v $(PWD):/app \
+		openclaw-system:latest
+
+docker-compose-up:
+	@echo "🐳 Запуск через docker-compose..."
+	@docker-compose up -d
+
+docker-compose-down:
+	@echo "🛑 Остановка docker-compose..."
+	@docker-compose down
+
+docker-compose-logs:
+	@echo "📋 Логи docker-compose..."
+	@docker-compose logs -f
+
+pre-commit-install:
+	@echo "🔧 Установка pre-commit hook..."
+	@cp .git/hooks/pre-commit.sample .git/hooks/pre-commit
+	@chmod +x .git/hooks/pre-commit
+	@echo "✅ Pre-commit hook установлен"
+
+coverage:
+	@echo "📊 Генерация отчета о покрытии..."
+	@source venv/bin/activate && pytest tests/ --cov=. --cov-report=html
+	@echo "✅ Отчет сохранен в htmlcov/index.html"
+	@python -m webbrowser htmlcov/index.html
+
+security-check:
+	@echo "🔒 Проверка безопасности..."
+	@source venv/bin/activate && safety check
+	@source venv/bin/activate && bandit -r . -x ./venv,./tests
+
+performance:
+	@echo "⚡ Тестирование производительности..."
+	@source venv/bin/activate && python -m pytest tests/ --benchmark-only
+
+release:
+	@echo "📦 Создание release..."
+	@read -p "Версия (например, 1.0.0): " version; \
+	git tag -a v$$version -m "Release v$$version"; \
+	git push origin v$$version; \
+	make deploy VERSION=$$version
+
+changelog:
+	@echo "📝 Генерация changelog..."
+	@git log --pretty=format:"- %s (%h)" --since="1 month ago" > CHANGELOG.md
+	@echo "✅ CHANGELOG.md обновлен"
+22. Финальная структура проекта
+code
+Копировать
+openclaw-multiagent-system/
+├── .github/
+│   └── workflows/
+│       └── ci.yml
+├── .openclaw/
+│   ├── agents/
+│   │   ├── research/
+│   │   │   ├── competitor-analyst/
+│   │   │   ```
+│   │   │   ├── competitor-analyst/
+│   │   │   │   ├── config.yaml
+│   │   │   │   ├── prompt.md
+│   │   │   │   └── tools/
+│   │   │   ├── market-analyst/
+│   │   │   │   ├── config.yaml
+│   │   │   │   ├── prompt.md
+│   │   │   │   └── tools/
+│   │   │   ├── tech-analyst/
+│   │   │   │   ├── config.yaml
+│   │   │   │   ├── prompt.md
+│   │   │   │   └── tools/
+│   │   │   └── product-manager/
+│   │   │       ├── config.yaml
+│   │   │       ├── prompt.md
+│   │   │       └── tools/
+│   │   └── implementation/
+│   │       ├── architect/
+│   │       │   ├── config.yaml
+│   │       │   ├── prompt.md
+│   │       │   └── tools/
+│   │       ├── developer/
+│   │       │   ├── config.yaml
+│   │       │   ├── prompt.md
+│   │       │   └── tools/
+│   │       ├── qa/
+│   │       │   ├── config.yaml
+│   │       │   ├── prompt.md
+│   │       │   └── tools/
+│   │       └── validator/
+│   │           ├── config.yaml
+│   │           ├── prompt.md
+│   │           └── tools/
+│   ├── config/
+│   │   ├── agents.yaml
+│   │   └── settings.yaml
+│   ├── logs/
+│   │   ├── workflow_*.log
+│   │   └── workflow_*.json
+│   └── feedback/
+│       └── feedback_*.json
+├── workflow/
+│   ├── config.yaml
+│   ├── phases/
+│   │   ├── research.yaml
+│   │   └── implementation.yaml
+│   └── templates/
+│       ├── agent_config.yaml
+│       └── prompt_template.md
+├── tests/
+│   ├── __init__.py
+│   ├── test_workflow.py
+│   ├── test_agents.py
+│   └── test_integration.py
+├── backups/
+│   └── backup_*.tar.gz
+├── docs/
+│   └── *.html
+├── htmlcov/
+│   └── index.html
+├── venv/
+├── start.py
+├── monitor_logs.py
+├── manage_agents.py
+├── install.sh
+├── ci.sh
+├── deploy.sh
+├── Makefile
+├── Dockerfile
+├── docker-compose.yml
+├── .dockerignore
+├── .gitignore
+├── requirements.txt
+├── requirements-dev.txt
+├── README.md
+├── CHANGELOG.md
+├── LICENSE
+└── ci_report.txt
+23. Создание интеграционных тестов
+python
+Копировать
+# tests/test_integration.py
+import unittest
+import subprocess
+import time
+from pathlib import Path
+import yaml
+import json
+
+class TestIntegration(unittest.TestCase):
+    """Интеграционные тесты полного цикла"""
+    
+    @classmethod
+    def setUpClass(cls):
+        """Подготовка перед всеми тестами"""
+        cls.project_root = Path(__file__).parent.parent
+        
+    def test_full_workflow_research_phase(self):
+        """Тест полного цикла фазы исследования"""
+        
+        # Запускаем только фазу исследования
+        result = subprocess.run(
+            ["python", "start.py", "--phase", "research", "--mode", "auto"],
+            cwd=self.project_root,
+            capture_output=True,
+            text=True,
+            timeout=300  # 5 минут максимум
+        )
+        
+        # Проверяем успешное выполнение
+        self.assertEqual(result.returncode, 0, 
+                        f"Research phase failed: {result.stderr}")
+        
+        # Проверяем что созданы логи
+        log_dir = self.project_root / ".openclaw" / "logs"
+        log_files = list(log_dir.glob("workflow_*.log"))
+        self.assertGreater(len(log_files), 0, "No log files created")
+        
+        # Проверяем что созданы JSON логи
+        json_logs = list(log_dir.glob("workflow_*.json"))
+        self.assertGreater(len(json_logs), 0, "No JSON logs created")
+        
+        # Читаем последний JSON лог
+        latest_json = max(json_logs, key=lambda p: p.stat().st_mtime)
+        with open(latest_json, 'r') as f:
+            log_data = json.load(f)
+        
+        # Проверяем структуру лога
+        self.assertIn('phase', log_data)
+        self.assertEqual(log_data['phase'], 'research')
+        self.assertIn('agents', log_data)
+        
+    def test_full_workflow_implementation_phase(self):
+        """Тест полного цикла фазы реализации"""
+        
+        result = subprocess.run(
+            ["python", "start.py", "--phase", "implementation", "--mode", "auto"],
+            cwd=self.project_root,
+            capture_output=True,
+            text=True,
+            timeout=600  # 10 минут максимум
+        )
+        
+        self.assertEqual(result.returncode, 0,
+                        f"Implementation phase failed: {result.stderr}")
+        
+        # Проверяем что созданы ветки в Git
+        branches_result = subprocess.run(
+            ["git", "branch"],
+            cwd=self.project_root,
+            capture_output=True,
+            text=True
+        )
+        
+        branches = branches_result.stdout
+        self.assertIn('architect', branches, "Architect branch not created")
+        self.assertIn('developer', branches, "Developer branch not created")
+        
+    def test_agent_communication(self):
+        """Тест взаимодействия между агентами"""
+        
+        # Проверяем что feedback файлы создаются
+     
+
+Напиши сообщение…
+
+NeuralHub может ошибаться · Наведи на сообщение для действий

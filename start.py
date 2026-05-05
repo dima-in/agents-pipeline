@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
@@ -17,7 +17,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--phase",
-        choices=["research", "implementation", "full"],
+        choices=["research", "implementation", "deployment", "full"],
         default="full",
         help="Phase to run",
     )
@@ -25,6 +25,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         default="workflow/config.yaml",
         help="Path to workflow config",
+    )
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Only validate runtime configuration and exit",
     )
     parser.add_argument(
         "--skip-git",
@@ -49,10 +54,15 @@ def main() -> int:
     orchestrator.config["git"]["enabled"] = not args.skip_git
     orchestrator.config["logging"]["level"] = args.log_level
 
+    if args.preflight_only:
+        return 0 if orchestrator._preflight_runtime() else 1
+
     if args.phase == "research":
         ok = orchestrator.run_research_phase()
     elif args.phase == "implementation":
         ok = orchestrator.run_implementation_phase()
+    elif args.phase == "deployment":
+        ok = orchestrator.run_deployment_phase()
     else:
         ok = orchestrator.run_full_cycle()
 
@@ -61,4 +71,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

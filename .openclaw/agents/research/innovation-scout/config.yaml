@@ -1,0 +1,6 @@
+name: innovation-scout
+phase: research
+description: "Find product, UX, GTM, and workflow innovations relevant to the current project"
+timeout: 300
+commands:
+  - echo "Scout innovations"
