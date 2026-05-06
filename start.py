@@ -7,6 +7,13 @@ import sys
 from workflow.orchestrator import WorkflowOrchestrator
 
 
+def configure_stdio() -> None:
+    for stream_name in ("stdin", "stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is not None and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="agents-pipeline multi-agent workflow")
     parser.add_argument(
@@ -46,6 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    configure_stdio()
     parser = build_parser()
     args = parser.parse_args()
 
