@@ -1,33 +1,49 @@
-﻿agents:
+agents:
+  - name: project-analyst
+    phase: research
+    description: Analyze the current repository, delivery context, and immediate gaps
+    timeout: 900
   - name: competitor-analyst
     phase: research
     description: Analyze competitors and compare workflows
-    timeout: 300
+    timeout: 600
   - name: market-analyst
     phase: research
     description: Analyze market demand and trends
-    timeout: 300
+    timeout: 600
   - name: tech-analyst
     phase: research
     description: Compare technical approaches and risks
-    timeout: 300
+    timeout: 600
+  - name: innovation-scout
+    phase: research
+    description: Discover product, UX, GTM, and workflow innovations worth testing
+    timeout: 600
   - name: product-manager
     phase: research
     description: Consolidate findings into a product brief
-    timeout: 600
+    timeout: 900
   - name: architect
     phase: implementation
     description: Prepare the technical plan and delivery steps
-    timeout: 600
+    timeout: 900
   - name: developer
     phase: implementation
     description: Implement the requested changes
-    timeout: 1800
+    timeout: 2400
   - name: qa
     phase: implementation
     description: Run validation and produce retry feedback
-    timeout: 600
+    timeout: 900
   - name: template-validator
     phase: implementation
     description: Check structure against the target template
-    timeout: 300
+    timeout: 600
+  - name: production-readiness-checker
+    phase: deployment
+    description: Audit production readiness, launch blockers, and operational gaps
+    timeout: 900
+  - name: launch-strategist
+    phase: deployment
+    description: Build launch plan, communication assets, and rollout checklist
+    timeout: 900

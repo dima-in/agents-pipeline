@@ -13,8 +13,7 @@ if exist venv\Scripts\activate.bat (
 )
 
 if "%~1"=="python" (
-  shift
-  python %*
+  python %2 %3 %4 %5 %6 %7 %8 %9
   exit /b %errorlevel%
 )
 

@@ -1,10 +1,16 @@
-﻿project:
+project:
   name: agents-pipeline
   workspace: .
 
 openclaw:
   bin: openclaw
+  provider: claude
+  model: anthropic/claude-sonnet-4-5
+  profile: default
+  preflight_enabled: true
+  run_mode: local
+  thinking: low
 
 agents:
-  default_timeout: 600
+  default_timeout: 900
   auto_register_on_bootstrap: false

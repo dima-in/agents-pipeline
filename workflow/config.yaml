@@ -1,6 +1,10 @@
-﻿workflow:
+workflow:
   mode: interactive
   auto_continue_delay: 3
+  phase_order:
+    - research
+    - implementation
+    - deployment
 
 project:
   name: agents-pipeline
@@ -16,36 +20,55 @@ phases:
   research:
     name: "Research"
     requires_approval: true
+    approval_prompt: "Подтвердить результаты исследования?"
     agents:
+      - name: project-analyst
+        description: "Analyze the current repository, constraints, gaps, and immediate opportunities"
+        timeout: 900
       - name: competitor-analyst
         description: "Analyze competitors"
-        timeout: 300
+        timeout: 600
       - name: market-analyst
         description: "Analyze market and trends"
-        timeout: 300
+        timeout: 600
       - name: tech-analyst
         description: "Review technical options"
-        timeout: 300
+        timeout: 600
+      - name: innovation-scout
+        description: "Find adjacent product and workflow innovations"
+        timeout: 600
       - name: product-manager
         description: "Summarize and prepare requirements"
-        timeout: 600
+        timeout: 900
 
   implementation:
     name: "Implementation"
     agents:
       - name: architect
         description: "Prepare technical plan"
-        timeout: 600
+        timeout: 900
       - name: developer
         description: "Implement the task"
-        timeout: 1800
+        timeout: 2400
         max_retries: 3
       - name: qa
         description: "Run checks and report regressions"
-        timeout: 600
+        timeout: 900
       - name: template-validator
         description: "Validate output against template"
-        timeout: 300
+        timeout: 600
+
+  deployment:
+    name: "Deployment Readiness"
+    requires_approval: true
+    approval_prompt: "Подтвердить готовность к production и план запуска?"
+    agents:
+      - name: production-readiness-checker
+        description: "Check production readiness, release risks, and launch blockers"
+        timeout: 900
+      - name: launch-strategist
+        description: "Prepare launch plan, channels, and rollout checklist after readiness approval"
+        timeout: 900
 
 git:
   enabled: true
