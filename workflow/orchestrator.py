@@ -154,7 +154,7 @@ class WorkflowOrchestrator:
             return False
 
         runner = resolve_runner_path(self.runtime.runner_bin) or self.runtime.runner_bin
-        cmd, message, prompt_stats = self._build_agent_command(runner, agent_name, agent_config, prompt_file, timeout)
+        cmd, message, prompt_stats = self._build_agent_command(runner, agent_name, agent_config, prompt_file, timeout, phase)
 
         self.logger.agent_progress(agent_name, "Полная команда OpenClaw:")
         self.logger.agent_progress(agent_name, " ".join(cmd))
@@ -460,9 +460,11 @@ class WorkflowOrchestrator:
         agent_config: dict[str, Any],
         prompt_file: Path,
         timeout: int,
+        phase: str,
     ) -> tuple[list[str], str, dict[str, int]]:
         prompt_text = prompt_file.read_text(encoding="utf-8").strip()
         task = agent_config.get("description", "").strip()
+        previous_context = self._build_previous_agent_context(phase, agent_name)
         translation_instruction = (
             "Output format is mandatory. Write the full primary answer in English first. "
             "Then add a second section titled exactly 'Russian translation' with a clear Russian translation "
@@ -473,6 +475,8 @@ class WorkflowOrchestrator:
         if task:
             message_parts.append(f"Task: {task}")
         message_parts.append(prompt_text)
+        if previous_context:
+            message_parts.append(f"Previous agent context:\n{previous_context}")
         message_parts.append(translation_instruction)
         message = "\n\n".join(message_parts)
         prompt_stats = {
@@ -489,6 +493,51 @@ class WorkflowOrchestrator:
         if runtime["thinking"]:
             cmd.extend(["--thinking", runtime["thinking"]])
         return cmd, message, prompt_stats
+
+    def _build_previous_agent_context(self, phase: str, agent_name: str, limit: int = 4000) -> str:
+        agent_dir = self.logger.run_dir / "agents" / phase
+        if not agent_dir.exists():
+            return ""
+
+        chunks: list[str] = []
+        total = 0
+        current_safe_name = self.logger._safe_name(agent_name)
+
+        for json_path in sorted(agent_dir.glob("*.json")):
+            if json_path.stem == current_safe_name:
+                continue
+            try:
+                payload = json.loads(json_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+
+            if payload.get("status") != "success":
+                continue
+
+            source_text = str(payload.get("parsed_output") or payload.get("stdout") or "").strip()
+            if not source_text:
+                continue
+
+            heading = f"[{payload.get('agent_name') or payload.get('agent') or json_path.stem}]\n"
+            remaining = limit - total
+            if remaining <= len(heading):
+                break
+
+            body_limit = remaining - len(heading)
+            if len(source_text) > body_limit:
+                source_text = source_text[-body_limit:]
+
+            chunk = heading + source_text
+            chunks.append(chunk)
+            total += len(chunk) + 2
+
+            if total >= limit:
+                break
+
+        context = "\n\n".join(chunks)
+        if len(context) <= limit:
+            return context
+        return context[-limit:]
 
     @staticmethod
     def _extract_agent_output(stdout: str) -> str:
