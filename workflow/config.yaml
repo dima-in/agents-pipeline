@@ -28,6 +28,8 @@ phases:
       - name: competitor-analyst
         description: "Analyze competitors"
         timeout: 600
+        provider: openrouter
+        model: perplexity/sonar
       - name: market-analyst
         description: "Analyze market and trends"
         timeout: 600
@@ -37,6 +39,8 @@ phases:
       - name: innovation-scout
         description: "Find adjacent product and workflow innovations"
         timeout: 600
+        provider: openrouter
+        model: perplexity/sonar
       - name: product-manager
         description: "Summarize and prepare requirements"
         timeout: 900

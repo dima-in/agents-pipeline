@@ -4,7 +4,9 @@ import json
 import os
 import subprocess
 import time
+from queue import Empty, Queue
 from pathlib import Path
+from threading import Thread
 from typing import Any
 
 import git
@@ -61,14 +63,17 @@ class WorkflowOrchestrator:
         self.logger.phase_start(phase["name"])
         ok = self._run_phase_agents(phase, phase_key)
         if not ok:
+            self.logger.save_phase_summary(phase_key, phase["name"])
             self.logger.phase_end(phase["name"], "failed")
             return False
 
         approval_prompt = phase.get("approval_prompt") or f"Подтвердить результаты фазы {phase['name']}?"
         if phase.get("requires_approval") and not self._wait_for_user(approval_prompt):
+            self.logger.save_phase_summary(phase_key, phase["name"])
             self.logger.phase_end(phase["name"], "rejected")
             return False
 
+        self.logger.save_phase_summary(phase_key, phase["name"])
         self.logger.phase_end(phase["name"], "success")
         return True
 
@@ -92,8 +97,10 @@ class WorkflowOrchestrator:
             ok = self._run_phase_agents(phase, "implementation")
             if ok:
                 if self.config["git"]["enabled"] and not self._merge_git():
+                    self.logger.save_phase_summary("implementation", phase["name"])
                     self.logger.phase_end(phase["name"], "failed")
                     return False
+                self.logger.save_phase_summary("implementation", phase["name"])
                 self.logger.phase_end(phase["name"], "success")
                 return True
 
@@ -103,6 +110,7 @@ class WorkflowOrchestrator:
                 if attempt < max_retries:
                     self._create_git_branch(task_id)
 
+        self.logger.save_phase_summary("implementation", phase["name"])
         self.logger.phase_end(phase["name"], "failed")
         return False
 
@@ -121,6 +129,7 @@ class WorkflowOrchestrator:
         timeout = agent_config.get("timeout", 600)
         agent_dir = Path(".openclaw/agents") / phase / agent_name
         prompt_file = agent_dir / "prompt.md"
+        agent_runtime = self._resolve_agent_runtime(agent_config)
 
         self.logger.agent_start(agent_name, agent_config.get("description", ""))
         if index and total:
@@ -129,6 +138,11 @@ class WorkflowOrchestrator:
         self.logger.agent_progress(agent_name, f"Провайдер: {self.runtime.provider}")
         self.logger.agent_progress(agent_name, f"Модель: {self.runtime.model}")
         self.logger.agent_progress(agent_name, f"Режим запуска: {self.runtime.run_mode}")
+
+        self.logger.agent_progress(
+            agent_name,
+            f"Runtime override: provider={agent_runtime['provider']} model={agent_runtime['model']} thinking={agent_runtime['thinking']}",
+        )
 
         if not agent_dir.exists():
             self.logger.error(f"Каталог агента не найден: {agent_dir}")
@@ -162,9 +176,33 @@ class WorkflowOrchestrator:
         self.logger.agent_progress(agent_name, "")
         self.logger.agent_progress(agent_name, "Ожидание ответа агента...")
 
+        def save_agent_report(status: str, result: str, elapsed_s: float, stdout: str, stderr: str, parsed_output: str) -> None:
+            self.logger.save_agent_report(
+                phase,
+                agent_name,
+                {
+                    "phase": phase,
+                    "agent": agent_name,
+                    "agent_name": agent_name,
+                    "status": status,
+                    "result": result,
+                    "elapsed_s": round(elapsed_s, 2),
+                    "returncode": getattr(process, "returncode", None) if "process" in locals() else None,
+                    "runtime": agent_runtime,
+                    "command": " ".join(cmd),
+                    "message": message,
+                    "prompt_stats": prompt_stats,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "parsed_output": parsed_output,
+                },
+            )
+
         started_at = time.monotonic()
         heartbeat_interval = 15.0
         last_heartbeat = started_at
+        stdout_lines: list[str] = []
+        stderr_lines: list[str] = []
         try:
             process = subprocess.Popen(
                 cmd,
@@ -173,17 +211,25 @@ class WorkflowOrchestrator:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                env=self._build_agent_env(),
+                env=self._build_agent_env(agent_config),
+                bufsize=1,
             )
+            output_queue: Queue[tuple[str, str]] = Queue()
+            stdout_thread = self._start_stream_reader(process.stdout, "stdout", output_queue)
+            stderr_thread = self._start_stream_reader(process.stderr, "stderr", output_queue)
             while True:
+                self._drain_output_queue(agent_name, output_queue, stdout_lines, stderr_lines)
                 if process.poll() is not None:
-                    stdout, stderr = process.communicate()
                     break
                 now = time.monotonic()
                 elapsed = now - started_at
                 if elapsed >= timeout:
                     process.kill()
-                    stdout, stderr = process.communicate()
+                    stdout_thread.join(timeout=2)
+                    stderr_thread.join(timeout=2)
+                    self._drain_output_queue(agent_name, output_queue, stdout_lines, stderr_lines)
+                    stdout = "\n".join(stdout_lines)
+                    stderr = "\n".join(stderr_lines)
                     timeout_details = [
                         f"timeout_s={timeout}",
                         f"elapsed_s={elapsed:.2f}",
@@ -194,6 +240,7 @@ class WorkflowOrchestrator:
                     if tail:
                         timeout_details.append(f"last_output_tail={tail}")
                     self.logger.error(f"Агент превысил таймаут: {agent_name}", " | ".join(timeout_details))
+                    save_agent_report("failed", "timeout", elapsed, stdout, stderr, "")
                     self.logger.agent_end(agent_name, "failed", "timeout")
                     return False
                 if now - last_heartbeat >= heartbeat_interval:
@@ -203,8 +250,14 @@ class WorkflowOrchestrator:
                     )
                     last_heartbeat = now
                 time.sleep(1)
+            stdout_thread.join(timeout=2)
+            stderr_thread.join(timeout=2)
+            self._drain_output_queue(agent_name, output_queue, stdout_lines, stderr_lines)
+            stdout = "\n".join(stdout_lines)
+            stderr = "\n".join(stderr_lines)
         except FileNotFoundError:
             self.logger.error("Команда openclaw не найдена", "Проверь установку OpenClaw или переменную OPENCLAW_BIN.")
+            save_agent_report("failed", "openclaw missing", 0.0, "", "", "")
             self.logger.agent_end(agent_name, "failed", "openclaw missing")
             return False
 
@@ -239,6 +292,7 @@ class WorkflowOrchestrator:
             if stderr_tail:
                 details += f" | stderr_tail={stderr_tail}"
             self.logger.error(f"Агент вернул некорректный результат: {agent_name}", details)
+            save_agent_report("failed", failure_reason, elapsed, stdout, stderr, parsed_output)
             self.logger.agent_end(agent_name, "failed", failure_reason)
             return False
 
@@ -248,9 +302,11 @@ class WorkflowOrchestrator:
             if stderr_tail:
                 details += f" | stderr_tail={stderr_tail}"
             self.logger.error(f"Агент завершился с ошибкой: {agent_name}", details)
+            save_agent_report("failed", stderr.strip() or "non-zero exit", elapsed, stdout, stderr, parsed_output)
             self.logger.agent_end(agent_name, "failed", stderr.strip())
             return False
 
+        save_agent_report("success", "completed", elapsed, stdout, stderr, parsed_output)
         self.logger.agent_end(agent_name, "success", "completed")
         return True
 
@@ -376,10 +432,26 @@ class WorkflowOrchestrator:
         )
         return True
 
-    def _build_agent_env(self) -> dict[str, str]:
+    def _build_agent_env(self, agent_config: dict[str, Any] | None = None) -> dict[str, str]:
         env = dict(os.environ)
         env.update(self.runtime.env_overrides)
+        if agent_config:
+            runtime = self._resolve_agent_runtime(agent_config)
+            if runtime["provider"]:
+                env["OPENCLAW_PROVIDER"] = runtime["provider"]
+            if runtime["model"]:
+                env["OPENCLAW_MODEL"] = runtime["model"]
+            if runtime["profile"]:
+                env["OPENCLAW_PROFILE"] = runtime["profile"]
         return env
+
+    def _resolve_agent_runtime(self, agent_config: dict[str, Any]) -> dict[str, str]:
+        return {
+            "provider": str(agent_config.get("provider") or self.runtime.provider),
+            "model": str(agent_config.get("model") or self.runtime.model),
+            "profile": str(agent_config.get("profile") or self.runtime.profile),
+            "thinking": str(agent_config.get("thinking") or self.runtime.thinking),
+        }
 
     def _build_agent_command(
         self,
@@ -391,10 +463,17 @@ class WorkflowOrchestrator:
     ) -> tuple[list[str], str, dict[str, int]]:
         prompt_text = prompt_file.read_text(encoding="utf-8").strip()
         task = agent_config.get("description", "").strip()
+        translation_instruction = (
+            "Output format is mandatory. Write the full primary answer in English first. "
+            "Then add a second section titled exactly 'Russian translation' with a clear Russian translation "
+            "of the full answer. Keep both sections aligned in meaning. "
+            "Do not omit the Russian translation section. Do not end the answer before that section appears."
+        )
         message_parts = []
         if task:
             message_parts.append(f"Task: {task}")
         message_parts.append(prompt_text)
+        message_parts.append(translation_instruction)
         message = "\n\n".join(message_parts)
         prompt_stats = {
             "prompt_chars": len(prompt_text),
@@ -403,11 +482,12 @@ class WorkflowOrchestrator:
             "message_lines": len(message.splitlines()) if message else 0,
         }
 
+        runtime = self._resolve_agent_runtime(agent_config)
         cmd = [runner, "agent", "--agent", agent_name, "--message", message, "--timeout", str(timeout), "--json"]
         if self.runtime.run_mode == "local":
             cmd.append("--local")
-        if self.runtime.thinking:
-            cmd.extend(["--thinking", self.runtime.thinking])
+        if runtime["thinking"]:
+            cmd.extend(["--thinking", runtime["thinking"]])
         return cmd, message, prompt_stats
 
     @staticmethod
@@ -426,6 +506,47 @@ class WorkflowOrchestrator:
                 if isinstance(value, str) and value.strip():
                     return value.strip()
         return text
+
+    def _start_stream_reader(
+        self,
+        stream: Any,
+        stream_name: str,
+        output_queue: Queue[tuple[str, str]],
+    ) -> Thread:
+        def reader() -> None:
+            if stream is None:
+                return
+            try:
+                for line in iter(stream.readline, ""):
+                    output_queue.put((stream_name, line.rstrip("\r\n")))
+            finally:
+                stream.close()
+
+        thread = Thread(target=reader, daemon=True)
+        thread.start()
+        return thread
+
+    def _drain_output_queue(
+        self,
+        agent_name: str,
+        output_queue: Queue[tuple[str, str]],
+        stdout_lines: list[str],
+        stderr_lines: list[str],
+    ) -> None:
+        while True:
+            try:
+                stream_name, line = output_queue.get_nowait()
+            except Empty:
+                return
+
+            if stream_name == "stdout":
+                stdout_lines.append(line)
+                if line.strip():
+                    self.logger.agent_progress(agent_name, f"[stdout] {line}")
+            else:
+                stderr_lines.append(line)
+                if line.strip():
+                    self.logger.agent_progress(agent_name, f"[stderr] {line}")
 
     @staticmethod
     def _tail_text(text: str, limit: int = 400) -> str:
@@ -449,6 +570,8 @@ class WorkflowOrchestrator:
             return "llm idle timeout"
         if "did not produce a response" in combined:
             return "llm produced no response"
+        if parsed_output and "russian translation" not in parsed_output.lower():
+            return "missing russian translation section"
         return ""
 
     def _get_registered_agents(self, runner_path: str) -> set[str]:

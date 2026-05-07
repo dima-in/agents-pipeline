@@ -16,6 +16,9 @@ class WorkflowLogger:
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.run_id = timestamp
+        self.run_dir = self.log_dir / f"run_{timestamp}"
+        self.run_dir.mkdir(parents=True, exist_ok=True)
         self.log_file = self.log_dir / f"workflow_{timestamp}.log"
         self.json_file = self.log_dir / f"workflow_{timestamp}.json"
         self.json_events: list[dict] = []
@@ -105,6 +108,107 @@ class WorkflowLogger:
         )
         return summary
 
+    def save_agent_report(self, phase: str, agent_name: str, payload: dict) -> tuple[Path, Path]:
+        agent_dir = self.run_dir / "agents" / phase
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        base_name = self._safe_name(agent_name)
+        json_path = agent_dir / f"{base_name}.json"
+        md_path = agent_dir / f"{base_name}.md"
+
+        payload = {
+            "timestamp": datetime.now().isoformat(),
+            "agent_name": agent_name,
+            "phase": phase,
+            **payload,
+        }
+
+        json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        sections = [
+            f"# {agent_name}",
+            "",
+            f"- timestamp: {payload.get('timestamp', '')}",
+            f"- agent_name: {payload.get('agent_name', '')}",
+            f"- phase: {payload.get('phase', '')}",
+            f"- status: {payload.get('status', '')}",
+            f"- result: {payload.get('result', '')}",
+            f"- elapsed_s: {payload.get('elapsed_s', '')}",
+            f"- returncode: {payload.get('returncode', '')}",
+            f"- provider: {payload.get('runtime', {}).get('provider', '')}",
+            f"- model: {payload.get('runtime', {}).get('model', '')}",
+            f"- thinking: {payload.get('runtime', {}).get('thinking', '')}",
+            "",
+            "## Command",
+            "",
+            "```text",
+            payload.get("command", ""),
+            "```",
+            "",
+            "## Prompt Message",
+            "",
+            "```text",
+            payload.get("message", ""),
+            "```",
+            "",
+            "## Parsed Output",
+            "",
+            "```text",
+            payload.get("parsed_output", ""),
+            "```",
+            "",
+            "## Stdout",
+            "",
+            "```text",
+            payload.get("stdout", ""),
+            "```",
+            "",
+            "## Stderr",
+            "",
+            "```text",
+            payload.get("stderr", ""),
+            "```",
+        ]
+        md_path.write_text("\n".join(sections) + "\n", encoding="utf-8")
+        return md_path, json_path
+
+    def save_phase_summary(self, phase: str, phase_name: str = "") -> Path:
+        agent_dir = self.run_dir / "agents" / phase
+        summary_path = self.run_dir / f"{phase}-summary.md"
+        if not agent_dir.exists():
+            summary_path.write_text(f"# {phase_name or phase} Summary\n\nNo agent reports found.\n", encoding="utf-8")
+            return summary_path
+
+        reports: list[dict] = []
+        for json_path in sorted(agent_dir.glob("*.json")):
+            try:
+                reports.append(json.loads(json_path.read_text(encoding="utf-8")))
+            except Exception:
+                continue
+
+        sections = [f"# {phase_name or phase} Summary", ""]
+        for report in reports:
+            sections.extend(
+                [
+                    f"## {report.get('agent', 'agent')}",
+                    "",
+                    f"- status: {report.get('status', '')}",
+                    f"- result: {report.get('result', '')}",
+                    f"- elapsed_s: {report.get('elapsed_s', '')}",
+                    f"- provider: {report.get('runtime', {}).get('provider', '')}",
+                    f"- model: {report.get('runtime', {}).get('model', '')}",
+                    "",
+                    "### Parsed Output",
+                    "",
+                    "```text",
+                    report.get("parsed_output", ""),
+                    "```",
+                    "",
+                ]
+            )
+
+        summary_path.write_text("\n".join(sections).rstrip() + "\n", encoding="utf-8")
+        return summary_path
+
     def _log_json(self, event_type: str, data: dict) -> None:
         event = {
             "timestamp": datetime.now().isoformat(),
@@ -126,6 +230,16 @@ class WorkflowLogger:
             "timeout": "таймаут",
         }
         return mapping.get(status, status)
+
+    @staticmethod
+    def _safe_name(value: str) -> str:
+        result = []
+        for char in value.lower():
+            if char.isalnum() or char in {"-", "_"}:
+                result.append(char)
+            else:
+                result.append("-")
+        return "".join(result).strip("-") or "agent"
 
     @staticmethod
     def _console(color: str, message: str) -> None:

@@ -55,7 +55,7 @@
           "maxTokens": 65536
         }
       ],
-      "apiKey": "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"
+      "apiKey": "OPENROUTER_API_KEY"
     },
     "openai-codex": {
       "baseUrl": "https://chatgpt.com/backend-api",
@@ -121,7 +121,7 @@
           }
         }
       ],
-      "apiKey": "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"
+      "apiKey": "OPENROUTER_API_KEY"
     }
   }
 }

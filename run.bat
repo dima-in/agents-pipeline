@@ -20,4 +20,9 @@ if "%~1"=="python" (
   exit /b %errorlevel%
 )
 
+where openclaw.CMD >nul 2>nul
+if %errorlevel%==0 (
+  call openclaw.CMD gateway start >nul 2>nul
+)
+
 python start.py %*

@@ -13,3 +13,12 @@ def test_detect_agent_failure_recognizes_idle_timeout() -> None:
         "",
     )
     assert reason == "llm idle timeout"
+
+
+def test_detect_agent_failure_requires_russian_translation_section() -> None:
+    reason = WorkflowOrchestrator._detect_agent_failure(
+        "",
+        "",
+        "English section only without the required translated block.",
+    )
+    assert reason == "missing russian translation section"

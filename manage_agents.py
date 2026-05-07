@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -17,6 +18,7 @@ class AgentManager:
         self.config_dir = Path(config_dir)
         self.settings = self._load_yaml(self.config_dir / 'settings.yaml', {})
         self.agent_catalog = self._load_yaml(self.config_dir / 'agents.yaml', {'agents': []})
+        self.workflow_config = self._load_yaml(Path('workflow/config.yaml'), {'phases': {}})
         self.openclaw_bin = self.settings.get('openclaw', {}).get('bin', 'openclaw')
         self.workspace = self.settings.get('project', {}).get('workspace', '.')
         self.default_timeout = self.settings.get('agents', {}).get('default_timeout', 600)
@@ -88,6 +90,7 @@ class AgentManager:
             print(f'{Fore.RED}Agent not found: {agent_dir}{Style.RESET_ALL}')
             return 1
 
+        overrides = self._get_agent_registration_overrides(name, phase)
         cmd = [
             self.openclaw_bin,
             'agents',
@@ -98,7 +101,19 @@ class AgentManager:
             '--workspace',
             self.workspace,
         ]
-        return self._run_command(cmd)
+        if overrides.get('model'):
+            cmd.extend(['--model', overrides['model']])
+
+        env = None
+        if overrides:
+            env = dict(os.environ)
+            if overrides.get('provider'):
+                env['OPENCLAW_PROVIDER'] = overrides['provider']
+            if overrides.get('model'):
+                env['OPENCLAW_MODEL'] = overrides['model']
+            if overrides.get('profile'):
+                env['OPENCLAW_PROFILE'] = overrides['profile']
+        return self._run_command(cmd, env=env)
 
     def register_all(self) -> int:
         exit_code = 0
@@ -140,9 +155,9 @@ class AgentManager:
             return yaml.safe_load(handle) or fallback
 
     @staticmethod
-    def _run_command(cmd: list[str]) -> int:
+    def _run_command(cmd: list[str], env: dict[str, str] | None = None) -> int:
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
+            result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', env=env)
         except FileNotFoundError:
             print(f'{Fore.RED}Command not found: {cmd[0]}{Style.RESET_ALL}')
             return 1
@@ -152,6 +167,17 @@ class AgentManager:
         if result.stderr:
             print(result.stderr)
         return result.returncode
+
+    def _get_agent_registration_overrides(self, name: str, phase: str) -> dict[str, str]:
+        phase_config = self.workflow_config.get('phases', {}).get(phase, {})
+        for agent in phase_config.get('agents', []):
+            if agent.get('name') == name:
+                return {
+                    'provider': str(agent.get('provider', '') or ''),
+                    'model': str(agent.get('model', '') or ''),
+                    'profile': str(agent.get('profile', '') or ''),
+                }
+        return {}
 
 
 def build_parser() -> argparse.ArgumentParser:
