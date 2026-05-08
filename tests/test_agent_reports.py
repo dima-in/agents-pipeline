@@ -2,6 +2,7 @@ import io
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import workflow.orchestrator as orchestrator_module
 from workflow.logger import WorkflowLogger
@@ -28,11 +29,25 @@ class _FakePopen:
         self.returncode = -9
 
 
+def _fake_models_list(*_args, **_kwargs) -> SimpleNamespace:
+    return SimpleNamespace(
+        returncode=0,
+        stdout=(
+            "claude-sonnet-4-5-20250929\n"
+            "anthropic/claude-sonnet-4-6\n"
+            "openrouter/anthropic/claude-sonnet-4.6\n"
+            "perplexity/sonar\n"
+        ),
+        stderr="",
+    )
+
+
 def test_successful_agent_run_creates_report_files(monkeypatch, tmp_path: Path) -> None:
     orchestrator = WorkflowOrchestrator("workflow/config.yaml")
     orchestrator.logger = WorkflowLogger(log_dir=str(tmp_path / "logs"))
 
     monkeypatch.setattr(orchestrator_module, "resolve_runner_path", lambda _runner: "openclaw")
+    monkeypatch.setattr(subprocess, "run", _fake_models_list)
     monkeypatch.setattr(subprocess, "Popen", _FakePopen)
 
     ok = orchestrator._run_agent(
@@ -101,7 +116,7 @@ def test_second_agent_message_includes_previous_agent_output(tmp_path: Path) -> 
             "stdout": "stdout text",
             "stderr": "",
             "parsed_output": "English summary.\n\nRussian translation\nРусский перевод.",
-            "runtime": {"provider": "claude", "model": "claude-sonnet-4-20250514", "thinking": "low"},
+            "runtime": {"provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.6", "thinking": "low"},
         },
     )
 
@@ -135,7 +150,7 @@ def test_previous_context_is_limited_to_4000_characters(tmp_path: Path) -> None:
             "stdout": "",
             "stderr": "",
             "parsed_output": long_text,
-            "runtime": {"provider": "claude", "model": "claude-sonnet-4-20250514", "thinking": "low"},
+            "runtime": {"provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.6", "thinking": "low"},
         },
     )
 
@@ -143,3 +158,105 @@ def test_previous_context_is_limited_to_4000_characters(tmp_path: Path) -> None:
 
     assert "[project-analyst]" in context
     assert len(context) <= 4000
+
+
+def test_failed_agents_are_excluded_from_previous_context_and_phase_summary_json(tmp_path: Path) -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+    orchestrator.logger = WorkflowLogger(log_dir=str(tmp_path / "logs"))
+
+    orchestrator.logger.save_agent_report(
+        "research",
+        "project-analyst",
+        {
+            "status": "success",
+            "result": "completed",
+            "elapsed_s": 10,
+            "returncode": 0,
+            "message": "prompt",
+            "stdout": "",
+            "stderr": "",
+            "parsed_output": "English summary.\n\nRussian translation\nРусский перевод.",
+            "runtime": {"provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.6", "thinking": "low"},
+        },
+    )
+    orchestrator.logger.save_agent_report(
+        "research",
+        "market-analyst",
+        {
+            "status": "invalid_output",
+            "result": "missing russian translation section",
+            "elapsed_s": 20,
+            "returncode": 0,
+            "message": "prompt",
+            "stdout": "bad output",
+            "stderr": "",
+            "parsed_output": "English only.",
+            "runtime": {"provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.6", "thinking": "low"},
+        },
+    )
+
+    context = orchestrator._build_previous_agent_context("research", "competitor-analyst")
+    assert "[project-analyst]" in context
+    assert "[market-analyst]" not in context
+
+    orchestrator.logger.save_phase_summary("research", "Research")
+    summary_payload = json.loads((orchestrator.logger.run_dir / "phase_summary.json").read_text(encoding="utf-8"))
+    assert summary_payload["phase"] == "research"
+    assert summary_payload["completed_agents"] == 1
+    assert summary_payload["failed_agents"] == 1
+    assert summary_payload["total_elapsed_s"] == 30.0
+
+
+def test_invalid_model_blocks_agent_launch(monkeypatch, tmp_path: Path) -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+    orchestrator.logger = WorkflowLogger(log_dir=str(tmp_path / "logs"))
+    effective_runtime = orchestrator._resolve_agent_runtime({"name": "project-analyst"})
+
+    monkeypatch.setattr(orchestrator_module, "resolve_runner_path", lambda _runner: "openclaw")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="perplexity/sonar\n", stderr=""),
+    )
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("agent launch must not happen for an unavailable model")
+
+    monkeypatch.setattr(subprocess, "Popen", fail_if_called)
+
+    ok = orchestrator._run_agent(
+        {
+            "name": "project-analyst",
+            "description": "Analyze repo",
+            "timeout": 5,
+        },
+        "research",
+    )
+
+    assert ok is False
+    payload = json.loads(
+        (orchestrator.logger.run_dir / "agents" / "research" / "project-analyst.json").read_text(encoding="utf-8")
+    )
+    assert payload["status"] == "failed"
+    assert payload["result"].startswith("Configured model is not available:")
+    assert effective_runtime["model"] in payload["result"]
+
+
+def test_valid_model_allows_agent_launch(monkeypatch, tmp_path: Path) -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+    orchestrator.logger = WorkflowLogger(log_dir=str(tmp_path / "logs"))
+
+    monkeypatch.setattr(orchestrator_module, "resolve_runner_path", lambda _runner: "openclaw")
+    monkeypatch.setattr(subprocess, "run", _fake_models_list)
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+
+    ok = orchestrator._run_agent(
+        {
+            "name": "project-analyst",
+            "description": "Analyze repo",
+            "timeout": 5,
+        },
+        "research",
+    )
+
+    assert ok is True

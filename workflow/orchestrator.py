@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import time
+import traceback
 from queue import Empty, Queue
 from pathlib import Path
 from threading import Thread
@@ -24,6 +25,8 @@ class WorkflowOrchestrator:
         self.runtime = load_runtime_config()
         self.current_branch: str | None = None
         self.task_counter = 0
+        self._models_cache: dict[tuple[str, str, str], set[str] | None] = {}
+        self._global_registry_models = self._load_global_registry_models()
 
     def run_full_cycle(self) -> bool:
         self.logger.info("Запуск полного цикла agents-pipeline")
@@ -116,13 +119,17 @@ class WorkflowOrchestrator:
 
     def _run_phase_agents(self, phase: dict[str, Any], phase_key: str) -> bool:
         total = len(phase["agents"])
+        fail_fast = bool(phase.get("fail_fast", False))
+        had_failures = False
         for index, agent in enumerate(phase["agents"], start=1):
             if not self._wait_for_user(f"Запустить агента {agent['name']} ({index}/{total})?"):
                 self.logger.warning(f"Агент пропущен: {agent['name']}")
                 continue
             if not self._run_agent(agent, phase_key, index=index, total=total):
-                return False
-        return True
+                had_failures = True
+                if fail_fast:
+                    return False
+        return not had_failures
 
     def _run_agent(self, agent_config: dict[str, Any], phase: str, index: int | None = None, total: int | None = None) -> bool:
         agent_name = agent_config["name"]
@@ -143,6 +150,10 @@ class WorkflowOrchestrator:
             agent_name,
             f"Runtime override: provider={agent_runtime['provider']} model={agent_runtime['model']} thinking={agent_runtime['thinking']}",
         )
+        self.logger.agent_progress(agent_name, f"Diagnostic agent={agent_name}")
+        self.logger.agent_progress(agent_name, f"Diagnostic provider={agent_runtime['provider']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic model={agent_runtime['model']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic source={agent_runtime['model_source']}")
 
         if not agent_dir.exists():
             self.logger.error(f"Каталог агента не найден: {agent_dir}")
@@ -154,6 +165,31 @@ class WorkflowOrchestrator:
             return False
 
         runner = resolve_runner_path(self.runtime.runner_bin) or self.runtime.runner_bin
+        unavailable_reason = self._verify_model_available(runner, agent_runtime)
+        if unavailable_reason:
+            self.logger.error(unavailable_reason)
+            self.logger.agent_end(agent_name, "failed", unavailable_reason)
+            self.logger.save_agent_report(
+                phase,
+                agent_name,
+                {
+                    "phase": phase,
+                    "agent": agent_name,
+                    "agent_name": agent_name,
+                    "status": "failed",
+                    "result": unavailable_reason,
+                    "elapsed_s": 0.0,
+                    "returncode": None,
+                    "runtime": agent_runtime,
+                    "command": "",
+                    "message": "",
+                    "prompt_stats": {},
+                    "stdout": "",
+                    "stderr": "",
+                    "parsed_output": "",
+                },
+            )
+            return False
         cmd, message, prompt_stats = self._build_agent_command(runner, agent_name, agent_config, prompt_file, timeout, phase)
 
         self.logger.agent_progress(agent_name, "Полная команда OpenClaw:")
@@ -240,8 +276,8 @@ class WorkflowOrchestrator:
                     if tail:
                         timeout_details.append(f"last_output_tail={tail}")
                     self.logger.error(f"Агент превысил таймаут: {agent_name}", " | ".join(timeout_details))
-                    save_agent_report("failed", "timeout", elapsed, stdout, stderr, "")
-                    self.logger.agent_end(agent_name, "failed", "timeout")
+                    save_agent_report("timeout", "timeout", elapsed, stdout, stderr, "")
+                    self.logger.agent_end(agent_name, "timeout", "timeout")
                     return False
                 if now - last_heartbeat >= heartbeat_interval:
                     self.logger.agent_progress(
@@ -292,8 +328,9 @@ class WorkflowOrchestrator:
             if stderr_tail:
                 details += f" | stderr_tail={stderr_tail}"
             self.logger.error(f"Агент вернул некорректный результат: {agent_name}", details)
-            save_agent_report("failed", failure_reason, elapsed, stdout, stderr, parsed_output)
-            self.logger.agent_end(agent_name, "failed", failure_reason)
+            failure_status = self._classify_failure_status(failure_reason)
+            save_agent_report(failure_status, failure_reason, elapsed, stdout, stderr, parsed_output)
+            self.logger.agent_end(agent_name, failure_status, failure_reason)
             return False
 
         if process.returncode != 0:
@@ -446,11 +483,32 @@ class WorkflowOrchestrator:
         return env
 
     def _resolve_agent_runtime(self, agent_config: dict[str, Any]) -> dict[str, str]:
+        agent_name = str(agent_config.get("name") or "")
+        provider_override = agent_config.get("provider")
+        model_override = agent_config.get("model")
+        profile_override = agent_config.get("profile")
+        thinking_override = agent_config.get("thinking")
+        registry_model = self._global_registry_models.get(agent_name, "")
+
+        if provider_override or model_override or profile_override:
+            provider = str(provider_override or self.runtime.provider)
+            model = str(model_override or registry_model or self.runtime.model)
+            model_source = "agent override"
+        elif registry_model:
+            provider = self._infer_provider_from_model(registry_model) or self.runtime.provider
+            model = registry_model
+            model_source = "global registry"
+        else:
+            provider = str(self.runtime.provider)
+            model = str(self.runtime.model)
+            model_source = "workflow config"
+
         return {
-            "provider": str(agent_config.get("provider") or self.runtime.provider),
-            "model": str(agent_config.get("model") or self.runtime.model),
-            "profile": str(agent_config.get("profile") or self.runtime.profile),
-            "thinking": str(agent_config.get("thinking") or self.runtime.thinking),
+            "provider": provider,
+            "model": model,
+            "profile": str(profile_override or self.runtime.profile),
+            "thinking": str(thinking_override or self.runtime.thinking),
+            "model_source": model_source,
         }
 
     def _build_agent_command(
@@ -539,6 +597,136 @@ class WorkflowOrchestrator:
             return context
         return context[-limit:]
 
+    def _load_global_registry_models(self) -> dict[str, str]:
+        registry_path = Path.home() / ".openclaw" / "openclaw.json"
+        if not registry_path.exists():
+            return {}
+
+        try:
+            payload = json.loads(registry_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+        models: dict[str, str] = {}
+        for item in payload.get("agents", {}).get("list", []):
+            if not isinstance(item, dict):
+                continue
+            agent_id = item.get("id")
+            model = item.get("model")
+            if isinstance(agent_id, str) and isinstance(model, str) and model.strip():
+                models[agent_id] = model.strip()
+        return models
+
+    @staticmethod
+    def _infer_provider_from_model(model: str) -> str:
+        normalized = model.strip()
+        if normalized.startswith("openrouter/"):
+            return "openrouter"
+        if normalized.startswith("anthropic/"):
+            return "anthropic"
+        return ""
+
+    def _build_model_list_env(self, agent_runtime: dict[str, str]) -> dict[str, str]:
+        env = dict(os.environ)
+        env.update(self.runtime.env_overrides)
+        env.pop("OPENCLAW_MODEL", None)
+        if agent_runtime.get("provider"):
+            env["OPENCLAW_PROVIDER"] = agent_runtime["provider"]
+        if agent_runtime.get("profile"):
+            env["OPENCLAW_PROFILE"] = agent_runtime["profile"]
+        return env
+
+    @staticmethod
+    def _prepare_command_for_windows(command: list[str]) -> list[str]:
+        if os.name != "nt" or not command:
+            return command
+        runner = command[0].lower()
+        if not (runner.endswith(".cmd") or runner.endswith(".bat")):
+            return command
+        comspec = os.environ.get("COMSPEC", "cmd.exe")
+        return [comspec, "/d", "/c", *command]
+
+    def _run_openclaw_subprocess(
+        self,
+        command: list[str],
+        env: dict[str, str],
+        timeout: int,
+        purpose: str,
+    ) -> subprocess.CompletedProcess[str] | None:
+        prepared = self._prepare_command_for_windows(command)
+        self.logger.info(f"{purpose}: subprocess command={' '.join(prepared)}")
+        try:
+            process = subprocess.run(
+                prepared,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                env=env,
+            )
+        except Exception:
+            self.logger.error(
+                f"{purpose}: subprocess exception",
+                traceback.format_exc(),
+            )
+            return None
+
+        self.logger.info(f"{purpose}: returncode={process.returncode}")
+        self.logger.info(f"{purpose}: stdout={process.stdout!r}")
+        self.logger.info(f"{purpose}: stderr={process.stderr!r}")
+        if not process.stdout.strip():
+            self.logger.warning(f"{purpose}: command completed but stdout is empty")
+        return process
+
+    def _get_available_models(self, runner: str, agent_runtime: dict[str, str]) -> set[str] | None:
+        cache_key = (
+            runner,
+            str(agent_runtime.get("provider") or ""),
+            str(agent_runtime.get("profile") or ""),
+        )
+        if cache_key in self._models_cache:
+            return self._models_cache[cache_key]
+
+        process = self._run_openclaw_subprocess(
+            [runner, "models", "list"],
+            env=self._build_model_list_env(agent_runtime),
+            timeout=60,
+            purpose="openclaw models list",
+        )
+        if process is None:
+            self._models_cache[cache_key] = None
+            return None
+
+        if process.returncode != 0 or not process.stdout.strip():
+            self._models_cache[cache_key] = None
+            return None
+
+        available: set[str] = set()
+        for line in process.stdout.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("["):
+                continue
+            available.add(stripped)
+            for token in stripped.replace(",", " ").split():
+                if "/" in token:
+                    available.add(token.strip())
+
+        self._models_cache[cache_key] = available
+        return available
+
+    def _verify_model_available(self, runner: str, agent_runtime: dict[str, str]) -> str:
+        model = str(agent_runtime.get("model") or "").strip()
+        if not model:
+            return "Configured model is not available: "
+
+        available_models = self._get_available_models(runner, agent_runtime)
+        if available_models is None:
+            return "Unable to verify configured model via `openclaw models list`."
+        if model not in available_models:
+            return f"Configured model is not available: {model}"
+        return ""
+
     @staticmethod
     def _extract_agent_output(stdout: str) -> str:
         text = stdout.strip()
@@ -623,18 +811,23 @@ class WorkflowOrchestrator:
             return "missing russian translation section"
         return ""
 
+    @staticmethod
+    def _classify_failure_status(failure_reason: str) -> str:
+        normalized = failure_reason.strip().lower()
+        if "timeout" in normalized:
+            return "timeout"
+        if normalized:
+            return "invalid_output"
+        return "failed"
+
     def _get_registered_agents(self, runner_path: str) -> set[str]:
-        try:
-            process = subprocess.run(
-                [runner_path, "agents", "list", "--json"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=60,
-                env=self._build_agent_env(),
-            )
-        except Exception:
+        process = self._run_openclaw_subprocess(
+            [runner_path, "agents", "list", "--json"],
+            env=self._build_agent_env(),
+            timeout=60,
+            purpose="openclaw agents list",
+        )
+        if process is None:
             return set()
         if process.returncode != 0 or not process.stdout.strip():
             return set()

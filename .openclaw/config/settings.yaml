@@ -4,8 +4,8 @@ project:
 
 openclaw:
   bin: openclaw
-  provider: claude
-  model: claude-sonnet-4-20250514
+  provider: openrouter
+  model: openrouter/anthropic/claude-sonnet-4.6
   profile: default
   preflight_enabled: true
   run_mode: local

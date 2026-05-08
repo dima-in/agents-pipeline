@@ -11,6 +11,11 @@ project:
   workspace: .
   default_branch: main
 
+runtime:
+  provider: anthropic
+  model: anthropic/claude-sonnet-4-6
+  thinking: low
+
 paths:
   agents_dir: .openclaw/agents
   logs_dir: .openclaw/logs

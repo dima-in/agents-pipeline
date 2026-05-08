@@ -2,15 +2,15 @@
 
 _Learn about the person you're helping. Update this as you go._
 
-- **Name:**
-- **What to call them:**
+- **Name:Дима**
+- **What to call them:Дима**
 - **Pronouns:** _(optional)_
 - **Timezone:**
 - **Notes:**
 
 ## Context
 
-_(What do they care about? What projects are they working on? What annoys them? What makes them laugh? Build this over time.)_
+_Для меня важно сделать продукт для пользователей с коммерческим успехом. Я работаю в другой сфере, но хочу заниматься разработкой ПО и коммерческой реализацией_
 
 ---
 

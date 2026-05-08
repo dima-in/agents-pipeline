@@ -22,3 +22,32 @@ def test_detect_agent_failure_requires_russian_translation_section() -> None:
         "English section only without the required translated block.",
     )
     assert reason == "missing russian translation section"
+
+
+def test_classify_failure_status_timeout() -> None:
+    status = WorkflowOrchestrator._classify_failure_status("llm idle timeout")
+    assert status == "timeout"
+
+
+def test_classify_failure_status_invalid_output() -> None:
+    status = WorkflowOrchestrator._classify_failure_status("missing russian translation section")
+    assert status == "invalid_output"
+
+
+def test_run_phase_agents_continues_after_failure_when_fail_fast_false(monkeypatch) -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+    outcomes = iter([False, True])
+
+    monkeypatch.setattr(orchestrator, "_wait_for_user", lambda _prompt: True)
+    monkeypatch.setattr(orchestrator, "_run_agent", lambda *_args, **_kwargs: next(outcomes))
+
+    phase = {
+        "agents": [
+            {"name": "first"},
+            {"name": "second"},
+        ],
+        "fail_fast": False,
+    }
+
+    ok = orchestrator._run_phase_agents(phase, "research")
+    assert ok is False

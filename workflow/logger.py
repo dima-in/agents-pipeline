@@ -61,7 +61,7 @@ class WorkflowLogger:
         self.logger.debug("AGENT_PROGRESS: %s - %s", agent_name, message)
 
     def agent_end(self, agent_name: str, status: str = "success", result: str = "") -> None:
-        color = Fore.GREEN if status == "success" else Fore.RED if status == "failed" else Fore.YELLOW
+        color = Fore.GREEN if status == "success" else Fore.RED if status in {"failed", "timeout", "invalid_output"} else Fore.YELLOW
         status_label = self._translate_status(status)
         self._console(color, f"Агент завершен: {agent_name} [{status_label}]")
         if result:
@@ -174,7 +174,17 @@ class WorkflowLogger:
     def save_phase_summary(self, phase: str, phase_name: str = "") -> Path:
         agent_dir = self.run_dir / "agents" / phase
         summary_path = self.run_dir / f"{phase}-summary.md"
+        json_summary_path = self.run_dir / "phase_summary.json"
         if not agent_dir.exists():
+            payload = {
+                "phase": phase,
+                "phase_name": phase_name or phase,
+                "completed_agents": 0,
+                "failed_agents": 0,
+                "total_elapsed_s": 0.0,
+                "agent_statuses": [],
+            }
+            json_summary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
             summary_path.write_text(f"# {phase_name or phase} Summary\n\nNo agent reports found.\n", encoding="utf-8")
             return summary_path
 
@@ -206,6 +216,22 @@ class WorkflowLogger:
                 ]
             )
 
+        payload = {
+            "phase": phase,
+            "phase_name": phase_name or phase,
+            "completed_agents": sum(1 for report in reports if report.get("status") == "success"),
+            "failed_agents": sum(1 for report in reports if report.get("status") != "success"),
+            "total_elapsed_s": round(sum(float(report.get("elapsed_s") or 0.0) for report in reports), 2),
+            "agent_statuses": [
+                {
+                    "agent_name": report.get("agent_name") or report.get("agent"),
+                    "status": report.get("status"),
+                    "elapsed_s": report.get("elapsed_s"),
+                }
+                for report in reports
+            ],
+        }
+        json_summary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         summary_path.write_text("\n".join(sections).rstrip() + "\n", encoding="utf-8")
         return summary_path
 
