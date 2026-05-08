@@ -4,6 +4,7 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from colorama import Fore, Style, init
 
@@ -21,7 +22,7 @@ class WorkflowLogger:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.log_file = self.log_dir / f"workflow_{timestamp}.log"
         self.json_file = self.log_dir / f"workflow_{timestamp}.json"
-        self.json_events: list[dict] = []
+        self.json_events: list[dict[str, Any]] = []
 
         self.logger = logging.getLogger(f"AgentsPipelineWorkflow-{timestamp}")
         self.logger.setLevel(logging.DEBUG)
@@ -94,6 +95,8 @@ class WorkflowLogger:
         errors = [e for e in self.json_events if e["type"] == "error"]
         phases = [e for e in self.json_events if e["type"] == "phase_start"]
         agents = [e for e in self.json_events if e["type"] == "agent_end"]
+        run_summary = self.save_run_summary()
+        run_payload = json.loads(run_summary.read_text(encoding="utf-8")) if run_summary.exists() else {}
         summary.write_text(
             "\n".join(
                 [
@@ -101,6 +104,8 @@ class WorkflowLogger:
                     f"phases={len(phases)}",
                     f"agents={len(agents)}",
                     f"errors={len(errors)}",
+                    f"run_total_tokens={run_payload.get('total_tokens', 0)}",
+                    f"run_estimated_cost_usd={run_payload.get('estimated_cost_usd', 0.0)}",
                     "",
                 ]
             ),
@@ -108,7 +113,7 @@ class WorkflowLogger:
         )
         return summary
 
-    def save_agent_report(self, phase: str, agent_name: str, payload: dict) -> tuple[Path, Path]:
+    def save_agent_report(self, phase: str, agent_name: str, payload: dict[str, Any]) -> tuple[Path, Path]:
         agent_dir = self.run_dir / "agents" / phase
         agent_dir.mkdir(parents=True, exist_ok=True)
         base_name = self._safe_name(agent_name)
@@ -121,6 +126,7 @@ class WorkflowLogger:
             "phase": phase,
             **payload,
         }
+        payload["usage"] = self._normalize_usage(payload.get("usage"))
 
         json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -137,6 +143,14 @@ class WorkflowLogger:
             f"- provider: {payload.get('runtime', {}).get('provider', '')}",
             f"- model: {payload.get('runtime', {}).get('model', '')}",
             f"- thinking: {payload.get('runtime', {}).get('thinking', '')}",
+            "",
+            "## Usage",
+            "",
+            f"- input_tokens: {payload.get('usage', {}).get('input_tokens', '')}",
+            f"- output_tokens: {payload.get('usage', {}).get('output_tokens', '')}",
+            f"- total_tokens: {payload.get('usage', {}).get('total_tokens', '')}",
+            f"- estimated_cost_usd: {payload.get('usage', {}).get('estimated_cost_usd', '')}",
+            f"- usage_status: {payload.get('usage', {}).get('usage_status', '')}",
             "",
             "## Command",
             "",
@@ -182,18 +196,18 @@ class WorkflowLogger:
                 "completed_agents": 0,
                 "failed_agents": 0,
                 "total_elapsed_s": 0.0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "estimated_cost_usd": 0.0,
                 "agent_statuses": [],
             }
             json_summary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
             summary_path.write_text(f"# {phase_name or phase} Summary\n\nNo agent reports found.\n", encoding="utf-8")
             return summary_path
 
-        reports: list[dict] = []
-        for json_path in sorted(agent_dir.glob("*.json")):
-            try:
-                reports.append(json.loads(json_path.read_text(encoding="utf-8")))
-            except Exception:
-                continue
+        reports = self._load_agent_reports(phase)
+        usage_totals = self._build_usage_totals(reports)
 
         sections = [f"# {phase_name or phase} Summary", ""]
         for report in reports:
@@ -206,6 +220,9 @@ class WorkflowLogger:
                     f"- elapsed_s: {report.get('elapsed_s', '')}",
                     f"- provider: {report.get('runtime', {}).get('provider', '')}",
                     f"- model: {report.get('runtime', {}).get('model', '')}",
+                    f"- total_tokens: {report.get('usage', {}).get('total_tokens', '')}",
+                    f"- estimated_cost_usd: {report.get('usage', {}).get('estimated_cost_usd', '')}",
+                    f"- usage_status: {report.get('usage', {}).get('usage_status', '')}",
                     "",
                     "### Parsed Output",
                     "",
@@ -222,11 +239,18 @@ class WorkflowLogger:
             "completed_agents": sum(1 for report in reports if report.get("status") == "success"),
             "failed_agents": sum(1 for report in reports if report.get("status") != "success"),
             "total_elapsed_s": round(sum(float(report.get("elapsed_s") or 0.0) for report in reports), 2),
+            "input_tokens": usage_totals["input_tokens"],
+            "output_tokens": usage_totals["output_tokens"],
+            "total_tokens": usage_totals["total_tokens"],
+            "estimated_cost_usd": usage_totals["estimated_cost_usd"],
             "agent_statuses": [
                 {
                     "agent_name": report.get("agent_name") or report.get("agent"),
                     "status": report.get("status"),
                     "elapsed_s": report.get("elapsed_s"),
+                    "total_tokens": report.get("usage", {}).get("total_tokens"),
+                    "estimated_cost_usd": report.get("usage", {}).get("estimated_cost_usd"),
+                    "usage_status": report.get("usage", {}).get("usage_status"),
                 }
                 for report in reports
             ],
@@ -235,7 +259,77 @@ class WorkflowLogger:
         summary_path.write_text("\n".join(sections).rstrip() + "\n", encoding="utf-8")
         return summary_path
 
-    def _log_json(self, event_type: str, data: dict) -> None:
+    def save_run_summary(self) -> Path:
+        reports = self._load_agent_reports()
+        payload = self._build_run_summary_payload(reports)
+        summary_path = self.run_dir / "run_summary.json"
+        summary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return summary_path
+
+    def get_phase_totals(self, phase: str) -> dict[str, int | float]:
+        return self._build_usage_totals(self._load_agent_reports(phase))
+
+    def get_run_totals(self) -> dict[str, int | float]:
+        return self._build_usage_totals(self._load_agent_reports())
+
+    def _load_agent_reports(self, phase: str | None = None) -> list[dict[str, Any]]:
+        agents_root = self.run_dir / "agents"
+        if not agents_root.exists():
+            return []
+
+        if phase is None:
+            report_paths = sorted(agents_root.glob("*/*.json"))
+        else:
+            report_paths = sorted((agents_root / phase).glob("*.json"))
+
+        reports: list[dict[str, Any]] = []
+        for report_path in report_paths:
+            try:
+                reports.append(json.loads(report_path.read_text(encoding="utf-8")))
+            except Exception:
+                continue
+        return reports
+
+    @staticmethod
+    def _normalize_usage(usage: dict[str, Any] | None) -> dict[str, Any]:
+        usage = usage or {}
+        return {
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+            "total_tokens": usage.get("total_tokens"),
+            "estimated_cost_usd": usage.get("estimated_cost_usd"),
+            "usage_status": usage.get("usage_status", "unavailable"),
+        }
+
+    @staticmethod
+    def _build_usage_totals(reports: list[dict[str, Any]]) -> dict[str, int | float]:
+        input_tokens = 0
+        output_tokens = 0
+        total_tokens = 0
+        estimated_cost = 0.0
+        for report in reports:
+            usage = report.get("usage", {}) or {}
+            input_tokens += int(usage.get("input_tokens") or 0)
+            output_tokens += int(usage.get("output_tokens") or 0)
+            total_tokens += int(usage.get("total_tokens") or 0)
+            estimated_cost += float(usage.get("estimated_cost_usd") or 0.0)
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "estimated_cost_usd": round(estimated_cost, 6),
+        }
+
+    def _build_run_summary_payload(self, reports: list[dict[str, Any]]) -> dict[str, Any]:
+        totals = self._build_usage_totals(reports)
+        return {
+            "completed_agents": sum(1 for report in reports if report.get("status") == "success"),
+            "failed_agents": sum(1 for report in reports if report.get("status") != "success"),
+            "total_elapsed_s": round(sum(float(report.get("elapsed_s") or 0.0) for report in reports), 2),
+            **totals,
+        }
+
+    def _log_json(self, event_type: str, data: dict[str, Any]) -> None:
         event = {
             "timestamp": datetime.now().isoformat(),
             "type": event_type,
@@ -254,6 +348,7 @@ class WorkflowLogger:
             "failed": "ошибка",
             "rejected": "отклонено",
             "timeout": "таймаут",
+            "invalid_output": "некорректный вывод",
         }
         return mapping.get(status, status)
 

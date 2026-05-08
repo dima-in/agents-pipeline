@@ -23,9 +23,12 @@ class WorkflowOrchestrator:
         self.logger = WorkflowLogger()
         self.repo = git.Repo(".", search_parent_directories=True)
         self.runtime = load_runtime_config()
+        self.pricing = self._load_pricing("workflow/pricing.yaml")
         self.current_branch: str | None = None
         self.task_counter = 0
-        self._models_cache: dict[tuple[str, str, str], set[str] | None] = {}
+        self._registered_agents_cache: dict[str, dict[str, Any]] | None = None
+        self._models_list_cache: set[str] | None = None
+        self._models_list_attempted = False
         self._global_registry_models = self._load_global_registry_models()
 
     def run_full_cycle(self) -> bool:
@@ -153,6 +156,7 @@ class WorkflowOrchestrator:
         self.logger.agent_progress(agent_name, f"Diagnostic agent={agent_name}")
         self.logger.agent_progress(agent_name, f"Diagnostic provider={agent_runtime['provider']}")
         self.logger.agent_progress(agent_name, f"Diagnostic model={agent_runtime['model']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic thinking={agent_runtime['thinking']}")
         self.logger.agent_progress(agent_name, f"Diagnostic source={agent_runtime['model_source']}")
 
         if not agent_dir.exists():
@@ -165,10 +169,13 @@ class WorkflowOrchestrator:
             return False
 
         runner = resolve_runner_path(self.runtime.runner_bin) or self.runtime.runner_bin
-        unavailable_reason = self._verify_model_available(runner, agent_runtime)
-        if unavailable_reason:
-            self.logger.error(unavailable_reason)
-            self.logger.agent_end(agent_name, "failed", unavailable_reason)
+        validation = self._verify_model_available(runner, agent_name, agent_runtime)
+        self.logger.agent_progress(agent_name, f"Diagnostic validation={validation['method']}")
+        if validation["warning"]:
+            self.logger.warning(validation["warning"])
+        if validation["error"]:
+            self.logger.error(validation["error"])
+            self.logger.agent_end(agent_name, "failed", validation["error"])
             self.logger.save_agent_report(
                 phase,
                 agent_name,
@@ -177,7 +184,7 @@ class WorkflowOrchestrator:
                     "agent": agent_name,
                     "agent_name": agent_name,
                     "status": "failed",
-                    "result": unavailable_reason,
+                    "result": validation["error"],
                     "elapsed_s": 0.0,
                     "returncode": None,
                     "runtime": agent_runtime,
@@ -213,6 +220,7 @@ class WorkflowOrchestrator:
         self.logger.agent_progress(agent_name, "Ожидание ответа агента...")
 
         def save_agent_report(status: str, result: str, elapsed_s: float, stdout: str, stderr: str, parsed_output: str) -> None:
+            usage = self._extract_usage(stdout, agent_runtime)
             self.logger.save_agent_report(
                 phase,
                 agent_name,
@@ -231,8 +239,10 @@ class WorkflowOrchestrator:
                     "stdout": stdout,
                     "stderr": stderr,
                     "parsed_output": parsed_output,
+                    "usage": usage,
                 },
             )
+            self._log_usage_totals(agent_name, phase, usage)
 
         started_at = time.monotonic()
         heartbeat_interval = 15.0
@@ -406,6 +416,15 @@ class WorkflowOrchestrator:
         with Path(config_path).open("r", encoding="utf-8") as handle:
             return yaml.safe_load(handle)
 
+    @staticmethod
+    def _load_pricing(pricing_path: str) -> dict[str, dict[str, float]]:
+        pricing_file = Path(pricing_path)
+        if not pricing_file.exists():
+            return {}
+        with pricing_file.open("r", encoding="utf-8") as handle:
+            payload = yaml.safe_load(handle) or {}
+        return payload if isinstance(payload, dict) else {}
+
     def _get_phase_order(self) -> list[str]:
         configured_order = self.config["workflow"].get("phase_order")
         if configured_order:
@@ -451,7 +470,9 @@ class WorkflowOrchestrator:
             )
             return False
 
-        registered_agents = self._get_registered_agents(runner_path)
+        registered_agents_map = self._get_registered_agent_records(runner_path)
+        self._registered_agents_cache = registered_agents_map
+        registered_agents = set(registered_agents_map)
         missing_agents = []
         for phase in self.config["phases"].values():
             for agent in phase["agents"]:
@@ -680,26 +701,20 @@ class WorkflowOrchestrator:
         return process
 
     def _get_available_models(self, runner: str, agent_runtime: dict[str, str]) -> set[str] | None:
-        cache_key = (
-            runner,
-            str(agent_runtime.get("provider") or ""),
-            str(agent_runtime.get("profile") or ""),
-        )
-        if cache_key in self._models_cache:
-            return self._models_cache[cache_key]
+        if self._models_list_attempted:
+            return self._models_list_cache
 
+        self._models_list_attempted = True
         process = self._run_openclaw_subprocess(
             [runner, "models", "list"],
             env=self._build_model_list_env(agent_runtime),
-            timeout=60,
+            timeout=20,
             purpose="openclaw models list",
         )
         if process is None:
-            self._models_cache[cache_key] = None
             return None
 
         if process.returncode != 0 or not process.stdout.strip():
-            self._models_cache[cache_key] = None
             return None
 
         available: set[str] = set()
@@ -712,20 +727,51 @@ class WorkflowOrchestrator:
                 if "/" in token:
                     available.add(token.strip())
 
-        self._models_cache[cache_key] = available
+        self._models_list_cache = available
         return available
 
-    def _verify_model_available(self, runner: str, agent_runtime: dict[str, str]) -> str:
+    def _verify_model_available(self, runner: str, agent_name: str, agent_runtime: dict[str, str]) -> dict[str, str]:
         model = str(agent_runtime.get("model") or "").strip()
         if not model:
-            return "Configured model is not available: "
+            return {"error": "Configured model is not available: ", "method": "missing model", "warning": ""}
+
+        registered_agents = self._ensure_registered_agents_cache(runner)
+        registry_record = registered_agents.get(agent_name, {})
+        registry_model = str(registry_record.get("model") or "").strip()
+        model_source = str(agent_runtime.get("model_source") or "")
+
+        if model_source == "global registry" and registry_model:
+            if model == registry_model:
+                return {"error": "", "method": "agents-list cache", "warning": ""}
+            return {
+                "error": f"Configured model is not available: {model}",
+                "method": "agents-list cache mismatch",
+                "warning": "",
+            }
 
         available_models = self._get_available_models(runner, agent_runtime)
         if available_models is None:
-            return "Unable to verify configured model via `openclaw models list`."
+            if registry_model:
+                return {
+                    "error": "",
+                    "method": "registry fallback after models-list timeout",
+                    "warning": (
+                        "openclaw models list verification unavailable; continuing because registry already defines "
+                        f"model {registry_model} for {agent_name}"
+                    ),
+                }
+            return {
+                "error": "Unable to verify configured model via `openclaw models list`.",
+                "method": "models-list fallback unavailable",
+                "warning": "",
+            }
         if model not in available_models:
-            return f"Configured model is not available: {model}"
-        return ""
+            return {
+                "error": f"Configured model is not available: {model}",
+                "method": "models-list fallback",
+                "warning": "",
+            }
+        return {"error": "", "method": "models-list fallback", "warning": ""}
 
     @staticmethod
     def _extract_agent_output(stdout: str) -> str:
@@ -743,6 +789,119 @@ class WorkflowOrchestrator:
                 if isinstance(value, str) and value.strip():
                     return value.strip()
         return text
+
+    @staticmethod
+    def _extract_agent_payload(stdout: str) -> dict[str, Any] | None:
+        text = stdout.strip()
+        if not text:
+            return None
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _extract_usage(self, stdout: str, agent_runtime: dict[str, str]) -> dict[str, Any]:
+        payload = self._extract_agent_payload(stdout)
+        runtime_model = str(agent_runtime.get("model") or "")
+        runtime_provider = str(agent_runtime.get("provider") or "")
+        usage = self._find_usage_payload(payload) if payload else None
+        if not usage:
+            return {
+                "input_tokens": None,
+                "output_tokens": None,
+                "total_tokens": None,
+                "estimated_cost_usd": None,
+                "usage_status": "unavailable",
+                "model": runtime_model,
+                "provider": runtime_provider,
+            }
+
+        input_tokens = self._coerce_int(
+            usage.get("input_tokens") or usage.get("prompt_tokens") or usage.get("inputTokens")
+        )
+        output_tokens = self._coerce_int(
+            usage.get("output_tokens") or usage.get("completion_tokens") or usage.get("outputTokens")
+        )
+        total_tokens = self._coerce_int(usage.get("total_tokens") or usage.get("totalTokens"))
+        if total_tokens is None and input_tokens is not None and output_tokens is not None:
+            total_tokens = input_tokens + output_tokens
+
+        if input_tokens is None and output_tokens is None and total_tokens is None:
+            return {
+                "input_tokens": None,
+                "output_tokens": None,
+                "total_tokens": None,
+                "estimated_cost_usd": None,
+                "usage_status": "unavailable",
+                "model": runtime_model,
+                "provider": runtime_provider,
+            }
+
+        model = str(
+            payload.get("model")
+            or usage.get("model")
+            or runtime_model
+        )
+        provider = str(
+            payload.get("provider")
+            or usage.get("provider")
+            or runtime_provider
+        )
+        estimated_cost = self._estimate_cost_usd(model, input_tokens, output_tokens)
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "estimated_cost_usd": estimated_cost,
+            "usage_status": "captured",
+            "model": model,
+            "provider": provider,
+        }
+
+    @staticmethod
+    def _find_usage_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+        candidates = [
+            payload.get("usage"),
+            payload.get("token_usage"),
+            payload.get("metrics", {}).get("usage") if isinstance(payload.get("metrics"), dict) else None,
+        ]
+        for candidate in candidates:
+            if isinstance(candidate, dict):
+                return candidate
+        return None
+
+    def _estimate_cost_usd(self, model: str, input_tokens: int | None, output_tokens: int | None) -> float | None:
+        pricing = self.pricing.get(model)
+        if not pricing or input_tokens is None or output_tokens is None:
+            return None
+        input_rate = float(pricing.get("input_per_1m_usd") or 0.0)
+        output_rate = float(pricing.get("output_per_1m_usd") or 0.0)
+        cost = (input_tokens / 1_000_000) * input_rate + (output_tokens / 1_000_000) * output_rate
+        return round(cost, 6)
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int | None:
+        if value is None or value == "":
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _log_usage_totals(self, agent_name: str, phase: str, usage: dict[str, Any]) -> None:
+        agent_cost = usage.get("estimated_cost_usd")
+        phase_totals = self.logger.get_phase_totals(phase)
+        run_totals = self.logger.get_run_totals()
+        self.logger.agent_progress(agent_name, f"Agent cost: {self._format_cost(agent_cost)}")
+        self.logger.agent_progress(agent_name, f"Phase total so far: {self._format_cost(phase_totals['estimated_cost_usd'])}")
+        self.logger.agent_progress(agent_name, f"Run total so far: {self._format_cost(run_totals['estimated_cost_usd'])}")
+
+    @staticmethod
+    def _format_cost(value: Any) -> str:
+        if value is None:
+            return "unavailable"
+        return f"${float(value):.6f}"
 
     def _start_stream_reader(
         self,
@@ -820,7 +979,12 @@ class WorkflowOrchestrator:
             return "invalid_output"
         return "failed"
 
-    def _get_registered_agents(self, runner_path: str) -> set[str]:
+    def _ensure_registered_agents_cache(self, runner_path: str) -> dict[str, dict[str, Any]]:
+        if self._registered_agents_cache is None:
+            self._registered_agents_cache = self._get_registered_agent_records(runner_path)
+        return self._registered_agents_cache
+
+    def _get_registered_agent_records(self, runner_path: str) -> dict[str, dict[str, Any]]:
         process = self._run_openclaw_subprocess(
             [runner_path, "agents", "list", "--json"],
             env=self._build_agent_env(),
@@ -828,18 +992,18 @@ class WorkflowOrchestrator:
             purpose="openclaw agents list",
         )
         if process is None:
-            return set()
+            return {}
         if process.returncode != 0 or not process.stdout.strip():
-            return set()
+            return {}
         try:
             payload = json.loads(process.stdout)
         except json.JSONDecodeError:
-            return set()
+            return {}
         if not isinstance(payload, list):
-            return set()
-        result = set()
+            return {}
+        result: dict[str, dict[str, Any]] = {}
         for item in payload:
             agent_id = item.get("id") if isinstance(item, dict) else None
             if isinstance(agent_id, str):
-                result.add(agent_id)
+                result[agent_id] = item
         return result

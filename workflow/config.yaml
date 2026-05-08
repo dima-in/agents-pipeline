@@ -30,25 +30,39 @@ phases:
       - name: project-analyst
         description: "Analyze the current repository, constraints, gaps, and immediate opportunities"
         timeout: 900
+        provider: openrouter
+        model: google/gemini-2.5-flash
+        thinking: low
       - name: competitor-analyst
         description: "Analyze competitors"
         timeout: 600
         provider: openrouter
         model: perplexity/sonar
+        thinking: low
       - name: market-analyst
         description: "Analyze market and trends"
         timeout: 600
+        provider: openrouter
+        model: google/gemini-2.5-flash
+        thinking: low
       - name: tech-analyst
         description: "Review technical options"
         timeout: 600
+        provider: openrouter
+        model: google/gemini-2.5-flash
+        thinking: low
       - name: innovation-scout
         description: "Find adjacent product and workflow innovations"
         timeout: 600
         provider: openrouter
         model: perplexity/sonar
+        thinking: low
       - name: product-manager
         description: "Summarize and prepare requirements"
         timeout: 900
+        provider: anthropic
+        model: anthropic/claude-sonnet-4-6
+        thinking: low
 
   implementation:
     name: "Implementation"
