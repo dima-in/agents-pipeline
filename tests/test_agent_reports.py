@@ -70,6 +70,7 @@ def _fake_models_list(*_args, **_kwargs) -> SimpleNamespace:
             "claude-sonnet-4-5-20250929\n"
             "anthropic/claude-sonnet-4-6\n"
             "openrouter/anthropic/claude-sonnet-4.6\n"
+            "google/gemini-2.5-flash\n"
             "perplexity/sonar\n"
         ),
         stderr="",
@@ -79,6 +80,12 @@ def _fake_models_list(*_args, **_kwargs) -> SimpleNamespace:
 def _fake_run_with_agents_cache(args, **_kwargs) -> SimpleNamespace:
     if args[:4] == ["openclaw", "agents", "list", "--json"]:
         return SimpleNamespace(returncode=0, stdout=_fake_agents_list_payload(), stderr="")
+    if args[:3] == ["openclaw", "agent", "--help"]:
+        return SimpleNamespace(
+            returncode=0,
+            stdout="Usage: openclaw agent [options]\n  --thinking <level>\n  --timeout <seconds>\n  --json\n",
+            stderr="",
+        )
     if args[:3] == ["openclaw", "models", "list"]:
         return _fake_models_list()
     raise AssertionError(f"unexpected subprocess.run args: {args}")
@@ -94,9 +101,12 @@ def test_successful_agent_run_creates_report_files(monkeypatch, tmp_path: Path) 
 
     ok = orchestrator._run_agent(
         {
-            "name": "project-analyst",
+            "name": "competitor-analyst",
             "description": "Analyze the current repository, active constraints, and the most important next questions",
             "timeout": 5,
+            "provider": "openrouter",
+            "model": "perplexity/sonar",
+            "thinking": "low",
         },
         "research",
     )
@@ -104,14 +114,14 @@ def test_successful_agent_run_creates_report_files(monkeypatch, tmp_path: Path) 
     assert ok is True
 
     report_dir = orchestrator.logger.run_dir / "agents" / "research"
-    md_path = report_dir / "project-analyst.md"
-    json_path = report_dir / "project-analyst.json"
+    md_path = report_dir / "competitor-analyst.md"
+    json_path = report_dir / "competitor-analyst.json"
 
     assert md_path.exists()
     assert json_path.exists()
 
     payload = json.loads(json_path.read_text(encoding="utf-8"))
-    assert payload["agent_name"] == "project-analyst"
+    assert payload["agent_name"] == "competitor-analyst"
     assert payload["phase"] == "research"
     assert payload["status"] == "success"
     assert payload["result"] == "completed"
@@ -123,11 +133,11 @@ def test_successful_agent_run_creates_report_files(monkeypatch, tmp_path: Path) 
     assert payload["usage"]["input_tokens"] == 1000
     assert payload["usage"]["output_tokens"] == 500
     assert payload["usage"]["total_tokens"] == 1500
-    assert payload["usage"]["estimated_cost_usd"] == 0.0105
+    assert payload["usage"]["estimated_cost_usd"] == 0.0015
     assert payload["usage"]["usage_status"] == "captured"
 
     report_text = md_path.read_text(encoding="utf-8")
-    assert "- agent_name: project-analyst" in report_text
+    assert "- agent_name: competitor-analyst" in report_text
     assert "## Prompt Message" in report_text
     assert "## Stdout" in report_text
     assert "## Usage" in report_text
@@ -264,13 +274,15 @@ def test_failed_agents_are_excluded_from_previous_context_and_phase_summary_json
 def test_invalid_model_blocks_agent_launch(monkeypatch, tmp_path: Path) -> None:
     orchestrator = WorkflowOrchestrator("workflow/config.yaml")
     orchestrator.logger = WorkflowLogger(log_dir=str(tmp_path / "logs"))
-    effective_runtime = orchestrator._resolve_agent_runtime({"name": "project-analyst"})
+    effective_runtime = orchestrator._resolve_agent_runtime(
+        {"name": "competitor-analyst", "provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"}
+    )
 
     monkeypatch.setattr(orchestrator_module, "resolve_runner_path", lambda _runner: "openclaw")
     monkeypatch.setattr(
         subprocess,
         "run",
-        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="perplexity/sonar\n", stderr=""),
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="google/gemini-2.5-flash\n", stderr=""),
     )
 
     def fail_if_called(*_args, **_kwargs):
@@ -280,9 +292,83 @@ def test_invalid_model_blocks_agent_launch(monkeypatch, tmp_path: Path) -> None:
 
     ok = orchestrator._run_agent(
         {
+            "name": "competitor-analyst",
+            "description": "Analyze repo",
+            "timeout": 5,
+            "provider": "openrouter",
+            "model": "perplexity/sonar",
+            "thinking": "low",
+        },
+        "research",
+    )
+
+    assert ok is False
+    payload = json.loads(
+        (orchestrator.logger.run_dir / "agents" / "research" / "competitor-analyst.json").read_text(encoding="utf-8")
+    )
+    assert payload["status"] == "failed"
+    assert payload["result"].startswith("Configured model is not available:")
+    assert effective_runtime["model"] in payload["result"]
+
+
+def test_override_applied_when_cli_supports_it(monkeypatch, tmp_path: Path) -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+    orchestrator.logger = WorkflowLogger(log_dir=str(tmp_path / "logs"))
+
+    monkeypatch.setattr(orchestrator_module, "resolve_runner_path", lambda _runner: "openclaw")
+    monkeypatch.setattr(subprocess, "run", _fake_run_with_agents_cache)
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+    monkeypatch.setattr(
+        orchestrator,
+        "_get_agent_cli_capabilities",
+        lambda _runner: {"supports_model_override": True, "supports_provider_override": True},
+    )
+
+    ok = orchestrator._run_agent(
+        {
             "name": "project-analyst",
             "description": "Analyze repo",
             "timeout": 5,
+            "provider": "openrouter",
+            "model": "google/gemini-2.5-flash",
+            "thinking": "low",
+        },
+        "research",
+    )
+
+    assert ok is True
+    payload = json.loads(
+        (orchestrator.logger.run_dir / "agents" / "research" / "project-analyst.json").read_text(encoding="utf-8")
+    )
+    assert "--provider openrouter" in payload["command"]
+    assert "--model google/gemini-2.5-flash" in payload["command"]
+
+
+def test_mismatch_blocks_launch_when_override_cannot_be_applied(monkeypatch, tmp_path: Path) -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+    orchestrator.logger = WorkflowLogger(log_dir=str(tmp_path / "logs"))
+
+    monkeypatch.setattr(orchestrator_module, "resolve_runner_path", lambda _runner: "openclaw")
+    monkeypatch.setattr(subprocess, "run", _fake_run_with_agents_cache)
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("agent launch must not happen when override cannot be applied")
+
+    monkeypatch.setattr(subprocess, "Popen", fail_if_called)
+    monkeypatch.setattr(
+        orchestrator,
+        "_get_agent_cli_capabilities",
+        lambda _runner: {"supports_model_override": False, "supports_provider_override": False},
+    )
+
+    ok = orchestrator._run_agent(
+        {
+            "name": "project-analyst",
+            "description": "Analyze repo",
+            "timeout": 5,
+            "provider": "openrouter",
+            "model": "google/gemini-2.5-flash",
+            "thinking": "low",
         },
         "research",
     )
@@ -292,8 +378,7 @@ def test_invalid_model_blocks_agent_launch(monkeypatch, tmp_path: Path) -> None:
         (orchestrator.logger.run_dir / "agents" / "research" / "project-analyst.json").read_text(encoding="utf-8")
     )
     assert payload["status"] == "failed"
-    assert payload["result"].startswith("Configured model is not available:")
-    assert effective_runtime["model"] in payload["result"]
+    assert payload["result"] == "Runtime override differs from registered agent model and cannot be applied"
 
 
 def test_valid_model_allows_agent_launch(monkeypatch, tmp_path: Path) -> None:
@@ -306,9 +391,12 @@ def test_valid_model_allows_agent_launch(monkeypatch, tmp_path: Path) -> None:
 
     ok = orchestrator._run_agent(
         {
-            "name": "project-analyst",
+            "name": "competitor-analyst",
             "description": "Analyze repo",
             "timeout": 5,
+            "provider": "openrouter",
+            "model": "perplexity/sonar",
+            "thinking": "low",
         },
         "research",
     )

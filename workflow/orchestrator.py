@@ -29,6 +29,7 @@ class WorkflowOrchestrator:
         self._registered_agents_cache: dict[str, dict[str, Any]] | None = None
         self._models_list_cache: set[str] | None = None
         self._models_list_attempted = False
+        self._agent_cli_capabilities: dict[str, bool] | None = None
         self._global_registry_models = self._load_global_registry_models()
 
     def run_full_cycle(self) -> bool:
@@ -169,6 +170,38 @@ class WorkflowOrchestrator:
             return False
 
         runner = resolve_runner_path(self.runtime.runner_bin) or self.runtime.runner_bin
+        runtime_application = self._evaluate_runtime_application(runner, agent_name, agent_runtime)
+        self.logger.agent_progress(agent_name, f"Diagnostic requested workflow model={runtime_application['requested_model']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic registered agent model={runtime_application['registered_model']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic actual command model={runtime_application['actual_command_model']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic actual command provider={runtime_application['actual_command_provider']}")
+        if runtime_application["warning"]:
+            self.logger.warning(runtime_application["warning"])
+        if runtime_application["error"]:
+            self.logger.error(runtime_application["error"])
+            self.logger.agent_end(agent_name, "failed", runtime_application["error"])
+            self.logger.save_agent_report(
+                phase,
+                agent_name,
+                {
+                    "phase": phase,
+                    "agent": agent_name,
+                    "agent_name": agent_name,
+                    "status": "failed",
+                    "result": runtime_application["error"],
+                    "elapsed_s": 0.0,
+                    "returncode": None,
+                    "runtime": agent_runtime,
+                    "command": "",
+                    "message": "",
+                    "prompt_stats": {},
+                    "stdout": "",
+                    "stderr": "",
+                    "parsed_output": "",
+                },
+            )
+            return False
+
         validation = self._verify_model_available(runner, agent_name, agent_runtime)
         self.logger.agent_progress(agent_name, f"Diagnostic validation={validation['method']}")
         if validation["warning"]:
@@ -197,7 +230,15 @@ class WorkflowOrchestrator:
                 },
             )
             return False
-        cmd, message, prompt_stats = self._build_agent_command(runner, agent_name, agent_config, prompt_file, timeout, phase)
+        cmd, message, prompt_stats = self._build_agent_command(
+            runner,
+            agent_name,
+            agent_config,
+            prompt_file,
+            timeout,
+            phase,
+            runtime_application,
+        )
 
         self.logger.agent_progress(agent_name, "Полная команда OpenClaw:")
         self.logger.agent_progress(agent_name, " ".join(cmd))
@@ -540,6 +581,7 @@ class WorkflowOrchestrator:
         prompt_file: Path,
         timeout: int,
         phase: str,
+        runtime_application: dict[str, Any] | None = None,
     ) -> tuple[list[str], str, dict[str, int]]:
         prompt_text = prompt_file.read_text(encoding="utf-8").strip()
         task = agent_config.get("description", "").strip()
@@ -569,6 +611,10 @@ class WorkflowOrchestrator:
         cmd = [runner, "agent", "--agent", agent_name, "--message", message, "--timeout", str(timeout), "--json"]
         if self.runtime.run_mode == "local":
             cmd.append("--local")
+        if runtime_application and runtime_application.get("supports_provider_override") and runtime["provider"]:
+            cmd.extend(["--provider", runtime["provider"]])
+        if runtime_application and runtime_application.get("supports_model_override") and runtime["model"]:
+            cmd.extend(["--model", runtime["model"]])
         if runtime["thinking"]:
             cmd.extend(["--thinking", runtime["thinking"]])
         return cmd, message, prompt_stats
@@ -656,6 +702,71 @@ class WorkflowOrchestrator:
         if agent_runtime.get("profile"):
             env["OPENCLAW_PROFILE"] = agent_runtime["profile"]
         return env
+
+    def _get_agent_cli_capabilities(self, runner: str) -> dict[str, bool]:
+        if self._agent_cli_capabilities is not None:
+            return self._agent_cli_capabilities
+
+        process = self._run_openclaw_subprocess(
+            [runner, "agent", "--help"],
+            env=dict(os.environ),
+            timeout=20,
+            purpose="openclaw agent help",
+        )
+        stdout = process.stdout if process else ""
+        self._agent_cli_capabilities = {
+            "supports_model_override": "--model" in stdout,
+            "supports_provider_override": "--provider" in stdout,
+        }
+        return self._agent_cli_capabilities
+
+    def _evaluate_runtime_application(self, runner: str, agent_name: str, agent_runtime: dict[str, str]) -> dict[str, Any]:
+        requested_model = str(agent_runtime.get("model") or "").strip()
+        requested_provider = str(agent_runtime.get("provider") or "").strip()
+        registered_agents = self._ensure_registered_agents_cache(runner)
+        registry_record = registered_agents.get(agent_name, {})
+        registered_model = str(registry_record.get("model") or "").strip()
+        capabilities = self._get_agent_cli_capabilities(runner)
+        supports_model = bool(capabilities.get("supports_model_override"))
+        supports_provider = bool(capabilities.get("supports_provider_override"))
+        model_source = str(agent_runtime.get("model_source") or "")
+
+        if model_source == "global registry":
+            actual_model = registered_model or requested_model
+            actual_provider = self._infer_provider_from_model(actual_model) or requested_provider
+            return {
+                "requested_model": requested_model,
+                "registered_model": registered_model,
+                "actual_command_model": actual_model,
+                "actual_command_provider": actual_provider,
+                "supports_model_override": supports_model,
+                "supports_provider_override": supports_provider,
+                "warning": "",
+                "error": "",
+            }
+
+        if registered_model and registered_model != requested_model and not (supports_model and supports_provider):
+            return {
+                "requested_model": requested_model,
+                "registered_model": registered_model,
+                "actual_command_model": registered_model,
+                "actual_command_provider": self._infer_provider_from_model(registered_model) or requested_provider,
+                "supports_model_override": supports_model,
+                "supports_provider_override": supports_provider,
+                "warning": "",
+                "error": "Runtime override differs from registered agent model and cannot be applied",
+            }
+
+        return {
+            "requested_model": requested_model,
+            "registered_model": registered_model,
+            "actual_command_model": requested_model,
+            "actual_command_provider": requested_provider,
+            "supports_model_override": supports_model,
+            "supports_provider_override": supports_provider,
+            "warning": "",
+            "error": "",
+        }
 
     @staticmethod
     def _prepare_command_for_windows(command: list[str]) -> list[str]:
