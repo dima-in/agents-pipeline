@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -19,9 +20,9 @@ class AgentManager:
         self.settings = self._load_yaml(self.config_dir / 'settings.yaml', {})
         self.agent_catalog = self._load_yaml(self.config_dir / 'agents.yaml', {'agents': []})
         self.workflow_config = self._load_yaml(Path('workflow/config.yaml'), {'phases': {}})
-        self.openclaw_bin = self.settings.get('openclaw', {}).get('bin', 'openclaw')
         self.workspace = self.settings.get('project', {}).get('workspace', '.')
         self.default_timeout = self.settings.get('agents', {}).get('default_timeout', 600)
+        self._delete_noninteractive_flag: str | None = '__unset__'
 
     def list_agents(self) -> dict[str, list[str]]:
         result: dict[str, list[str]] = {}
@@ -91,8 +92,35 @@ class AgentManager:
             return 1
 
         overrides = self._get_agent_registration_overrides(name, phase)
+        desired_model = overrides.get('model', '')
+        registered = self._get_registered_agent(name)
+
+        if registered:
+            registered_model = str(registered.get('model', '') or '')
+            if desired_model and registered_model != desired_model:
+                print(
+                    f'{Fore.YELLOW}Re-registering {name}: model mismatch '
+                    f'({registered_model or "unknown"} -> {desired_model}){Style.RESET_ALL}'
+                )
+                delete_cmd = [self._get_openclaw_bin(), 'agents', 'delete', name]
+                delete_flag = self._get_delete_noninteractive_flag()
+                if delete_flag:
+                    delete_cmd.append(delete_flag)
+                else:
+                    print(
+                        f'{Fore.RED}OpenClaw delete is interactive and no non-interactive flag was found.{Style.RESET_ALL}\n'
+                        f'Manual command: {" ".join(delete_cmd)}'
+                    )
+                    return 1
+                delete_code = self._run_command(delete_cmd)
+                if delete_code != 0:
+                    return delete_code
+            else:
+                print(f'{Fore.GREEN}Agent already registered with desired model: {name}{Style.RESET_ALL}')
+                return 0
+
         cmd = [
-            self.openclaw_bin,
+            self._get_openclaw_bin(),
             'agents',
             'add',
             name,
@@ -129,7 +157,7 @@ class AgentManager:
             print(f'{Fore.RED}Agent not found: {agent_dir}{Style.RESET_ALL}')
             return 1
 
-        cmd = [self.openclaw_bin, 'run', name, '--agent-dir', str(agent_dir), '--workspace', self.workspace]
+        cmd = [self._get_openclaw_bin(), 'run', name, '--agent-dir', str(agent_dir), '--workspace', self.workspace]
         return self._run_command(cmd)
 
     def bootstrap_defaults(self, force: bool = False) -> int:
@@ -154,10 +182,14 @@ class AgentManager:
         with path.open('r', encoding='utf-8') as handle:
             return yaml.safe_load(handle) or fallback
 
+    def _get_openclaw_bin(self) -> str:
+        return os.environ.get('OPENCLAW_BIN', self.settings.get('openclaw', {}).get('bin', 'openclaw'))
+
     @staticmethod
     def _run_command(cmd: list[str], env: dict[str, str] | None = None) -> int:
+        prepared_cmd = AgentManager._prepare_command_for_windows(cmd)
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', env=env)
+            result = subprocess.run(prepared_cmd, capture_output=True, text=True, encoding='utf-8', env=env)
         except FileNotFoundError:
             print(f'{Fore.RED}Command not found: {cmd[0]}{Style.RESET_ALL}')
             return 1
@@ -167,6 +199,16 @@ class AgentManager:
         if result.stderr:
             print(result.stderr)
         return result.returncode
+
+    @staticmethod
+    def _prepare_command_for_windows(command: list[str]) -> list[str]:
+        if os.name != 'nt' or not command:
+            return command
+        runner = command[0].lower()
+        if not (runner.endswith('.cmd') or runner.endswith('.bat')):
+            return command
+        comspec = os.environ.get('COMSPEC', 'cmd.exe')
+        return [comspec, '/d', '/c', *command]
 
     def _get_agent_registration_overrides(self, name: str, phase: str) -> dict[str, str]:
         phase_config = self.workflow_config.get('phases', {}).get(phase, {})
@@ -178,6 +220,52 @@ class AgentManager:
                     'profile': str(agent.get('profile', '') or ''),
                 }
         return {}
+
+    def _get_registered_agent(self, name: str) -> dict[str, object] | None:
+        cmd = [self._get_openclaw_bin(), 'agents', 'list', '--json']
+        result = self._run_command_capture(cmd)
+        if result.returncode != 0:
+            return None
+
+        try:
+            payload = json.loads(result.stdout or '[]')
+        except json.JSONDecodeError:
+            return None
+
+        if not isinstance(payload, list):
+            return None
+
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            registered_name = str(item.get('id') or item.get('name') or '')
+            if registered_name == name:
+                return item
+        return None
+
+    def _get_delete_noninteractive_flag(self) -> str | None:
+        if self._delete_noninteractive_flag != '__unset__':
+            return None if self._delete_noninteractive_flag is None else str(self._delete_noninteractive_flag)
+
+        cmd = [self._get_openclaw_bin(), 'agents', 'delete', '--help']
+        result = self._run_command_capture(cmd)
+        if result.returncode != 0:
+            self._delete_noninteractive_flag = None
+            return None
+
+        help_text = (result.stdout or '') + '\n' + (result.stderr or '')
+        for flag in ('--force', '--yes', '-y'):
+            if flag in help_text:
+                self._delete_noninteractive_flag = flag
+                return flag
+
+        self._delete_noninteractive_flag = None
+        return None
+
+    @staticmethod
+    def _run_command_capture(cmd: list[str], env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        prepared_cmd = AgentManager._prepare_command_for_windows(cmd)
+        return subprocess.run(prepared_cmd, capture_output=True, text=True, encoding='utf-8', env=env)
 
 
 def build_parser() -> argparse.ArgumentParser:

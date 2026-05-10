@@ -10,11 +10,14 @@ import yaml
 
 @dataclass
 class RuntimeConfig:
+    executor: str
     runner_bin: str
     provider: str
     model: str
     profile: str
     preflight_enabled: bool
+    require_registry_preflight: bool
+    require_model_list_preflight: bool
     run_mode: str
     thinking: str
     workspace: str
@@ -36,17 +39,26 @@ def load_runtime_config(settings_path: str = ".openclaw/config/settings.yaml") -
     settings = {}
     if settings_file.exists():
         settings = yaml.safe_load(settings_file.read_text(encoding="utf-8")) or {}
+    workflow_settings_path = Path("workflow/config.yaml")
+    workflow_settings = {}
+    if workflow_settings_path.exists():
+        workflow_settings = yaml.safe_load(workflow_settings_path.read_text(encoding="utf-8")) or {}
 
     openclaw_settings = settings.get("openclaw", {})
     project_settings = settings.get("project", {})
+    workflow_settings_block = workflow_settings.get("workflow", {})
+    workflow_runtime = workflow_settings.get("runtime", {})
     return RuntimeConfig(
+        executor=str(workflow_settings_block.get("executor", "openclaw")),
         runner_bin=os.getenv("OPENCLAW_BIN", openclaw_settings.get("bin", "openclaw")),
-        provider=os.getenv("OPENCLAW_PROVIDER", openclaw_settings.get("provider", "openrouter")),
-        model=os.getenv("OPENCLAW_MODEL", openclaw_settings.get("model", "openrouter/auto")),
+        provider=os.getenv("OPENCLAW_PROVIDER", workflow_runtime.get("provider", openclaw_settings.get("provider", "openrouter"))),
+        model=os.getenv("OPENCLAW_MODEL", workflow_runtime.get("model", openclaw_settings.get("model", "openrouter/auto"))),
         profile=os.getenv("OPENCLAW_PROFILE", openclaw_settings.get("profile", "default")),
         preflight_enabled=bool(openclaw_settings.get("preflight_enabled", True)),
+        require_registry_preflight=bool(workflow_settings_block.get("require_registry_preflight", os.name != "nt")),
+        require_model_list_preflight=bool(workflow_settings_block.get("require_model_list_preflight", os.name != "nt")),
         run_mode=str(openclaw_settings.get("run_mode", "local")),
-        thinking=str(openclaw_settings.get("thinking", "medium")),
+        thinking=str(workflow_runtime.get("thinking", openclaw_settings.get("thinking", "medium"))),
         workspace=str(project_settings.get("workspace", ".")),
     )
 

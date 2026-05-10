@@ -1,0 +1,6 @@
+﻿name: devops-release
+phase: implementation
+description: "Own deployment, compose, environment separation, and release hygiene"
+timeout: 900
+commands:
+  - echo "devops-release"

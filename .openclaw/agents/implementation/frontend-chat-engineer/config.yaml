@@ -1,0 +1,6 @@
+﻿name: frontend-chat-engineer
+phase: implementation
+description: "Stabilize chat UI, composer, message rendering, and streaming behavior"
+timeout: 1200
+commands:
+  - echo "frontend-chat-engineer"

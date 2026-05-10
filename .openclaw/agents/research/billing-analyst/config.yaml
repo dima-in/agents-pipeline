@@ -1,0 +1,6 @@
+﻿name: billing-analyst
+phase: research
+description: "Audit plans, quotas, balances, and billing rules"
+timeout: 600
+commands:
+  - echo "billing-analyst"

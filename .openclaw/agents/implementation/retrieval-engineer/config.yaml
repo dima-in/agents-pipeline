@@ -1,0 +1,6 @@
+﻿name: retrieval-engineer
+phase: implementation
+description: "Improve RAG, web retrieval, source extraction, and context assembly"
+timeout: 1200
+commands:
+  - echo "retrieval-engineer"

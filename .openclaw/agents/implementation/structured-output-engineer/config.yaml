@@ -1,0 +1,6 @@
+﻿name: structured-output-engineer
+phase: implementation
+description: "Stabilize Mermaid, diagrams, and other structured response rendering"
+timeout: 900
+commands:
+  - echo "structured-output-engineer"

@@ -9,6 +9,8 @@ from queue import Empty, Queue
 from pathlib import Path
 from threading import Thread
 from typing import Any
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 import git
 import yaml
@@ -29,15 +31,16 @@ class WorkflowOrchestrator:
         self._registered_agents_cache: dict[str, dict[str, Any]] | None = None
         self._models_list_cache: set[str] | None = None
         self._models_list_attempted = False
+        self._models_list_status = "not_attempted"
         self._agent_cli_capabilities: dict[str, bool] | None = None
         self._global_registry_models = self._load_global_registry_models()
 
     def run_full_cycle(self) -> bool:
         self.logger.info("Запуск полного цикла agents-pipeline")
         try:
-            if not self._preflight_runtime():
-                return False
             for phase_key in self._get_phase_order():
+                if not self._preflight_runtime(phase_key):
+                    return False
                 if not self.run_phase(phase_key):
                     return False
             return True
@@ -46,17 +49,17 @@ class WorkflowOrchestrator:
             self.logger.info(f"Сводка сохранена: {summary}")
 
     def run_research_phase(self) -> bool:
-        if not self._preflight_runtime():
+        if not self._preflight_runtime("research"):
             return False
         return self.run_phase("research")
 
     def run_implementation_phase(self) -> bool:
-        if not self._preflight_runtime():
+        if not self._preflight_runtime("implementation"):
             return False
         return self.run_phase("implementation")
 
     def run_deployment_phase(self) -> bool:
-        if not self._preflight_runtime():
+        if not self._preflight_runtime("deployment"):
             return False
         return self.run_phase("deployment")
 
@@ -138,9 +141,10 @@ class WorkflowOrchestrator:
     def _run_agent(self, agent_config: dict[str, Any], phase: str, index: int | None = None, total: int | None = None) -> bool:
         agent_name = agent_config["name"]
         timeout = agent_config.get("timeout", 600)
-        agent_dir = Path(".openclaw/agents") / phase / agent_name
+        agent_dir = self._get_agents_root() / phase / agent_name
         prompt_file = agent_dir / "prompt.md"
         agent_runtime = self._resolve_agent_runtime(agent_config)
+        executor = self.runtime.executor
 
         self.logger.agent_start(agent_name, agent_config.get("description", ""))
         if index and total:
@@ -159,6 +163,7 @@ class WorkflowOrchestrator:
         self.logger.agent_progress(agent_name, f"Diagnostic model={agent_runtime['model']}")
         self.logger.agent_progress(agent_name, f"Diagnostic thinking={agent_runtime['thinking']}")
         self.logger.agent_progress(agent_name, f"Diagnostic source={agent_runtime['model_source']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic executor={executor}")
 
         if not agent_dir.exists():
             self.logger.error(f"Каталог агента не найден: {agent_dir}")
@@ -168,6 +173,54 @@ class WorkflowOrchestrator:
             self.logger.error(f"Файл prompt.md не найден: {prompt_file}")
             self.logger.agent_end(agent_name, "failed", "missing agent prompt")
             return False
+
+        message_bundle = self._build_agent_message_bundle(agent_name, agent_config, prompt_file, phase)
+        message = message_bundle["combined_message"]
+        prompt_stats = message_bundle["prompt_stats"]
+
+        def save_agent_report(
+            status: str,
+            result: str,
+            elapsed_s: float,
+            stdout: str,
+            stderr: str,
+            parsed_output: str,
+            command: str,
+            returncode: int | None,
+        ) -> None:
+            usage = self._extract_usage(stdout, agent_runtime)
+            self.logger.save_agent_report(
+                phase,
+                agent_name,
+                {
+                    "phase": phase,
+                    "agent": agent_name,
+                    "agent_name": agent_name,
+                    "status": status,
+                    "result": result,
+                    "elapsed_s": round(elapsed_s, 2),
+                    "returncode": returncode,
+                    "runtime": agent_runtime,
+                    "command": command,
+                    "message": message,
+                    "prompt_stats": prompt_stats,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "parsed_output": parsed_output,
+                    "usage": usage,
+                },
+            )
+            self._log_usage_totals(agent_name, phase, usage)
+
+        if executor == "direct_api":
+            return self._run_direct_api_agent(
+                agent_name,
+                phase,
+                agent_runtime,
+                message_bundle,
+                timeout,
+                save_agent_report,
+            )
 
         runner = resolve_runner_path(self.runtime.runner_bin) or self.runtime.runner_bin
         runtime_application = self._evaluate_runtime_application(runner, agent_name, agent_runtime)
@@ -193,8 +246,8 @@ class WorkflowOrchestrator:
                     "returncode": None,
                     "runtime": agent_runtime,
                     "command": "",
-                    "message": "",
-                    "prompt_stats": {},
+                    "message": message,
+                    "prompt_stats": prompt_stats,
                     "stdout": "",
                     "stderr": "",
                     "parsed_output": "",
@@ -222,8 +275,8 @@ class WorkflowOrchestrator:
                     "returncode": None,
                     "runtime": agent_runtime,
                     "command": "",
-                    "message": "",
-                    "prompt_stats": {},
+                    "message": message,
+                    "prompt_stats": prompt_stats,
                     "stdout": "",
                     "stderr": "",
                     "parsed_output": "",
@@ -259,31 +312,6 @@ class WorkflowOrchestrator:
             self.logger.agent_progress(agent_name, line)
         self.logger.agent_progress(agent_name, "")
         self.logger.agent_progress(agent_name, "Ожидание ответа агента...")
-
-        def save_agent_report(status: str, result: str, elapsed_s: float, stdout: str, stderr: str, parsed_output: str) -> None:
-            usage = self._extract_usage(stdout, agent_runtime)
-            self.logger.save_agent_report(
-                phase,
-                agent_name,
-                {
-                    "phase": phase,
-                    "agent": agent_name,
-                    "agent_name": agent_name,
-                    "status": status,
-                    "result": result,
-                    "elapsed_s": round(elapsed_s, 2),
-                    "returncode": getattr(process, "returncode", None) if "process" in locals() else None,
-                    "runtime": agent_runtime,
-                    "command": " ".join(cmd),
-                    "message": message,
-                    "prompt_stats": prompt_stats,
-                    "stdout": stdout,
-                    "stderr": stderr,
-                    "parsed_output": parsed_output,
-                    "usage": usage,
-                },
-            )
-            self._log_usage_totals(agent_name, phase, usage)
 
         started_at = time.monotonic()
         heartbeat_interval = 15.0
@@ -327,7 +355,7 @@ class WorkflowOrchestrator:
                     if tail:
                         timeout_details.append(f"last_output_tail={tail}")
                     self.logger.error(f"Агент превысил таймаут: {agent_name}", " | ".join(timeout_details))
-                    save_agent_report("timeout", "timeout", elapsed, stdout, stderr, "")
+                    save_agent_report("timeout", "timeout", elapsed, stdout, stderr, "", " ".join(cmd), None)
                     self.logger.agent_end(agent_name, "timeout", "timeout")
                     return False
                 if now - last_heartbeat >= heartbeat_interval:
@@ -344,7 +372,7 @@ class WorkflowOrchestrator:
             stderr = "\n".join(stderr_lines)
         except FileNotFoundError:
             self.logger.error("Команда openclaw не найдена", "Проверь установку OpenClaw или переменную OPENCLAW_BIN.")
-            save_agent_report("failed", "openclaw missing", 0.0, "", "", "")
+            save_agent_report("failed", "openclaw missing", 0.0, "", "", "", " ".join(cmd), None)
             self.logger.agent_end(agent_name, "failed", "openclaw missing")
             return False
 
@@ -380,7 +408,7 @@ class WorkflowOrchestrator:
                 details += f" | stderr_tail={stderr_tail}"
             self.logger.error(f"Агент вернул некорректный результат: {agent_name}", details)
             failure_status = self._classify_failure_status(failure_reason)
-            save_agent_report(failure_status, failure_reason, elapsed, stdout, stderr, parsed_output)
+            save_agent_report(failure_status, failure_reason, elapsed, stdout, stderr, parsed_output, " ".join(cmd), process.returncode)
             self.logger.agent_end(agent_name, failure_status, failure_reason)
             return False
 
@@ -390,11 +418,11 @@ class WorkflowOrchestrator:
             if stderr_tail:
                 details += f" | stderr_tail={stderr_tail}"
             self.logger.error(f"Агент завершился с ошибкой: {agent_name}", details)
-            save_agent_report("failed", stderr.strip() or "non-zero exit", elapsed, stdout, stderr, parsed_output)
+            save_agent_report("failed", stderr.strip() or "non-zero exit", elapsed, stdout, stderr, parsed_output, " ".join(cmd), process.returncode)
             self.logger.agent_end(agent_name, "failed", stderr.strip())
             return False
 
-        save_agent_report("success", "completed", elapsed, stdout, stderr, parsed_output)
+        save_agent_report("success", "completed", elapsed, stdout, stderr, parsed_output, " ".join(cmd), process.returncode)
         self.logger.agent_end(agent_name, "success", "completed")
         return True
 
@@ -490,9 +518,33 @@ class WorkflowOrchestrator:
         self.logger.info(f"Файл обратной связи сохранен: {feedback_file}")
         return feedback_file
 
-    def _preflight_runtime(self) -> bool:
+    def _preflight_runtime(self, phase_key: str | None = None) -> bool:
         if not self.runtime.preflight_enabled:
             return True
+
+        configured_agents = self._iter_configured_agents_for_preflight(phase_key)
+        missing_local_agents = self._get_missing_local_agents(configured_agents)
+        if missing_local_agents:
+            self.logger.error(
+                "Local agent directories are missing",
+                "Missing: " + ", ".join(sorted(missing_local_agents)),
+            )
+            return False
+
+        for configured_phase, agent in configured_agents:
+            runtime = self._resolve_agent_runtime(agent)
+            self.logger.info(
+                "Startup diagnostic: "
+                f"phase={configured_phase} "
+                f"agent={agent['name']} "
+                f"effective provider={runtime['provider']} "
+                f"effective model={runtime['model']} "
+                f"effective source={runtime['model_source']} "
+                f"effective thinking level={runtime['thinking']}"
+            )
+
+        if self.runtime.executor == "direct_api":
+            return self._preflight_direct_api(configured_agents)
 
         runner_path = resolve_runner_path(self.runtime.runner_bin)
         if not runner_path:
@@ -511,20 +563,50 @@ class WorkflowOrchestrator:
             )
             return False
 
-        registered_agents_map = self._get_registered_agent_records(runner_path)
+        registry_check = self._inspect_registered_agent_records(runner_path)
+        registered_agents_map = registry_check["records"]
         self._registered_agents_cache = registered_agents_map
         registered_agents = set(registered_agents_map)
-        missing_agents = []
-        for phase in self.config["phases"].values():
-            for agent in phase["agents"]:
-                if agent["name"] not in registered_agents:
-                    missing_agents.append(agent["name"])
-        if missing_agents:
+        missing_agents = (
+            self._get_missing_registered_agents(configured_agents, registered_agents)
+            if registry_check["status"] == "ok"
+            else []
+        )
+        if registry_check["status"] == "timeout":
+            self.logger.warning(
+                "openclaw agents list --json timed out after 60 seconds; using local agent directories for preflight"
+            )
+        elif registry_check["status"] != "ok":
+            if self.runtime.require_registry_preflight:
+                self.logger.error(
+                    "Unable to verify the OpenClaw agent registry",
+                    "Run `run.bat python manage_agents.py register-all` or disable workflow.require_registry_preflight.",
+                )
+                return False
+            self.logger.warning(
+                "openclaw agents list --json did not return usable registry data; using local agent directories because "
+                "workflow.require_registry_preflight=false"
+            )
+        if missing_agents and self.runtime.require_registry_preflight:
             self.logger.error(
                 "Агенты не зарегистрированы в OpenClaw",
                 "Выполни `run.bat python manage_agents.py register-all`. Не найдены: " + ", ".join(sorted(missing_agents)),
             )
             return False
+        if missing_agents:
+            self.logger.warning(
+                "Some configured agents are missing from `openclaw agents list --json`; continuing because "
+                "workflow.require_registry_preflight=false. Missing: " + ", ".join(sorted(missing_agents))
+            )
+
+        for model, runtime in self._get_required_startup_models().items():
+            validation = self._verify_required_startup_model(runner_path, runtime)
+            self.logger.info(f"Startup diagnostic: model={model} validation={validation['method']}")
+            if validation["warning"]:
+                self.logger.warning(validation["warning"])
+            if validation["error"]:
+                self.logger.error(validation["error"])
+                return False
 
         self.logger.info(
             f"Проверка runtime пройдена: runner={runner_path}, provider={self.runtime.provider}, model={self.runtime.model}"
@@ -543,6 +625,153 @@ class WorkflowOrchestrator:
             if runtime["profile"]:
                 env["OPENCLAW_PROFILE"] = runtime["profile"]
         return env
+
+    def _iter_configured_agents(self) -> list[tuple[str, dict[str, Any]]]:
+        configured: list[tuple[str, dict[str, Any]]] = []
+        for phase_key, phase in self.config.get("phases", {}).items():
+            for agent in phase.get("agents", []):
+                configured.append((phase_key, agent))
+        return configured
+
+    def _iter_configured_agents_for_preflight(self, phase_key: str | None = None) -> list[tuple[str, dict[str, Any]]]:
+        if phase_key is None:
+            return self._iter_configured_agents()
+        phase = self.config.get("phases", {}).get(phase_key, {})
+        return [(phase_key, agent) for agent in phase.get("agents", [])]
+
+    def _preflight_direct_api(self, configured_agents: list[tuple[str, dict[str, Any]]]) -> bool:
+        env = self._build_agent_env()
+        for _phase_key, agent in configured_agents:
+            runtime = self._resolve_agent_runtime(agent)
+            provider = str(runtime.get("provider") or "").strip().lower()
+            if provider != "openrouter":
+                self.logger.error(
+                    "direct_api executor currently supports only provider=openrouter",
+                    f"agent={agent['name']} provider={runtime['provider']}",
+                )
+                return False
+            api_key = env.get("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_API_KEY", "")
+            if not api_key:
+                self.logger.error(
+                    "OPENROUTER_API_KEY is required for direct_api executor",
+                    f"agent={agent['name']} provider={runtime['provider']}",
+                )
+                return False
+
+        self.logger.info(
+            f"Runtime preflight passed for direct_api: provider={self.runtime.provider}, model={self.runtime.model}"
+        )
+        return True
+
+    def _preflight_openclaw(self, configured_agents: list[tuple[str, dict[str, Any]]]) -> bool:
+        runner_path = resolve_runner_path(self.runtime.runner_bin)
+        if not runner_path:
+            self.logger.error(
+                "РќРµ РЅР°Р№РґРµРЅ РёСЃРїРѕР»РЅСЏРµРјС‹Р№ С„Р°Р№Р» OpenClaw",
+                f"configured bin={self.runtime.runner_bin}. РћР±РЅРѕРІРё .openclaw/config/settings.yaml РёР»Рё OPENCLAW_BIN.",
+            )
+            return False
+
+        required_key = required_key_env(self.runtime.provider)
+        env = self._build_agent_env()
+        if required_key and not has_provider_credentials(self.runtime.provider) and required_key not in env:
+            self.logger.error(
+                "РќРµ РЅР°Р№РґРµРЅ РєР»СЋС‡ РїСЂРѕРІР°Р№РґРµСЂР°",
+                f"provider={self.runtime.provider} С‚СЂРµР±СѓРµС‚ {required_key} РёР»Рё СЃРѕРѕС‚РІРµС‚СЃС‚РІСѓСЋС‰РёР№ РїСЂРѕС„РёР»СЊ РІ ~/.openclaw.",
+            )
+            return False
+
+        registry_check = self._inspect_registered_agent_records(runner_path)
+        registered_agents_map = registry_check["records"]
+        self._registered_agents_cache = registered_agents_map
+        registered_agents = set(registered_agents_map)
+        missing_agents = (
+            self._get_missing_registered_agents(configured_agents, registered_agents)
+            if registry_check["status"] == "ok"
+            else []
+        )
+        if registry_check["status"] == "timeout":
+            self.logger.warning(
+                "openclaw agents list --json timed out after 60 seconds; using local agent directories for preflight"
+            )
+        elif registry_check["status"] != "ok":
+            if self.runtime.require_registry_preflight:
+                self.logger.error(
+                    "Unable to verify the OpenClaw agent registry",
+                    "Run `run.bat python manage_agents.py register-all` or disable workflow.require_registry_preflight.",
+                )
+                return False
+            self.logger.warning(
+                "openclaw agents list --json did not return usable registry data; using local agent directories because "
+                "workflow.require_registry_preflight=false"
+            )
+        if missing_agents and self.runtime.require_registry_preflight:
+            self.logger.error(
+                "РђРіРµРЅС‚С‹ РЅРµ Р·Р°СЂРµРіРёСЃС‚СЂРёСЂРѕРІР°РЅС‹ РІ OpenClaw",
+                "Р’С‹РїРѕР»РЅРё `run.bat python manage_agents.py register-all`. РќРµ РЅР°Р№РґРµРЅС‹: " + ", ".join(sorted(missing_agents)),
+            )
+            return False
+        if missing_agents:
+            self.logger.warning(
+                "Some configured agents are missing from `openclaw agents list --json`; continuing because "
+                "workflow.require_registry_preflight=false. Missing: " + ", ".join(sorted(missing_agents))
+            )
+
+        for model, runtime in self._get_required_startup_models().items():
+            validation = self._verify_required_startup_model(runner_path, runtime)
+            self.logger.info(f"Startup diagnostic: model={model} validation={validation['method']}")
+            if validation["warning"]:
+                self.logger.warning(validation["warning"])
+            if validation["error"]:
+                self.logger.error(validation["error"])
+                return False
+
+        self.logger.info(
+            f"РџСЂРѕРІРµСЂРєР° runtime РїСЂРѕР№РґРµРЅР°: runner={runner_path}, provider={self.runtime.provider}, model={self.runtime.model}"
+        )
+        return True
+
+    def _get_agents_root(self) -> Path:
+        configured_root = str(self.config.get("paths", {}).get("agents_dir", ".openclaw/agents"))
+        return Path(configured_root)
+
+    def _get_missing_local_agents(self, configured_agents: list[tuple[str, dict[str, Any]]]) -> list[str]:
+        missing: list[str] = []
+        agents_root = self._get_agents_root()
+        for phase_key, agent in configured_agents:
+            agent_name = str(agent.get("name") or "").strip()
+            if not agent_name:
+                continue
+            agent_dir = agents_root / phase_key / agent_name
+            if not agent_dir.is_dir():
+                missing.append(f"{phase_key}/{agent_name}")
+        return missing
+
+    @staticmethod
+    def _get_missing_registered_agents(
+        configured_agents: list[tuple[str, dict[str, Any]]],
+        registered_agents: set[str],
+    ) -> list[str]:
+        missing: list[str] = []
+        for _phase_key, agent in configured_agents:
+            agent_name = str(agent.get("name") or "").strip()
+            if agent_name and agent_name not in registered_agents:
+                missing.append(agent_name)
+        return missing
+
+    def _get_required_startup_models(self) -> dict[str, dict[str, str]]:
+        required: dict[str, dict[str, str]] = {}
+        required[self.runtime.model] = {
+            "provider": self.runtime.provider,
+            "model": self.runtime.model,
+            "profile": self.runtime.profile,
+            "thinking": self.runtime.thinking,
+            "model_source": "runtime config",
+        }
+        for _phase_key, agent in self._iter_configured_agents():
+            runtime = self._resolve_agent_runtime(agent)
+            required.setdefault(runtime["model"], runtime)
+        return required
 
     def _resolve_agent_runtime(self, agent_config: dict[str, Any]) -> dict[str, str]:
         agent_name = str(agent_config.get("name") or "")
@@ -573,6 +802,171 @@ class WorkflowOrchestrator:
             "model_source": model_source,
         }
 
+    def _build_agent_message_bundle(
+        self,
+        agent_name: str,
+        agent_config: dict[str, Any],
+        prompt_file: Path,
+        phase: str,
+    ) -> dict[str, Any]:
+        prompt_text = prompt_file.read_text(encoding="utf-8").strip()
+        task = str(agent_config.get("description", "") or "").strip()
+        previous_context = self._build_previous_agent_context(phase, agent_name)
+        translation_instruction = (
+            "Output format is mandatory. Write the full primary answer in English first. "
+            "Then add a second section titled exactly 'Russian translation' with a clear Russian translation "
+            "of the full answer. Keep both sections aligned in meaning. "
+            "Do not omit the Russian translation section. Do not end the answer before that section appears."
+        )
+
+        combined_parts: list[str] = []
+        if task:
+            combined_parts.append(f"Task: {task}")
+        combined_parts.append(prompt_text)
+        repository_context = ""
+        if self.runtime.executor == "direct_api" and agent_name == "project-analyst":
+            repository_context = self._build_direct_api_repository_context(limit=12000)
+            if repository_context:
+                combined_parts.append(f"Repository context collected locally:\n{repository_context}")
+        if previous_context:
+            combined_parts.append(f"Previous agent context:\n{previous_context}")
+        combined_parts.append(translation_instruction)
+        combined_message = "\n\n".join(combined_parts)
+
+        system_parts = [prompt_text]
+        if repository_context:
+            system_parts.append(f"Repository context collected locally:\n{repository_context}")
+        if previous_context:
+            system_parts.append(f"Previous agent context:\n{previous_context}")
+        system_parts.append(translation_instruction)
+        system_message = "\n\n".join(part for part in system_parts if part)
+        user_message = task or "Follow the system instructions and produce the requested output format."
+
+        prompt_stats = {
+            "prompt_chars": len(prompt_text),
+            "prompt_lines": len(prompt_text.splitlines()) if prompt_text else 0,
+            "message_chars": len(combined_message),
+            "message_lines": len(combined_message.splitlines()) if combined_message else 0,
+        }
+        return {
+            "prompt_text": prompt_text,
+            "task": task,
+            "previous_context": previous_context,
+            "translation_instruction": translation_instruction,
+            "system_message": system_message,
+            "user_message": user_message,
+            "combined_message": combined_message,
+            "prompt_stats": prompt_stats,
+        }
+
+    def _build_direct_api_repository_context(self, limit: int = 12000) -> str:
+        sections = [
+            ("Current working directory", str(Path.cwd())),
+            ("Git status --short", self._run_local_capture(["git", "status", "--short"])),
+            ("Git log --oneline -5", self._run_local_capture(["git", "log", "--oneline", "-5"])),
+            ("README.md", self._read_file_excerpt(Path("README.md"), 2000)),
+            ("workflow/config.yaml", self._read_file_excerpt(Path("workflow/config.yaml"), 3000)),
+            ("workflow/orchestrator.py outline", self._build_python_outline(Path("workflow/orchestrator.py"))),
+            ("workflow/runtime.py", self._read_file_excerpt(Path("workflow/runtime.py"), 2000)),
+            ("manage_agents.py outline", self._build_python_outline(Path("manage_agents.py"))),
+            ("requirements.txt", self._read_file_excerpt(Path("requirements.txt"), 2000)),
+            ("pyproject.toml", self._read_file_excerpt(Path("pyproject.toml"), 2000)),
+            ("Top-level file tree up to depth 3", self._build_top_level_tree(depth=3)),
+            ("Tests file list", self._build_tests_file_list()),
+        ]
+
+        chunks: list[str] = []
+        total = 0
+        for title, content in sections:
+            if not content:
+                continue
+            chunk = f"## {title}\n{content.strip()}"
+            remaining = limit - total
+            if remaining <= 0:
+                break
+            if len(chunk) > remaining:
+                chunk = chunk[:remaining]
+            chunks.append(chunk)
+            total += len(chunk) + 2
+            if total >= limit:
+                break
+
+        context = "\n\n".join(chunks)
+        if len(context) <= limit:
+            return context
+        return context[:limit]
+
+    def _run_local_capture(self, command: list[str], timeout: int = 10) -> str:
+        try:
+            process = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                cwd=Path.cwd(),
+            )
+        except Exception:
+            return ""
+        output = (process.stdout or "").strip()
+        if output:
+            return output
+        return (process.stderr or "").strip()
+
+    def _build_top_level_tree(self, depth: int = 3) -> str:
+        root = Path.cwd()
+        lines: list[str] = []
+        for path in sorted(root.rglob("*")):
+            try:
+                relative = path.relative_to(root)
+            except ValueError:
+                continue
+            if len(relative.parts) > depth:
+                continue
+            if any(part.startswith(".git") for part in relative.parts):
+                continue
+            lines.append(str(relative).replace("\\", "/"))
+        return "\n".join(lines)
+
+    def _read_file_excerpt(self, path: Path, limit: int) -> str:
+        if not path.exists() or not path.is_file():
+            return ""
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        return text[:limit]
+
+    def _build_python_outline(self, path: Path) -> str:
+        if not path.exists() or not path.is_file():
+            return ""
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return ""
+        outline: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("import ") or stripped.startswith("from "):
+                outline.append(stripped)
+            elif stripped.startswith("class "):
+                outline.append(stripped.split(":", 1)[0])
+            elif stripped.startswith("def "):
+                outline.append(stripped.split(":", 1)[0])
+        return "\n".join(outline)
+
+    def _build_tests_file_list(self) -> str:
+        tests_dir = Path("tests")
+        if not tests_dir.exists():
+            return ""
+        files = sorted(
+            str(path).replace("\\", "/")
+            for path in tests_dir.rglob("*")
+            if path.is_file()
+        )
+        return "\n".join(files)
+
     def _build_agent_command(
         self,
         runner: str,
@@ -583,29 +977,9 @@ class WorkflowOrchestrator:
         phase: str,
         runtime_application: dict[str, Any] | None = None,
     ) -> tuple[list[str], str, dict[str, int]]:
-        prompt_text = prompt_file.read_text(encoding="utf-8").strip()
-        task = agent_config.get("description", "").strip()
-        previous_context = self._build_previous_agent_context(phase, agent_name)
-        translation_instruction = (
-            "Output format is mandatory. Write the full primary answer in English first. "
-            "Then add a second section titled exactly 'Russian translation' with a clear Russian translation "
-            "of the full answer. Keep both sections aligned in meaning. "
-            "Do not omit the Russian translation section. Do not end the answer before that section appears."
-        )
-        message_parts = []
-        if task:
-            message_parts.append(f"Task: {task}")
-        message_parts.append(prompt_text)
-        if previous_context:
-            message_parts.append(f"Previous agent context:\n{previous_context}")
-        message_parts.append(translation_instruction)
-        message = "\n\n".join(message_parts)
-        prompt_stats = {
-            "prompt_chars": len(prompt_text),
-            "prompt_lines": len(prompt_text.splitlines()) if prompt_text else 0,
-            "message_chars": len(message),
-            "message_lines": len(message.splitlines()) if message else 0,
-        }
+        message_bundle = self._build_agent_message_bundle(agent_name, agent_config, prompt_file, phase)
+        message = str(message_bundle["combined_message"])
+        prompt_stats = dict(message_bundle["prompt_stats"])
 
         runtime = self._resolve_agent_runtime(agent_config)
         cmd = [runner, "agent", "--agent", agent_name, "--message", message, "--timeout", str(timeout), "--json"]
@@ -618,6 +992,182 @@ class WorkflowOrchestrator:
         if runtime["thinking"]:
             cmd.extend(["--thinking", runtime["thinking"]])
         return cmd, message, prompt_stats
+
+    @staticmethod
+    def _normalize_openrouter_model(model: str) -> str:
+        normalized = str(model or "").strip()
+        if normalized.startswith("openrouter/"):
+            return normalized[len("openrouter/") :]
+        return normalized
+
+    @staticmethod
+    def _extract_direct_api_text(payload: dict[str, Any]) -> str:
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return ""
+        message = choices[0].get("message") if isinstance(choices[0], dict) else None
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        parts.append(text.strip())
+            return "\n".join(parts).strip()
+        return ""
+
+    @staticmethod
+    def _classify_direct_api_error(status_code: int, body: str) -> str:
+        normalized = body.lower()
+        if status_code == 401:
+            return "auth_failed"
+        if status_code == 429:
+            return "rate_limited"
+        if "model" in normalized and ("not found" in normalized or "does not exist" in normalized):
+            return "model_not_found"
+        return "failed"
+
+    def _run_direct_api_agent(
+        self,
+        agent_name: str,
+        phase: str,
+        agent_runtime: dict[str, str],
+        message_bundle: dict[str, Any],
+        timeout: int,
+        save_agent_report: Any,
+    ) -> bool:
+        provider = str(agent_runtime.get("provider") or "").strip().lower()
+        if provider != "openrouter":
+            error_message = "direct_api executor currently supports only provider=openrouter"
+            self.logger.error(error_message)
+            save_agent_report("failed", error_message, 0.0, "", error_message, "", "direct_api", 1)
+            self.logger.agent_end(agent_name, "failed", error_message)
+            return False
+
+        api_key = self._build_agent_env().get("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_API_KEY", "")
+        if not api_key:
+            error_message = "OPENROUTER_API_KEY is required for direct_api executor"
+            self.logger.error(error_message)
+            save_agent_report("failed", error_message, 0.0, "", error_message, "", "direct_api", 1)
+            self.logger.agent_end(agent_name, "failed", error_message)
+            return False
+
+        normalized_model = self._normalize_openrouter_model(str(agent_runtime.get("model") or ""))
+        command = (
+            "direct_api POST https://openrouter.ai/api/v1/chat/completions "
+            f"--model {normalized_model}"
+        )
+        request_payload = {
+            "model": normalized_model,
+            "messages": [
+                {"role": "system", "content": str(message_bundle["system_message"])},
+                {"role": "user", "content": str(message_bundle["user_message"])},
+            ],
+            "temperature": 0.2,
+        }
+        body = json.dumps(request_payload).encode("utf-8")
+        request = urllib_request.Request(
+            "https://openrouter.ai/api/v1/chat/completions",
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "http://localhost/agents-pipeline",
+                "X-Title": "agents-pipeline",
+            },
+        )
+
+        self.logger.agent_progress(agent_name, "Executor command:")
+        self.logger.agent_progress(agent_name, command)
+        self.logger.agent_progress(agent_name, "")
+        self.logger.agent_progress(
+            agent_name,
+            (
+                "Direct API prompt/message: "
+                f"prompt_chars={message_bundle['prompt_stats']['prompt_chars']}, "
+                f"prompt_lines={message_bundle['prompt_stats']['prompt_lines']}, "
+                f"message_chars={message_bundle['prompt_stats']['message_chars']}, "
+                f"message_lines={message_bundle['prompt_stats']['message_lines']}, "
+                f"timeout_s={timeout}"
+            ),
+        )
+        self.logger.agent_progress(agent_name, "Full prompt message:")
+        for line in str(message_bundle["combined_message"]).splitlines():
+            self.logger.agent_progress(agent_name, line)
+        self.logger.agent_progress(agent_name, "")
+        self.logger.agent_progress(agent_name, "Waiting for direct_api response...")
+
+        started_at = time.monotonic()
+        try:
+            with urllib_request.urlopen(request, timeout=timeout) as response:
+                raw_body = response.read().decode("utf-8", errors="replace")
+        except urllib_error.HTTPError as exc:
+            response_body = exc.read().decode("utf-8", errors="replace")
+            status = self._classify_direct_api_error(exc.code, response_body)
+            elapsed = time.monotonic() - started_at
+            self.logger.error(
+                f"Direct API request failed: {agent_name}",
+                f"status_code={exc.code} | body={self._tail_text(response_body)}",
+            )
+            save_agent_report(status, status, elapsed, "", response_body, "", command, 1)
+            self.logger.agent_end(agent_name, status, status)
+            return False
+        except Exception:
+            elapsed = time.monotonic() - started_at
+            error_text = traceback.format_exc()
+            self.logger.error(f"Direct API request failed: {agent_name}", error_text)
+            save_agent_report("failed", "direct_api request failed", elapsed, "", error_text, "", command, 1)
+            self.logger.agent_end(agent_name, "failed", "direct_api request failed")
+            return False
+
+        elapsed = time.monotonic() - started_at
+        try:
+            response_payload = json.loads(raw_body)
+        except json.JSONDecodeError:
+            self.logger.error(f"Direct API returned invalid JSON: {agent_name}", self._tail_text(raw_body))
+            save_agent_report("failed", "invalid direct_api response", elapsed, raw_body, "", "", command, 1)
+            self.logger.agent_end(agent_name, "failed", "invalid direct_api response")
+            return False
+
+        output_text = self._extract_direct_api_text(response_payload)
+        stdout_payload = {
+            "output_text": output_text,
+            "model": str(response_payload.get("model") or normalized_model),
+            "provider": "openrouter",
+        }
+        usage = response_payload.get("usage")
+        if isinstance(usage, dict):
+            stdout_payload["usage"] = {
+                "prompt_tokens": usage.get("prompt_tokens"),
+                "completion_tokens": usage.get("completion_tokens"),
+                "total_tokens": usage.get("total_tokens"),
+            }
+        stdout = json.dumps(stdout_payload, ensure_ascii=False)
+        parsed_output = self._extract_agent_output(stdout)
+        if parsed_output:
+            self.logger.agent_progress(agent_name, "")
+            self.logger.agent_progress(agent_name, "Agent response:")
+            for line in parsed_output.splitlines():
+                self.logger.agent_progress(agent_name, line)
+
+        failure_reason = self._detect_agent_failure(stdout, "", parsed_output)
+        if failure_reason:
+            failure_status = self._classify_failure_status(failure_reason)
+            self.logger.error(
+                f"Agent returned invalid direct_api output: {agent_name}",
+                f"elapsed_s={elapsed:.2f} | detected_failure={failure_reason} | stdout_tail={self._tail_text(stdout)}",
+            )
+            save_agent_report(failure_status, failure_reason, elapsed, stdout, "", parsed_output, command, 0)
+            self.logger.agent_end(agent_name, failure_status, failure_reason)
+            return False
+
+        save_agent_report("success", "completed", elapsed, stdout, "", parsed_output, command, 0)
+        self.logger.agent_end(agent_name, "success", "completed")
+        return True
 
     def _build_previous_agent_context(self, phase: str, agent_name: str, limit: int = 4000) -> str:
         agent_dir = self.logger.run_dir / "agents" / phase
@@ -797,6 +1347,9 @@ class WorkflowOrchestrator:
                 timeout=timeout,
                 env=env,
             )
+        except subprocess.TimeoutExpired:
+            self.logger.warning(f"{purpose}: subprocess timed out after {timeout}s")
+            return None
         except Exception:
             self.logger.error(
                 f"{purpose}: subprocess exception",
@@ -816,6 +1369,7 @@ class WorkflowOrchestrator:
             return self._models_list_cache
 
         self._models_list_attempted = True
+        self._models_list_status = "running"
         process = self._run_openclaw_subprocess(
             [runner, "models", "list"],
             env=self._build_model_list_env(agent_runtime),
@@ -823,9 +1377,11 @@ class WorkflowOrchestrator:
             purpose="openclaw models list",
         )
         if process is None:
+            self._models_list_status = "timeout"
             return None
 
         if process.returncode != 0 or not process.stdout.strip():
+            self._models_list_status = "failed"
             return None
 
         available: set[str] = set()
@@ -839,7 +1395,31 @@ class WorkflowOrchestrator:
                     available.add(token.strip())
 
         self._models_list_cache = available
+        self._models_list_status = "ok"
         return available
+
+    def _verify_required_startup_model(self, runner: str, agent_runtime: dict[str, str]) -> dict[str, str]:
+        model = str(agent_runtime.get("model") or "").strip()
+        available_models = self._get_available_models(runner, agent_runtime)
+        if available_models is None:
+            if not self.runtime.require_model_list_preflight:
+                return {
+                    "error": "",
+                    "method": f"startup models-list {self._models_list_status} ignored",
+                    "warning": "OpenClaw model list check timed out; continuing with configured effective models.",
+                }
+            return {
+                "error": "Unable to verify configured model via `openclaw models list`.",
+                "method": f"startup models-list {self._models_list_status}",
+                "warning": "",
+            }
+        if model not in available_models:
+            return {
+                "error": f"Configured startup model is not available: {model}",
+                "method": "startup models-list missing",
+                "warning": "",
+            }
+        return {"error": "", "method": "startup models-list", "warning": ""}
 
     def _verify_model_available(self, runner: str, agent_name: str, agent_runtime: dict[str, str]) -> dict[str, str]:
         model = str(agent_runtime.get("model") or "").strip()
@@ -870,6 +1450,12 @@ class WorkflowOrchestrator:
                         "openclaw models list verification unavailable; continuing because registry already defines "
                         f"model {registry_model} for {agent_name}"
                     ),
+                }
+            if not self.runtime.require_model_list_preflight:
+                return {
+                    "error": "",
+                    "method": f"configured model fallback after models-list {self._models_list_status}",
+                    "warning": "OpenClaw model list check timed out; continuing with configured effective models.",
                 }
             return {
                 "error": "Unable to verify configured model via `openclaw models list`.",
@@ -1095,26 +1681,48 @@ class WorkflowOrchestrator:
             self._registered_agents_cache = self._get_registered_agent_records(runner_path)
         return self._registered_agents_cache
 
-    def _get_registered_agent_records(self, runner_path: str) -> dict[str, dict[str, Any]]:
-        process = self._run_openclaw_subprocess(
-            [runner_path, "agents", "list", "--json"],
-            env=self._build_agent_env(),
-            timeout=60,
-            purpose="openclaw agents list",
-        )
-        if process is None:
-            return {}
+    def _inspect_registered_agent_records(self, runner_path: str) -> dict[str, Any]:
+        command = [runner_path, "agents", "list", "--json"]
+        prepared = self._prepare_command_for_windows(command)
+        self.logger.info(f"openclaw agents list: subprocess command={' '.join(prepared)}")
+        try:
+            process = subprocess.run(
+                prepared,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=60,
+                env=self._build_agent_env(),
+            )
+        except subprocess.TimeoutExpired:
+            return {"records": {}, "status": "timeout"}
+        except Exception:
+            self.logger.error(
+                "openclaw agents list: subprocess exception",
+                traceback.format_exc(),
+            )
+            return {"records": {}, "status": "error"}
+
+        self.logger.info(f"openclaw agents list: returncode={process.returncode}")
+        self.logger.info(f"openclaw agents list: stdout={process.stdout!r}")
+        self.logger.info(f"openclaw agents list: stderr={process.stderr!r}")
+
         if process.returncode != 0 or not process.stdout.strip():
-            return {}
+            return {"records": {}, "status": "unavailable"}
         try:
             payload = json.loads(process.stdout)
         except json.JSONDecodeError:
-            return {}
+            return {"records": {}, "status": "invalid_json"}
         if not isinstance(payload, list):
-            return {}
+            return {"records": {}, "status": "invalid_payload"}
+
         result: dict[str, dict[str, Any]] = {}
         for item in payload:
             agent_id = item.get("id") if isinstance(item, dict) else None
             if isinstance(agent_id, str):
                 result[agent_id] = item
-        return result
+        return {"records": result, "status": "ok"}
+
+    def _get_registered_agent_records(self, runner_path: str) -> dict[str, dict[str, Any]]:
+        return self._inspect_registered_agent_records(runner_path)["records"]

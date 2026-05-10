@@ -1,6 +1,9 @@
 workflow:
+  executor: direct_api
   mode: interactive
   auto_continue_delay: 3
+  require_registry_preflight: false
+  require_model_list_preflight: false
   phase_order:
     - research
     - implementation
@@ -12,8 +15,8 @@ project:
   default_branch: main
 
 runtime:
-  provider: anthropic
-  model: anthropic/claude-sonnet-4-6
+  provider: openrouter
+  model: openrouter/deepseek/deepseek-chat-v3
   thinking: low
 
 paths:
@@ -31,7 +34,7 @@ phases:
         description: "Analyze the current repository, constraints, gaps, and immediate opportunities"
         timeout: 900
         provider: openrouter
-        model: google/gemini-2.5-flash
+        model: openrouter/deepseek/deepseek-chat-v3
         thinking: low
       - name: competitor-analyst
         description: "Analyze competitors"
@@ -43,13 +46,13 @@ phases:
         description: "Analyze market and trends"
         timeout: 600
         provider: openrouter
-        model: google/gemini-2.5-flash
+        model: openrouter/deepseek/deepseek-chat-v3
         thinking: low
       - name: tech-analyst
         description: "Review technical options"
         timeout: 600
         provider: openrouter
-        model: google/gemini-2.5-flash
+        model: openrouter/deepseek/deepseek-chat-v3
         thinking: low
       - name: innovation-scout
         description: "Find adjacent product and workflow innovations"
@@ -60,8 +63,8 @@ phases:
       - name: product-manager
         description: "Summarize and prepare requirements"
         timeout: 900
-        provider: anthropic
-        model: anthropic/claude-sonnet-4-6
+        provider: openrouter
+        model: openrouter/deepseek/deepseek-chat-v3
         thinking: low
 
   implementation:
@@ -70,16 +73,28 @@ phases:
       - name: architect
         description: "Prepare technical plan"
         timeout: 900
+        provider: openrouter
+        model: openrouter/deepseek/deepseek-chat-v3
+        thinking: low
       - name: developer
         description: "Implement the task"
         timeout: 2400
         max_retries: 3
+        provider: openrouter
+        model: openrouter/deepseek/deepseek-chat-v3
+        thinking: low
       - name: qa
         description: "Run checks and report regressions"
         timeout: 900
+        provider: openrouter
+        model: openrouter/deepseek/deepseek-chat-v3
+        thinking: low
       - name: template-validator
         description: "Validate output against template"
         timeout: 600
+        provider: openrouter
+        model: openrouter/deepseek/deepseek-chat-v3
+        thinking: low
 
   deployment:
     name: "Deployment Readiness"
@@ -89,9 +104,15 @@ phases:
       - name: production-readiness-checker
         description: "Check production readiness, release risks, and launch blockers"
         timeout: 900
+        provider: openrouter
+        model: openrouter/deepseek/deepseek-chat-v3
+        thinking: low
       - name: launch-strategist
         description: "Prepare launch plan, channels, and rollout checklist after readiness approval"
         timeout: 900
+        provider: openrouter
+        model: openrouter/deepseek/deepseek-chat-v3
+        thinking: low
 
 git:
   enabled: true

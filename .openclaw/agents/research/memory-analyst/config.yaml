@@ -1,0 +1,6 @@
+﻿name: memory-analyst
+phase: research
+description: "Audit memory layers, persistence, RAG interactions, and chat history semantics"
+timeout: 600
+commands:
+  - echo "memory-analyst"

@@ -1,0 +1,6 @@
+﻿name: encoding-cleanup
+phase: implementation
+description: "Remove mojibake from user-facing strings and normalize UTF-8 sources"
+timeout: 900
+commands:
+  - echo "encoding-cleanup"
