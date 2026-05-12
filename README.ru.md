@@ -73,7 +73,17 @@ Copy-Item .env.example .env
 6. Запустите workflow:
 
 ```powershell
-.\run.bat --mode interactive
+.\run.bat interactive
+```
+
+Короткие алиасы фаз и режима:
+
+```powershell
+.\run.bat research --skip-git
+.\run.bat r --log-level DEBUG
+.\run.bat impl --mode interactive
+.\run.bat deploy
+.\run.bat auto
 ```
 
 ## Ежедневная работа на нескольких Windows-устройствах

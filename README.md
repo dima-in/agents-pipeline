@@ -185,13 +185,22 @@ Run against the current directory:
 
 ```powershell
 cd /d D:\SomeProject
-D:\agentic-dev-loop\agents-pipeline\run.bat --phase research --mode interactive
+D:\agentic-dev-loop\agents-pipeline\run.bat research
 ```
 
 Run against an explicit directory:
 
 ```powershell
 D:\agentic-dev-loop\agents-pipeline\run.bat --phase research --workspace D:\SomeProject
+```
+
+Shortcut aliases also work with extra flags:
+
+```powershell
+.\run.bat research --skip-git
+.\run.bat r --log-level DEBUG
+.\run.bat impl --mode interactive
+.\run.bat auto
 ```
 
 ## Reports

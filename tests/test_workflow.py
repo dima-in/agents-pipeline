@@ -109,6 +109,7 @@ def test_agent_directories_exist() -> None:
     assert "implementation" in agents
     assert "competitor-analyst" in agents["research"]
     assert "architect" in agents["implementation"]
+    assert "implementation-planner" in agents["implementation"]
 
 
 def test_agent_catalog_loads() -> None:
@@ -464,7 +465,7 @@ def test_implementation_fails_before_architect_if_research_handoff_missing(tmp_p
     assert ok is False
 
 
-def test_developer_blocked_when_architect_plans_marketplace_file(tmp_path: Path, monkeypatch) -> None:
+def test_implementation_planner_runs_after_architect(tmp_path: Path, monkeypatch) -> None:
     engine_root = tmp_path / "engine"
     target_workspace = tmp_path / "target"
     target_workspace.mkdir(parents=True)
@@ -480,10 +481,10 @@ def test_developer_blocked_when_architect_plans_marketplace_file(tmp_path: Path,
 
     def fake_run_agent(agent_config, phase_key, index=None, total=None):
         calls.append(agent_config["name"])
-        if agent_config["name"] == "architect":
+        if agent_config["name"] == "implementation-planner":
             orchestrator.logger.save_agent_report(
                 "implementation",
-                "architect",
+                "implementation-planner",
                 {
                     "status": "success",
                     "result": "completed",
@@ -492,18 +493,89 @@ def test_developer_blocked_when_architect_plans_marketplace_file(tmp_path: Path,
                     "message": "prompt",
                     "stdout": "",
                     "stderr": "",
-                    "parsed_output": "Planned files:\n- gateway-v4/app/services/marketplace.py",
+                    "parsed_output": json.dumps(
+                        [
+                            {
+                                "id": "backend-task",
+                                "title": "Backend task",
+                                "priority": "P0",
+                                "scope": "Touch backend only.",
+                                "allowed_paths": ["gateway-v4/app/services/monitoring.py"],
+                                "forbidden_paths": [],
+                                "acceptance_criteria": ["Backend updated."],
+                                "risk_level": "low",
+                                "estimated_effort": "S",
+                            }
+                        ]
+                    ),
                 },
             )
         return True
 
     monkeypatch.setattr(orchestrator, "_run_agent", fake_run_agent)
-    phase = {"agents": [{"name": "architect"}, {"name": "developer"}, {"name": "qa"}]}
+    monkeypatch.setattr(orchestrator, "_enforce_implementation_scope_diff", lambda: True)
+    phase = {"agents": [{"name": "architect"}, {"name": "implementation-planner"}, {"name": "developer"}]}
+
+    ok = orchestrator._run_phase_agents(phase, "implementation")
+
+    assert ok is True
+    assert calls[:2] == ["architect", "implementation-planner"]
+
+
+def test_developer_blocked_when_selected_task_plans_marketplace_file(tmp_path: Path, monkeypatch) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    monkeypatch.setattr(orchestrator, "_wait_for_user", lambda _prompt: True)
+    calls: list[str] = []
+
+    def fake_run_agent(agent_config, phase_key, index=None, total=None):
+        calls.append(agent_config["name"])
+        if agent_config["name"] == "implementation-planner":
+            orchestrator.logger.save_agent_report(
+                "implementation",
+                "implementation-planner",
+                {
+                    "status": "success",
+                    "result": "completed",
+                    "elapsed_s": 1,
+                    "returncode": 0,
+                    "message": "prompt",
+                    "stdout": "",
+                    "stderr": "",
+                    "parsed_output": json.dumps(
+                        [
+                            {
+                                "id": "planner-marketplace-task",
+                                "title": "Marketplace billing task",
+                                "priority": "P0",
+                                "scope": "Touch marketplace code.",
+                                "allowed_paths": ["gateway-v4/app/services/marketplace.py"],
+                                "forbidden_paths": [],
+                                "acceptance_criteria": ["Marketplace code updated."],
+                                "risk_level": "high",
+                                "estimated_effort": "M",
+                            }
+                        ]
+                    ),
+                },
+            )
+        return True
+
+    monkeypatch.setattr(orchestrator, "_run_agent", fake_run_agent)
+    phase = {"agents": [{"name": "architect"}, {"name": "implementation-planner"}, {"name": "developer"}, {"name": "qa"}]}
 
     ok = orchestrator._run_phase_agents(phase, "implementation")
 
     assert ok is False
-    assert calls == ["architect"]
+    assert calls == ["architect", "implementation-planner"]
     payload = json.loads(
         (orchestrator.logger.run_dir / "agents" / "implementation" / "developer.json").read_text(encoding="utf-8")
     )
@@ -628,10 +700,10 @@ def test_allow_scope_expansion_bypasses_watchdog_with_warning(tmp_path: Path, mo
 
     def fake_run_agent(agent_config, phase_key, index=None, total=None):
         calls.append(agent_config["name"])
-        if agent_config["name"] == "architect":
+        if agent_config["name"] == "implementation-planner":
             orchestrator.logger.save_agent_report(
                 "implementation",
-                "architect",
+                "implementation-planner",
                 {
                     "status": "success",
                     "result": "completed",
@@ -640,7 +712,21 @@ def test_allow_scope_expansion_bypasses_watchdog_with_warning(tmp_path: Path, mo
                     "message": "prompt",
                     "stdout": "",
                     "stderr": "",
-                    "parsed_output": "Planned files:\n- frontend/src/App.jsx",
+                    "parsed_output": json.dumps(
+                        [
+                            {
+                                "id": "planner-frontend-task",
+                                "title": "Frontend task",
+                                "priority": "P1",
+                                "scope": "Touch frontend code.",
+                                "allowed_paths": ["frontend/src/App.jsx"],
+                                "forbidden_paths": [],
+                                "acceptance_criteria": ["Frontend code updated."],
+                                "risk_level": "high",
+                                "estimated_effort": "M",
+                            }
+                        ]
+                    ),
                 },
             )
         return True
@@ -659,10 +745,51 @@ def test_allow_scope_expansion_bypasses_watchdog_with_warning(tmp_path: Path, mo
             "scope_policy_result": "allowed",
         },
     )
-    phase = {"agents": [{"name": "architect"}, {"name": "developer"}, {"name": "qa"}]}
+    phase = {"agents": [{"name": "architect"}, {"name": "implementation-planner"}, {"name": "developer"}, {"name": "qa"}]}
 
     ok = orchestrator._run_phase_agents(phase, "implementation")
 
     assert ok is True
-    assert calls == ["architect", "developer", "qa"]
+    assert calls == ["architect", "implementation-planner", "developer", "qa"]
     assert any("Scope watchdog bypassed" in warning for warning in warnings)
+
+
+def test_scope_watchdog_uses_selected_task_allowed_paths(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    repo = git.Repo.init(target_workspace)
+    with repo.config_writer() as writer:
+        writer.set_value("user", "name", "Test")
+        writer.set_value("user", "email", "test@example.com")
+    allowed_path = "docs/implementation-plan.md"
+    disallowed_global_path = target_workspace / allowed_path
+    disallowed_global_path.parent.mkdir(parents=True, exist_ok=True)
+    disallowed_global_path.write_text("old\n", encoding="utf-8")
+    repo.index.add([allowed_path])
+    repo.index.commit("init")
+    disallowed_global_path.write_text("new\n", encoding="utf-8")
+
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    orchestrator._selected_implementation_item = {
+        "id": "docs-task",
+        "title": "Docs task",
+        "priority": "P1",
+        "scope": "Update docs only.",
+        "allowed_paths": [allowed_path],
+        "forbidden_paths": [],
+        "acceptance_criteria": ["Docs updated."],
+        "risk_level": "low",
+        "estimated_effort": "S",
+    }
+
+    diagnostics = orchestrator._collect_scope_watchdog_diff_diagnostics()
+
+    assert diagnostics["allowed"] is True
+    assert diagnostics["allowed_paths_matched"] == [allowed_path]

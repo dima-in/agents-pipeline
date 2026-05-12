@@ -120,6 +120,26 @@ def _seed_research_run(log_root: Path, run_id: str, reports: list[dict[str, obje
     return run_dir.parent.parent
 
 
+def _seed_implementation_report(
+    run_dir: Path,
+    agent_name: str,
+    *,
+    parsed_output: str = "",
+    handoff_summary: str = "",
+    status: str = "success",
+) -> None:
+    agent_dir = run_dir / "agents" / "implementation"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "agent_name": agent_name,
+        "agent": agent_name,
+        "status": status,
+        "handoff_summary": handoff_summary,
+        "parsed_output": parsed_output,
+    }
+    (agent_dir / f"{agent_name}.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def _ensure_temp_agent_prompt(engine_root: Path, phase: str, agent_name: str) -> None:
     prompt_dir = engine_root / ".openclaw" / "agents" / phase / agent_name
     prompt_dir.mkdir(parents=True, exist_ok=True)
@@ -822,6 +842,25 @@ def test_developer_write_tools_are_enabled_for_scoped_implementation(tmp_path: P
         "20260101_120003",
         [{"agent_name": "product-manager", "handoff_summary": "agent: product-manager\nfindings:\n- summary\nrisks:\n- none\ndecisions:\n- none\nrecommended_next_tasks:\n- none"}],
     )
+    _seed_implementation_report(
+        orchestrator.logger.run_dir,
+        "implementation-planner",
+        parsed_output=json.dumps(
+            [
+                {
+                    "id": "planner-backend-safe-task",
+                    "title": "Implement monitoring service changes",
+                    "priority": "P0",
+                    "scope": "Edit monitoring service only.",
+                    "allowed_paths": ["gateway-v4/app/services/monitoring.py"],
+                    "forbidden_paths": ["frontend/*"],
+                    "acceptance_criteria": ["Monitoring service is updated."],
+                    "risk_level": "low",
+                    "estimated_effort": "S",
+                }
+            ]
+        ),
+    )
 
     bundle = orchestrator._build_agent_message_bundle(
         "developer",
@@ -831,14 +870,205 @@ def test_developer_write_tools_are_enabled_for_scoped_implementation(tmp_path: P
     )
 
     assert bundle["implementation_retrieval_enabled"] is True
-    assert bundle["selected_task_scope"]
+    assert bundle["selected_task_scope"] == "Edit monitoring service only."
     assert bundle["selected_task_scope"] in bundle["system_message"]
+    assert bundle["selected_task_id"] == "planner-backend-safe-task"
+    assert bundle["selected_task_allowed_paths"] == ["gateway-v4/app/services/monitoring.py"]
+    assert bundle["backlog_task_count"] == 1
+    assert bundle["implementation_planner_output_chars"] > 0
     assert '"tool":"write_file"' in bundle["system_message"]
     assert '"tool":"apply_patch"' in bundle["system_message"]
     assert "Developer must produce real file edits via write_file/apply_patch" in bundle["system_message"]
     assert "Do not implement marketplace." in bundle["system_message"]
     assert "Do not change Stripe or billing flows." in bundle["system_message"]
     assert "Do not make broad frontend changes." in bundle["system_message"]
+    assert "[selected-task-contract]" in bundle["system_message"]
+
+
+def test_backlog_is_generated_from_implementation_planner_output(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir(parents=True)
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    _seed_research_run(
+        orchestrator.logger.log_dir,
+        "20260101_120010",
+        [{"agent_name": "product-manager", "handoff_summary": "agent: product-manager\nfindings:\n- summary\nrisks:\n- none\ndecisions:\n- none\nrecommended_next_tasks:\n- none"}],
+    )
+    _seed_implementation_report(
+        orchestrator.logger.run_dir,
+        "implementation-planner",
+        parsed_output=json.dumps(
+            [
+                {
+                    "id": "p1-frontend",
+                    "title": "Frontend follow-up",
+                    "priority": "P1",
+                    "scope": "Touch frontend.",
+                    "allowed_paths": ["frontend/src/App.jsx"],
+                    "forbidden_paths": [],
+                    "acceptance_criteria": ["Frontend updated."],
+                    "risk_level": "high",
+                    "estimated_effort": "M",
+                },
+                {
+                    "id": "p0-backend",
+                    "title": "Backend first task",
+                    "priority": "P0",
+                    "scope": "Touch backend only.",
+                    "allowed_paths": ["gateway-v4/app/services/monitoring.py"],
+                    "forbidden_paths": [],
+                    "acceptance_criteria": ["Backend updated."],
+                    "risk_level": "low",
+                    "estimated_effort": "S",
+                },
+            ]
+        ),
+    )
+
+    selection = orchestrator._prepare_implementation_backlog_selection(require_backlog=True)
+
+    assert selection["error"] == ""
+    assert [item["id"] for item in selection["backlog"]] == ["p0-backend", "p1-frontend"]
+    assert selection["backlog_source"] == "implementation-planner"
+    assert selection["selected_item"]["id"] == "p0-backend"
+
+
+def test_developer_prompt_receives_only_selected_task_not_raw_architect_plan(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir(parents=True)
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (target_workspace / "README.md").write_text("target readme", encoding="utf-8")
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    _seed_research_run(
+        orchestrator.logger.log_dir,
+        "20260101_120011",
+        [{"agent_name": "product-manager", "handoff_summary": "agent: product-manager\nfindings:\n- summary\nrisks:\n- none\ndecisions:\n- none\nrecommended_next_tasks:\n- none"}],
+    )
+    _seed_implementation_report(
+        orchestrator.logger.run_dir,
+        "architect",
+        parsed_output="Broad architect plan: touch frontend/src/App.jsx and gateway-v4/app/services/marketplace.py",
+    )
+    _seed_implementation_report(
+        orchestrator.logger.run_dir,
+        "implementation-planner",
+        parsed_output=json.dumps(
+            [
+                {
+                    "id": "safe-backend-task",
+                    "title": "Safe backend task",
+                    "priority": "P0",
+                    "scope": "Touch gateway-v4/app/services/monitoring.py only.",
+                    "allowed_paths": ["gateway-v4/app/services/monitoring.py"],
+                    "forbidden_paths": ["frontend/*", "gateway-v4/app/services/marketplace.py"],
+                    "acceptance_criteria": ["Monitoring file updated."],
+                    "risk_level": "low",
+                    "estimated_effort": "S",
+                }
+            ]
+        ),
+    )
+
+    bundle = orchestrator._build_agent_message_bundle(
+        "developer",
+        {"name": "developer", "description": "Implement the task"},
+        Path(".openclaw/agents/implementation/developer/prompt.md"),
+        "implementation",
+    )
+
+    assert "safe-backend-task" in bundle["system_message"]
+    assert "gateway-v4/app/services/monitoring.py" in bundle["system_message"]
+    assert "frontend/src/App.jsx" not in bundle["system_message"]
+    assert "Broad architect plan:" not in bundle["system_message"]
+
+
+def test_implementation_planner_receives_architect_output_after_architect(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir(parents=True)
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (target_workspace / "README.md").write_text("target readme", encoding="utf-8")
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    _seed_research_run(
+        orchestrator.logger.log_dir,
+        "20260101_120012",
+        [{"agent_name": "product-manager", "handoff_summary": "agent: product-manager\nfindings:\n- PM summary\nrisks:\n- none\ndecisions:\n- none\nrecommended_next_tasks:\n- none"}],
+    )
+    _seed_implementation_report(
+        orchestrator.logger.run_dir,
+        "architect",
+        parsed_output="Architect plan: update gateway-v4/app/services/monitoring.py and add tests.",
+    )
+
+    bundle = orchestrator._build_agent_message_bundle(
+        "implementation-planner",
+        {"name": "implementation-planner", "description": "Convert plan to backlog"},
+        Path(".openclaw/agents/implementation/implementation-planner/prompt.md"),
+        "implementation",
+    )
+
+    assert "Architect plan: update gateway-v4/app/services/monitoring.py and add tests." in bundle["system_message"]
+    assert "[product-manager]" in bundle["system_message"]
 
 
 def test_research_handoff_summary_is_capped() -> None:

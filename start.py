@@ -61,6 +61,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicit implementation task scope override",
     )
     parser.add_argument(
+        "--task-id",
+        default=None,
+        help="Implementation backlog item id or 1-based number",
+    )
+    parser.add_argument(
+        "--list-tasks",
+        action="store_true",
+        help="List implementation backlog items and exit",
+    )
+    parser.add_argument(
+        "--next-task",
+        action="store_true",
+        help="Select the next uncompleted implementation backlog item",
+    )
+    parser.add_argument(
         "--research-run",
         default=None,
         help="Specific research run id to use for implementation context",
@@ -89,10 +104,10 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     configure_stdio()
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     engine_root = Path(__file__).resolve().parent
     launch_cwd = Path(os.environ.get("AGENTS_PIPELINE_LAUNCH_CWD") or os.getcwd()).resolve()
@@ -109,12 +124,17 @@ def main() -> int:
         no_memory=args.no_memory,
         fresh_run=args.fresh_run,
         task_scope=args.task_scope,
+        selected_task_ref=args.task_id,
+        next_task=args.next_task,
         research_run=args.research_run,
         allow_scope_expansion=args.allow_scope_expansion,
     )
     orchestrator.config["workflow"]["mode"] = args.mode
     orchestrator.config["git"]["enabled"] = not args.skip_git
     orchestrator.config["logging"]["level"] = args.log_level
+
+    if args.list_tasks:
+        return orchestrator.print_implementation_backlog()
 
     if args.preflight_only:
         return 0 if orchestrator._preflight_runtime() else 1

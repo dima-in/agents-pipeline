@@ -7,6 +7,7 @@ def test_project_tree_exists() -> None:
         Path("workflow/orchestrator.py"),
         Path("workflow/logger.py"),
         Path(".openclaw/agents/research/competitor-analyst/config.yaml"),
+        Path(".openclaw/agents/implementation/implementation-planner/config.yaml"),
         Path(".openclaw/agents/implementation/qa/config.yaml"),
         Path("start.py"),
     ]

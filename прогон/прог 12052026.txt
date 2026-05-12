@@ -1,0 +1,178 @@
+ product-manager:
+  product-manager: # Документ требований к продукту: Улучшение agents-pipeline
+  product-manager:
+  product-manager: ## Резюме
+  product-manager:
+  product-manager: На основе комплексного рыночного, технического и конкурентного анализа, **agents-pipeline** позиционируется для захвата растущей ниши в локальной оркестрации мультиагентных рабочих процессов. Проект в настоящее время реализует поэтапную агентную систему с двумя режимами выполнения (прямой API и MCP-сервер), ориентированную на разработчиков, которым нужны воспроизводимые, проверяемые рабочие процессы с помощью ИИ.
+  product-manager:
+  product-manager: ## Стратегическое позиционирование
+  product-manager:
+  product-manager: **Рыночная возможность:**
+  product-manager: - Развивающийся сегмент: Локальная оркестрация агентов (избегание привязки к поставщику)
+  product-manager: - Целевые пользователи: Индивидуальные разработчики, небольшие команды, исследователи ИИ
+  product-manager: - Ключевое отличие: Поэтапные, проверяемые рабочие процессы против непрозрачных ИИ-ассистентов
+  product-manager: - Драйверы роста: Внедрение ИИ-ассистентов для кодирования, потребность в воспроизводимых процессах разработки
+  product-manager:
+  product-manager: **Конкурентная среда:**
+  product-manager: - Прямые конкуренты: LangGraph, AutoGen, CrewAI (облачные, сложные)
+  product-manager: - Косвенные конкуренты: Cursor, GitHub Copilot (одноагентные, непрозрачные)
+  product-manager: - **Преимущество**: Простота, локальное выполнение, прозрачная многофазная оркестрация
+  product-manager:
+  product-manager: ## Основные требования
+  product-manager:
+  product-manager: ### 1. **Настраиваемые шаблоны агентов** (Высокий приоритет)
+  product-manager: **Цель:** Позволить пользователям настраивать рабочие процессы без изменения кода
+  product-manager:
+  product-manager: **Требования:**
+  product-manager: - Расширить `workflow/config.yaml` для поддержки подключаемых шаблонов агентов
+  product-manager: - Добавить готовые шаблоны для общих фаз:
+  product-manager:   - Агенты валидации (проверка кода, проверки безопасности)
+  product-manager:   - Агенты оптимизации (анализ производительности, предложения по рефакторингу)
+  product-manager:   - Агенты документации (API-документация, генерация README)
+  product-manager: - Реализовать концепцию маркетплейса/реестра шаблонов
+  product-manager: - Сохранить обратную совместимость с существующей 6-агентной структурой
+  product-manager:
+  product-manager: **Метрики успеха:**
+  product-manager: - Сокращение времени до первого рабочего процесса на 30% для новых пользователей
+  product-manager: - Увеличение принятия настройки рабочих процессов на 20%
+  product-manager: - Поддержка 10+ типов шаблонов в течение 6 месяцев
+  product-manager:
+  product-manager: ### 2. **Улучшенная оркестрация рабочих процессов** (Высокий приоритет)
+  product-manager: **Цель:** Улучшить надежность и наблюдаемость выполнения мультиагентов
+  product-manager:
+  product-manager: **Требования:**
+  product-manager: - Добавить сохранение состояния рабочего процесса (возобновление прерванных процессов)
+  product-manager: - Реализовать валидацию выходных данных агентов между фазами
+  product-manager: - Создать визуальное отслеживание прогресса рабочего процесса (CLI/веб-панель)
+  product-manager: - Добавить условное ветвление (пропуск фаз на основе предыдущих выходов)
+  product-manager: - Улучшить обработку ошибок с автоматической логикой повтора
+  product-manager:
+  product-manager: **Технические спецификации:**
+  product-manager: - Хранить состояние рабочего процесса в SQLite/JSON для портативности
+  product-manager: - Использовать JSON Schema для валидации выходов между агентами
+  product-manager: - Реализовать событийно-ориентированные обновления прогресса
+  product-manager: - Добавить синтаксис условной логики на основе YAML
+  product-manager:
+  product-manager: ### 3. **Созревание режима MCP-сервера** (Средний приоритет)
+  product-manager: **Цель:** Сделать MCP-режим готовым к продакшену для интеграции с IDE
+  product-manager:
+  product-manager: **Требования:**
+  product-manager: - Завершить реализацию протокола MCP (в настоящее время частичная)
+  product-manager: - Добавить аутентификацию/авторизацию для многопользовательских сценариев
+  product-manager: - Реализовать управление ресурсами (лимиты одновременных рабочих процессов)
+  product-manager: - Создать плагины для IDE: VS Code, Cursor, Zed
+  product-manager: - Добавить поддержку потоковой передачи для обратной связи в реальном времени
+  product-manager:
+  product-manager: **Результаты:**
+  product-manager: - Полностью совместимая реализация MCP-сервера
+  product-manager: - Расширение VS Code (готовое к маркетплейсу)
+  product-manager: - Документация для пользовательских интеграций с IDE
+  product-manager:
+  product-manager: ### 4. **Улучшения опыта разработчиков** (Средний приоритет)
+  product-manager: **Цель:** Снизить трение для новых пользователей и опытных пользователей
+  product-manager:
+  product-manager: **Требования:**
+  product-manager: - Интерактивный мастер настройки CLI (`agents-pipeline init`)
+  product-manager: - Встроенный фреймворк тестирования агентов (юнит-тесты для пользовательских агентов)
+  product-manager: - Горячая перезагрузка для изменений конфигурации во время разработки
+  product-manager: - Обширная библиотека примеров (10+ реальных рабочих процессов)
+  product-manager: - Руководство по миграции с инструментов конкурентов (LangGraph, AutoGen)
+  product-manager:
+  product-manager: **Потребности в документации:**
+  product-manager: - Руководство быстрого старта (5-минутная настройка)
+  product-manager: - Учебник по разработке агентов
+  product-manager: - Лучшие практики проектирования рабочих процессов
+  product-manager: - Руководство по устранению неполадок
+  product-manager:
+  product-manager: ### 5. **Производительность и масштабируемость** (Низко-средний приоритет)
+  product-manager: **Цель:** Поддержка более крупных проектов и более быстрого выполнения
+  product-manager:
+  product-manager: **Требования:**
+  product-manager: - Параллельное выполнение агентов там, где позволяют зависимости
+  product-manager: - Слой кэширования для повторных вызовов LLM (снижение затрат на API)
+  product-manager: - Поддержка локальных бэкендов LLM (Ollama, LM Studio)
+  product-manager: - Режим пакетной обработки для нескольких задач
+  product-manager: - Мониторинг использования ресурсов и лимиты
+  product-manager:
+  product-manager: **Технический подход:**
+  product-manager: - Реализовать разрешение зависимостей на основе DAG
+  product-manager: - Добавить кэш ответов на основе Redis/диска
+  product-manager: - Абстрагировать интерфейс провайдера LLM (OpenAI, Anthropic, локальный)
+  product-manager:
+  product-manager: ## Дорожная карта реализации
+  product-manager:
+  product-manager: ### Фаза 1 (Месяцы 1-2): Основа
+  product-manager: - Настраиваемые шаблоны агентов (базовые)
+  product-manager: - Сохранение состояния рабочего процесса
+  product-manager: - Интерактивный мастер настройки CLI
+  product-manager: - Переработка документации
+  product-manager:
+  product-manager: ### Фаза 2 (Месяцы 3-4): Интеграция
+  product-manager: - Завершение MCP-сервера
+  product-manager: - Расширение VS Code
+  product-manager: - Валидация выходов агентов
+  product-manager: - Визуальное отслеживание прогресса
+  product-manager:
+  product-manager: ### Фаза 3 (Месяцы 5-6): Масштаб
+  product-manager: - Движок параллельного выполнения
+  product-manager: - Кэширование ответов LLM
+  product-manager: - Маркетплейс шаблонов
+  product-manager: - Оптимизация производительности
+  product-manager:
+  product-manager: ## Снижение рисков
+  product-manager:
+  product-manager: **Технические риски:**
+  product-manager: - **Риск:** Критические изменения существующих рабочих процессов
+  product-manager:   - **Снижение:** Семантическое версионирование, предупреждения об устаревании, скрипты миграции
+  product-manager:
+  product-manager: - **Риск:** Лимиты скорости/затраты API LLM
+  product-manager:   - **Снижение:** Встроенное кэширование, поддержка локальных LLM, настраиваемая логика повтора
+  product-manager:
+  product-manager: **Рыночные риски:**
+  product-manager: - **Риск:** Паритет функций конкурентов
+  product-manager:   - **Снижение:** Фокус на простоте и локальных преимуществах, более быстрая итерация
+  product-manager:
+  product-manager: - **Риск:** Низкое принятие из-за сложности
+  product-manager:   - **Снижение:** Значительные инвестиции в DX (мастер настройки, примеры, документация)
+  product-manager:
+  product-manager: ## Критерии успеха
+  product-manager:
+  product-manager: **Цели на 6 месяцев:**
+  product-manager: - 500+ звезд на GitHub (в настоящее время ~50)
+  product-manager: - 50+ активных рабочих процессов в витрине сообщества
+  product-manager: - 5+ шаблонов агентов от сообщества
+  product-manager: - <10 минут среднее время настройки для новых пользователей
+  product-manager: - 90%+ успешность рабочих процессов (без сбоев)
+  product-manager:
+  product-manager: **Видение на 12 месяцев:**
+  product-manager: - Де-факто стандарт для локальной оркестрации агентов
+  product-manager: - Интеграция с основными IDE (VS Code, Cursor, JetBrains)
+  product-manager: - Самоподдерживающееся сообщество (еженедельные вклады)
+  product-manager: - Коммерческий уровень поддержки для предприятий
+  product-manager:
+  product-manager: ## Требования к ресурсам
+  product-manager:
+  product-manager: **Разработка:**
+  product-manager: - 1 старший инженер (ядро оркестрации)
+  product-manager: - 1 инженер среднего уровня (интеграции, инструменты)
+  product-manager: - Технический писатель на неполный рабочий день (документация)
+  product-manager:
+  product-manager: **Инфраструктура:**
+  product-manager: - Конвейер CI/CD (GitHub Actions)
+  product-manager: - Хостинг документации (ReadTheDocs/Docusaurus)
+  product-manager: - Форум сообщества (GitHub Discussions/Discord)
+  product-manager:
+  product-manager: **Оценка бюджета:** $150K-200K для выполнения Фазы 1 в течение 6 месяцев
+  product-manager: Agent cost: unavailable
+  product-manager: Phase total so far: $0.006500
+  product-manager: Run total so far: $0.006500
+Агент завершен: product-manager [успех]
+  Результат: completed
+Подтвердить результаты исследования? [y/n/auto]: y
+
+
+
+
+
+
+

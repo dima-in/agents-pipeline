@@ -26,4 +26,4 @@ if %errorlevel%==0 (
   call openclaw.CMD gateway start >nul 2>nul
 )
 
-python start.py %*
+python run_launcher.py %*

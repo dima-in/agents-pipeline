@@ -35,6 +35,8 @@ class WorkflowOrchestrator:
         no_memory: bool = False,
         fresh_run: bool = False,
         task_scope: str | None = None,
+        selected_task_ref: str | None = None,
+        next_task: bool = False,
         research_run: str | None = None,
         allow_scope_expansion: bool = False,
     ) -> None:
@@ -48,6 +50,8 @@ class WorkflowOrchestrator:
         self.git_remote = self._detect_git_remote()
         self.project_id = self._resolve_project_id(project_id)
         self.project_state_dir = self._ensure_project_state_dirs()
+        self.project_settings_path = self.project_state_dir / "settings.yaml"
+        self.project_settings = self._load_project_settings()
         self.repository_context_root = self.engine_root if self.context_mode == "engine_self_analysis" else self.target_workspace
         self.retrieval_root = self.target_workspace
         logs_root = self._engine_path(self.config.get("paths", {}).get("logs_dir", ".openclaw/logs"))
@@ -64,6 +68,8 @@ class WorkflowOrchestrator:
         self.no_memory = no_memory
         self.fresh_run = fresh_run
         self.task_scope_override = str(task_scope or "").strip()
+        self.selected_task_ref = str(selected_task_ref or "").strip()
+        self.next_task_requested = next_task
         self.research_run_id = str(research_run or "").strip()
         self.allow_scope_expansion = allow_scope_expansion
         self.implementation_scope_policy = self._get_implementation_scope_policy()
@@ -77,6 +83,10 @@ class WorkflowOrchestrator:
         self._models_list_status = "not_attempted"
         self._agent_cli_capabilities: dict[str, bool] | None = None
         self._global_registry_models = self._load_global_registry_models()
+        self._implementation_backlog_cache: list[dict[str, Any]] | None = None
+        self._implementation_backlog_source = ""
+        self._selected_implementation_item: dict[str, Any] | None = None
+        self._implementation_planner_output_chars = 0
         self._log_startup_diagnostics()
 
     def run_full_cycle(self) -> bool:
@@ -134,9 +144,13 @@ class WorkflowOrchestrator:
     def _run_implementation_phase(self) -> bool:
         phase = self.config["phases"]["implementation"]
         self._phase_failure_status = None
+        self._selected_implementation_item = None
+        self._implementation_backlog_cache = None
+        self._implementation_backlog_source = ""
+        self._implementation_planner_output_chars = 0
         self.logger.phase_start(phase["name"])
-        implementation_context = self._build_implementation_phase_context(limit=12000)
-        if implementation_context["context_chars"] == 0:
+        research_reports, _run_dir = self._load_latest_project_research_reports()
+        if not research_reports:
             self.logger.error(
                 f"No research handoff found for project_id={self.project_id}. Run research phase first or specify --research-run."
             )
@@ -164,12 +178,21 @@ class WorkflowOrchestrator:
                 self.logger.phase_end(phase["name"], self._phase_failure_status)
                 return False
             if ok:
+                self._mark_implementation_task_completed()
                 if self.config["git"]["enabled"] and not self._merge_git():
                     self.logger.save_phase_summary("implementation", phase["name"])
                     self.logger.phase_end(phase["name"], "failed")
                     return False
                 self.logger.save_phase_summary("implementation", phase["name"])
                 self.logger.phase_end(phase["name"], "success")
+                next_action = self._prompt_post_implementation_action()
+                if next_action == "next":
+                    self.next_task_requested = True
+                    self.selected_task_ref = ""
+                    self._selected_implementation_item = None
+                    return self._run_implementation_phase()
+                if next_action == "deployment":
+                    return self.run_deployment_phase()
                 return True
 
             self._save_feedback(task_id, "qa", f"Попытка {attempt} завершилась ошибкой. Проверь логи и исправь регрессии.")
@@ -194,6 +217,11 @@ class WorkflowOrchestrator:
                 self.logger.warning(f"Агент пропущен: {agent['name']}")
                 continue
             if phase_key == "implementation" and agent["name"] == "developer":
+                selection = self._prepare_implementation_backlog_selection(require_backlog=True)
+                if selection["error"]:
+                    self.logger.error(selection["error"])
+                    had_failures = True
+                    return False
                 if not self._enforce_implementation_scope_plan():
                     had_failures = True
                     return False
@@ -297,8 +325,13 @@ class WorkflowOrchestrator:
         self.logger.agent_progress(agent_name, f"Diagnostic retrieval_rounds={message_bundle['retrieval_rounds']}")
         self.logger.agent_progress(agent_name, f"Diagnostic target_workspace={self.target_workspace}")
         self.logger.agent_progress(agent_name, f"Diagnostic implementation_context_chars={message_bundle['implementation_context_chars']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic implementation_planner_output_chars={message_bundle['implementation_planner_output_chars']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic backlog_task_count={message_bundle['backlog_task_count']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic backlog_source={message_bundle['backlog_source']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic selected_task_id={message_bundle['selected_task_id']}")
         self.logger.agent_progress(agent_name, f"Diagnostic research_handoff_sources={', '.join(message_bundle['research_handoff_sources'])}")
         self.logger.agent_progress(agent_name, f"Diagnostic selected_task_scope={message_bundle['selected_task_scope']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic selected_task_allowed_paths={message_bundle['selected_task_allowed_paths']}")
         self.logger.agent_progress(agent_name, f"Diagnostic implementation_retrieval_enabled={message_bundle['implementation_retrieval_enabled']}")
 
         def save_agent_report(
@@ -336,8 +369,11 @@ class WorkflowOrchestrator:
                     "retrieval_enabled": message_bundle["retrieval_enabled"],
                     "retrieval_rounds": message_bundle["retrieval_rounds"],
                     "implementation_context_chars": message_bundle["implementation_context_chars"],
+                    "implementation_planner_output_chars": message_bundle["implementation_planner_output_chars"],
+                    "backlog_task_count": message_bundle["backlog_task_count"],
                     "research_handoff_sources": message_bundle["research_handoff_sources"],
                     "selected_task_scope": message_bundle["selected_task_scope"],
+                    "selected_task_allowed_paths": message_bundle["selected_task_allowed_paths"],
                     "implementation_retrieval_enabled": message_bundle["implementation_retrieval_enabled"],
                     "target_workspace": str(self.target_workspace),
                     "project_id": self.project_id,
@@ -356,6 +392,8 @@ class WorkflowOrchestrator:
                         else ""
                     ),
                     "usage": usage,
+                    "backlog_source": message_bundle["backlog_source"],
+                    "selected_task_id": message_bundle["selected_task_id"],
                     **extra_fields,
                 },
             )
@@ -980,6 +1018,11 @@ class WorkflowOrchestrator:
         repository_context = ""
         handoff_sources: list[str] = []
         selected_task_scope = ""
+        selected_task_id = ""
+        selected_task_allowed_paths: list[str] = []
+        backlog_source = ""
+        backlog_task_count = 0
+        implementation_planner_output_chars = 0
         implementation_retrieval_enabled = False
         implementation_context_chars = 0
         retrieval_enabled = self.runtime.executor == "direct_api" and phase == "research"
@@ -995,6 +1038,11 @@ class WorkflowOrchestrator:
             previous_context = implementation_context["previous_context"]
             handoff_sources = implementation_context["research_handoff_sources"]
             selected_task_scope = implementation_context["selected_task_scope"]
+            selected_task_id = implementation_context["selected_task_id"]
+            selected_task_allowed_paths = implementation_context["selected_task_allowed_paths"]
+            backlog_source = implementation_context["backlog_source"]
+            backlog_task_count = implementation_context["backlog_task_count"]
+            implementation_planner_output_chars = implementation_context["implementation_planner_output_chars"]
             implementation_context_chars = implementation_context["context_chars"]
             implementation_retrieval_enabled = self.runtime.executor == "direct_api" and self._is_implementation_retrieval_enabled(agent_name)
             retrieval_enabled = implementation_retrieval_enabled
@@ -1046,8 +1094,13 @@ class WorkflowOrchestrator:
             "retrieval_enabled": retrieval_enabled,
             "retrieval_rounds": 0,
             "implementation_context_chars": implementation_context_chars if phase == "implementation" else 0,
+            "implementation_planner_output_chars": implementation_planner_output_chars if phase == "implementation" else 0,
+            "backlog_task_count": backlog_task_count if phase == "implementation" else 0,
+            "backlog_source": backlog_source,
+            "selected_task_id": selected_task_id,
             "research_handoff_sources": handoff_sources,
             "selected_task_scope": selected_task_scope,
+            "selected_task_allowed_paths": selected_task_allowed_paths,
             "implementation_retrieval_enabled": implementation_retrieval_enabled,
             "translation_instruction": translation_instruction,
             "system_message": system_message,
@@ -1174,7 +1227,6 @@ class WorkflowOrchestrator:
         elif profile == "technical_architecture":
             sections = [
                 ("Execution architecture", self._build_execution_architecture_summary()),
-                ("workflow/orchestrator.py outline", self._build_python_outline(self.engine_root / "workflow/orchestrator.py")),
                 (
                     "direct_api implementation",
                     self._read_python_sections(
@@ -1198,6 +1250,7 @@ class WorkflowOrchestrator:
                         4000,
                     ),
                 ),
+                ("workflow/orchestrator.py outline", self._build_python_outline(self.engine_root / "workflow/orchestrator.py")),
                 ("workflow/runtime.py", self._read_file_excerpt(self.engine_root / "workflow/runtime.py", 2200)),
                 ("Relevant orchestration tests", self._build_tests_subset(["agent_reports", "workflow", "orchestrator"], limit=2000)),
             ]
@@ -2269,12 +2322,18 @@ class WorkflowOrchestrator:
         text = "\n\n".join(part.strip() for part in parts if part.strip())
         return text[:2000]
 
-    @staticmethod
-    def _build_implementation_scope_instruction(selected_scope: str) -> str:
+    def _build_implementation_scope_instruction(self, selected_scope: str) -> str:
         lines = [
             "Selected implementation scope:",
             selected_scope,
             "",
+        ]
+        if self._selected_implementation_item and self._selected_implementation_item.get("allowed_paths"):
+            lines.append("Allowed files for the selected task:")
+            lines.extend(f"- {path}" for path in self._selected_implementation_item["allowed_paths"])
+            lines.append("")
+        lines.extend(
+            [
             "Implementation guardrails:",
             "- Do not implement marketplace.",
             "- Do not change Stripe or billing flows.",
@@ -2285,7 +2344,8 @@ class WorkflowOrchestrator:
             "- Developer must produce real file edits via write_file/apply_patch when a safe scoped change is possible.",
             "- If no safe edit is possible, return status=no_changes with a reason.",
             "- If the task requires wider scope, stop and report that scope expansion is needed.",
-        ]
+            ]
+        )
         return "\n".join(lines)
 
     def _load_saved_agent_report(self, phase: str, agent_name: str, run_dir: Path | None = None) -> dict[str, Any] | None:
@@ -2343,6 +2403,9 @@ class WorkflowOrchestrator:
             for path in paths
             if self._normalize_repo_relative_path(path)
         ]
+        allowed_patterns = list(self.implementation_scope_policy["allowed_paths"])
+        if self._selected_implementation_item and self._selected_implementation_item.get("allowed_paths"):
+            allowed_patterns = list(self._selected_implementation_item["allowed_paths"])
         allowed_paths_matched: list[str] = []
         forbidden_hits: list[str] = []
         violations: list[str] = []
@@ -2351,7 +2414,7 @@ class WorkflowOrchestrator:
                 forbidden_hits.append(f"path:{path}")
                 violations.append(path)
                 continue
-            if self._path_matches_any(path, self.implementation_scope_policy["allowed_paths"]):
+            if self._path_matches_any(path, allowed_patterns):
                 allowed_paths_matched.append(path)
                 continue
             forbidden_hits.append(f"out_of_scope:{path}")
@@ -2364,47 +2427,54 @@ class WorkflowOrchestrator:
         }
 
     def _enforce_implementation_scope_plan(self) -> bool:
-        architect_report = self._load_saved_agent_report("implementation", "architect")
-        if not architect_report:
+        planner_report = self._load_saved_agent_report("implementation", "implementation-planner")
+        if not planner_report or not self._selected_implementation_item:
             diagnostics = {
                 "scope_policy_result": "blocked",
                 "changed_files_count": 0,
                 "diff_lines_count": 0,
-                "forbidden_hits": ["missing_architect_output"],
+                "forbidden_hits": ["missing_implementation_planner_output"],
                 "allowed_paths_matched": [],
             }
             return self._handle_scope_violation(
                 "developer",
-                "Architect output is missing; cannot validate implementation plan scope.",
+                "Implementation planner output is missing; cannot validate implementation task scope.",
                 diagnostics,
             )
 
-        planned_files = self._extract_planned_files_from_text(
-            str(architect_report.get("parsed_output") or architect_report.get("stdout") or "")
-        )
+        planned_files = list(self._selected_implementation_item.get("allowed_paths") or [])
         path_check = self._evaluate_scope_paths(planned_files)
+        forbidden_paths = [
+            path
+            for path in (self._selected_implementation_item.get("forbidden_paths") or [])
+            if self._path_matches_any(path, self.implementation_scope_policy["forbidden_paths"])
+        ]
+        forbidden_hits = list(path_check["forbidden_hits"])
+        if forbidden_paths:
+            forbidden_hits.extend(f"forbidden_path:{path}" for path in forbidden_paths)
         diagnostics = {
-            "scope_policy_result": "allowed" if path_check["allowed"] else "blocked",
+            "scope_policy_result": "allowed" if path_check["allowed"] and not forbidden_paths else "blocked",
             "changed_files_count": len(planned_files),
             "diff_lines_count": 0,
-            "forbidden_hits": path_check["forbidden_hits"],
+            "forbidden_hits": forbidden_hits,
             "allowed_paths_matched": path_check["allowed_paths_matched"],
         }
-        self._set_agent_report_extras("implementation", "architect", diagnostics)
-        self.logger.agent_progress("architect", f"Diagnostic scope_policy_result={diagnostics['scope_policy_result']}")
-        self.logger.agent_progress("architect", f"Diagnostic changed_files_count={diagnostics['changed_files_count']}")
-        self.logger.agent_progress("architect", f"Diagnostic diff_lines_count={diagnostics['diff_lines_count']}")
-        self.logger.agent_progress("architect", f"Diagnostic forbidden_hits={diagnostics['forbidden_hits']}")
-        self.logger.agent_progress("architect", f"Diagnostic allowed_paths_matched={diagnostics['allowed_paths_matched']}")
-        existing_architect = self._load_saved_agent_report("implementation", "architect")
-        if existing_architect:
-            self._overwrite_agent_report("implementation", "architect", {**existing_architect, **diagnostics})
-        if path_check["allowed"]:
+        self._set_agent_report_extras("implementation", "implementation-planner", diagnostics)
+        self.logger.agent_progress("implementation-planner", f"Diagnostic scope_policy_result={diagnostics['scope_policy_result']}")
+        self.logger.agent_progress("implementation-planner", f"Diagnostic changed_files_count={diagnostics['changed_files_count']}")
+        self.logger.agent_progress("implementation-planner", f"Diagnostic diff_lines_count={diagnostics['diff_lines_count']}")
+        self.logger.agent_progress("implementation-planner", f"Diagnostic forbidden_hits={diagnostics['forbidden_hits']}")
+        self.logger.agent_progress("implementation-planner", f"Diagnostic allowed_paths_matched={diagnostics['allowed_paths_matched']}")
+        existing_planner = self._load_saved_agent_report("implementation", "implementation-planner")
+        if existing_planner:
+            self._overwrite_agent_report("implementation", "implementation-planner", {**existing_planner, **diagnostics})
+        if path_check["allowed"] and not forbidden_paths:
             self._set_agent_report_extras("implementation", "developer", diagnostics)
             return True
         return self._handle_scope_violation(
             "developer",
-            "Architect planned files outside the allowed implementation scope: " + ", ".join(path_check["violations"]),
+            "Implementation planner selected task is outside the allowed implementation scope: "
+            + ", ".join(path_check["violations"] + forbidden_paths),
             diagnostics,
             warning_only=self.allow_scope_expansion,
         )
@@ -2584,8 +2654,10 @@ class WorkflowOrchestrator:
 
     def _build_implementation_phase_context(self, agent_name: str = "architect", limit: int = 12000) -> dict[str, Any]:
         research_reports, run_dir = self._load_latest_project_research_reports()
+        selection = self._prepare_implementation_backlog_selection(reports=research_reports, require_backlog=False)
+        selected_item = selection["selected_item"] or {}
         selected_scope = self._select_implementation_scope(research_reports)
-        same_phase_context = self._build_previous_agent_context("implementation", agent_name, limit=4000)
+        same_phase_context = self._build_implementation_same_phase_context(agent_name=agent_name, limit=4000)
         research_context = self._build_implementation_research_context(research_reports, agent_name, limit=5000)
         previous_parts = [part for part in [research_context, same_phase_context] if part.strip()]
         previous_context = "\n\n".join(previous_parts)
@@ -2614,8 +2686,18 @@ class WorkflowOrchestrator:
             "previous_context": previous_context,
             "research_handoff_sources": sources,
             "selected_task_scope": selected_scope,
+            "selected_task_id": str(selected_item.get("id") or ""),
+            "selected_task_allowed_paths": list(selected_item.get("allowed_paths") or []),
+            "backlog_task_count": len(selection["backlog"]),
+            "implementation_planner_output_chars": self._implementation_planner_output_chars,
+            "backlog_source": selection["backlog_source"],
             "context_chars": (len(repository_context) + len(previous_context)) if sources else 0,
         }
+
+    def _build_implementation_same_phase_context(self, agent_name: str, limit: int = 4000) -> str:
+        if agent_name in {"developer", "qa", "template-validator"}:
+            return self._build_selected_task_contract_context(limit=limit)
+        return self._build_previous_agent_context("implementation", agent_name, limit=limit)
 
     def _load_latest_project_research_reports(self) -> tuple[list[dict[str, Any]], Path | None]:
         candidate_run_dirs: list[Path] = []
@@ -2658,6 +2740,10 @@ class WorkflowOrchestrator:
         }
         if agent_name == "architect":
             selected_names = ["product-manager", "project-analyst", "tech-analyst"]
+        elif agent_name == "implementation-planner":
+            selected_names = ["product-manager", "project-analyst", "tech-analyst"]
+        elif agent_name in {"developer", "qa", "template-validator"}:
+            selected_names = []
         else:
             selected_names = wanted_order
 
@@ -2685,6 +2771,8 @@ class WorkflowOrchestrator:
     def _select_implementation_scope(self, reports: list[dict[str, Any]]) -> str:
         if self.task_scope_override:
             return self.task_scope_override
+        if self._selected_implementation_item:
+            return str(self._selected_implementation_item.get("scope") or "").strip()
         return str(
             self.config.get("workflow", {}).get(
                 "default_implementation_scope",
@@ -2692,6 +2780,367 @@ class WorkflowOrchestrator:
                 "No marketplace, no Stripe changes, no frontend changes except API client stubs if required.",
             )
         )
+
+    def print_implementation_backlog(self) -> int:
+        reports, _run_dir = self._load_latest_project_research_reports()
+        backlog, backlog_source = self._build_implementation_backlog(reports)
+        if not backlog:
+            print("No implementation backlog found. Run research first.")
+            return 1
+        print(self._format_implementation_backlog(backlog, backlog_source))
+        return 0
+
+    def _prepare_implementation_backlog_selection(
+        self,
+        reports: list[dict[str, Any]] | None = None,
+        *,
+        require_backlog: bool,
+    ) -> dict[str, Any]:
+        if self._selected_implementation_item is not None:
+            return {
+                "selected_item": self._selected_implementation_item,
+                "backlog": self._implementation_backlog_cache or [],
+                "backlog_source": self._implementation_backlog_source,
+                "error": "",
+            }
+        available_reports = reports if reports is not None else self._load_latest_project_research_reports()[0]
+        backlog, backlog_source = self._build_implementation_backlog(available_reports)
+        self._implementation_backlog_cache = backlog
+        self._implementation_backlog_source = backlog_source
+        if not backlog:
+            return {
+                "selected_item": None,
+                "backlog": [],
+                "backlog_source": "",
+                "error": "No implementation backlog found. Run research first." if require_backlog else "",
+            }
+        selected_item = self._resolve_selected_implementation_item(backlog)
+        if selected_item is None and require_backlog:
+            return {
+                "selected_item": None,
+                "backlog": backlog,
+                "backlog_source": backlog_source,
+                "error": "No implementation backlog found. Run research first.",
+            }
+        self._selected_implementation_item = selected_item
+        return {
+            "selected_item": selected_item,
+            "backlog": backlog,
+            "backlog_source": backlog_source,
+            "error": "",
+        }
+
+    def _build_implementation_backlog(self, reports: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str]:
+        planner_report = self._load_saved_agent_report("implementation", "implementation-planner")
+        parsed_items: list[dict[str, Any]] = []
+        sources: list[str] = []
+        self._implementation_planner_output_chars = 0
+
+        if planner_report and planner_report.get("status") == "success":
+            planner_text = str(planner_report.get("parsed_output") or planner_report.get("stdout") or "").strip()
+            self._implementation_planner_output_chars = len(planner_text)
+            parsed_items = self._parse_implementation_planner_output(planner_text)
+            if parsed_items:
+                sources.append("implementation-planner")
+
+        if not parsed_items:
+            return [], ""
+        unique: dict[str, dict[str, Any]] = {}
+        for item in parsed_items:
+            unique[str(item["id"])] = item
+        backlog = sorted(unique.values(), key=self._implementation_backlog_sort_key)
+        return backlog, ",".join(sources)
+
+    def _parse_implementation_planner_output(self, text: str) -> list[dict[str, Any]]:
+        normalized_text = str(text or "").strip()
+        if not normalized_text:
+            return []
+        try:
+            payload = json.loads(normalized_text)
+        except json.JSONDecodeError:
+            try:
+                payload = yaml.safe_load(normalized_text)
+            except yaml.YAMLError:
+                return []
+
+        if isinstance(payload, dict):
+            for key in ("tasks", "backlog", "items"):
+                if isinstance(payload.get(key), list):
+                    payload = payload[key]
+                    break
+
+        if not isinstance(payload, list):
+            return []
+
+        items: list[dict[str, Any]] = []
+        for raw_item in payload:
+            normalized = self._normalize_planner_task(raw_item)
+            if normalized:
+                items.append(normalized)
+        return items
+
+    def _normalize_planner_task(self, raw_item: Any) -> dict[str, Any] | None:
+        if not isinstance(raw_item, dict):
+            return None
+        title = str(raw_item.get("title") or "").strip()
+        task_id = str(raw_item.get("id") or "").strip()
+        scope = str(raw_item.get("scope") or title).strip()
+        if not task_id or not title or not scope:
+            return None
+        allowed_paths = [
+            self._normalize_repo_relative_path(path)
+            for path in (raw_item.get("allowed_paths") or [])
+            if self._normalize_repo_relative_path(path)
+        ]
+        forbidden_paths = [
+            self._normalize_repo_relative_path(path)
+            for path in (raw_item.get("forbidden_paths") or [])
+            if self._normalize_repo_relative_path(path)
+        ]
+        acceptance_criteria = [str(item).strip() for item in (raw_item.get("acceptance_criteria") or []) if str(item).strip()]
+        if not acceptance_criteria:
+            acceptance_criteria = [scope]
+        return {
+            "id": task_id,
+            "title": title,
+            "priority": str(raw_item.get("priority") or "P1").upper(),
+            "scope": scope,
+            "allowed_paths": allowed_paths or list(self.implementation_scope_policy["allowed_paths"]),
+            "forbidden_paths": forbidden_paths,
+            "acceptance_criteria": acceptance_criteria,
+            "risk_level": str(raw_item.get("risk_level") or "medium").lower(),
+            "estimated_effort": str(raw_item.get("estimated_effort") or "M").upper(),
+        }
+
+    def _parse_implementation_backlog_items(self, text: str, *, source_name: str) -> list[dict[str, Any]]:
+        normalized_text = str(text or "").replace("\r\n", "\n")
+        priority_pattern = re.compile(r"^\s*(?:[-*]\s*)?\[(P[0-2])\]\s*(.+?)\s*$", re.IGNORECASE)
+        items: list[dict[str, Any]] = []
+        current: dict[str, Any] | None = None
+        for raw_line in normalized_text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            match = priority_pattern.match(line)
+            if match:
+                if current:
+                    items.append(self._finalize_backlog_item(current, source_name))
+                current = {
+                    "priority": match.group(1).upper(),
+                    "title": match.group(2).strip(),
+                    "scope": "",
+                    "expected_files": [],
+                    "risk_level": "medium",
+                    "estimated_effort": "M",
+                }
+                continue
+            if current is None:
+                continue
+            lowered = line.lower()
+            if lowered.startswith("scope:"):
+                current["scope"] = line.split(":", 1)[1].strip()
+            elif lowered.startswith("files:"):
+                current["expected_files"] = [
+                    self._normalize_repo_relative_path(part)
+                    for part in line.split(":", 1)[1].split(",")
+                    if self._normalize_repo_relative_path(part)
+                ]
+            elif lowered.startswith("risk:"):
+                current["risk_level"] = line.split(":", 1)[1].strip().lower() or "medium"
+            elif lowered.startswith("effort:"):
+                current["estimated_effort"] = line.split(":", 1)[1].strip().upper() or "M"
+        if current:
+            items.append(self._finalize_backlog_item(current, source_name))
+        if items:
+            return items
+
+        sections = self._extract_handoff_sections(normalized_text)
+        fallback_items: list[dict[str, Any]] = []
+        for index, task_text in enumerate(sections.get("recommended_next_tasks", []), start=1):
+            cleaned = str(task_text).strip()
+            if not cleaned or cleaned.lower() == "none":
+                continue
+            fallback_items.append(
+                {
+                    "id": f"{source_name}-next-{index}",
+                    "title": cleaned[:80],
+                    "priority": self._infer_priority_from_text(cleaned),
+                    "scope": cleaned,
+                    "expected_files": [],
+                    "allowed_paths": list(self.implementation_scope_policy["allowed_paths"]),
+                    "risk_level": self._infer_risk_from_text(cleaned),
+                    "estimated_effort": self._infer_effort_from_text(cleaned),
+                    "source_name": source_name,
+                }
+            )
+        return fallback_items
+
+    def _finalize_backlog_item(self, item: dict[str, Any], source_name: str) -> dict[str, Any]:
+        title = str(item.get("title") or "").strip()
+        scope = str(item.get("scope") or title).strip()
+        expected_files = [path for path in item.get("expected_files", []) if path]
+        slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-") or "task"
+        return {
+            "id": f"{source_name}-{slug}",
+            "title": title,
+            "priority": str(item.get("priority") or "P1").upper(),
+            "scope": scope,
+            "expected_files": expected_files,
+            "allowed_paths": expected_files or list(self.implementation_scope_policy["allowed_paths"]),
+            "risk_level": str(item.get("risk_level") or "medium").lower(),
+            "estimated_effort": str(item.get("estimated_effort") or "M").upper(),
+            "source_name": source_name,
+        }
+
+    def _implementation_backlog_sort_key(self, item: dict[str, Any]) -> tuple[int, int, int, str]:
+        priority_rank = {"P0": 0, "P1": 1, "P2": 2}.get(str(item.get("priority") or "P2").upper(), 3)
+        risk_rank = {"low": 0, "medium": 1, "high": 2}.get(str(item.get("risk_level") or "medium").lower(), 1)
+        blob = " ".join(
+            [
+                str(item.get("title") or ""),
+                str(item.get("scope") or ""),
+                " ".join(item.get("allowed_paths") or []),
+            ]
+        ).lower()
+        domain_rank = 0
+        if any(marker in blob for marker in ("frontend",)):
+            domain_rank = 1
+        if any(marker in blob for marker in ("billing", "stripe", "payment", "checkout", "marketplace")):
+            domain_rank = 2
+        return (priority_rank, risk_rank, domain_rank, str(item.get("title") or ""))
+
+    @staticmethod
+    def _infer_priority_from_text(text: str) -> str:
+        lowered = text.lower()
+        if "p0" in lowered or "critical" in lowered or "blocker" in lowered:
+            return "P0"
+        if "p2" in lowered or "later" in lowered or "optional" in lowered:
+            return "P2"
+        return "P1"
+
+    @staticmethod
+    def _infer_risk_from_text(text: str) -> str:
+        lowered = text.lower()
+        if any(marker in lowered for marker in ("low risk", "safe", "small", "contained")):
+            return "low"
+        if any(marker in lowered for marker in ("high risk", "broad", "migration", "dangerous")):
+            return "high"
+        return "medium"
+
+    @staticmethod
+    def _infer_effort_from_text(text: str) -> str:
+        lowered = text.lower()
+        if any(marker in lowered for marker in ("small", "minor", "single file", "quick")):
+            return "S"
+        if any(marker in lowered for marker in ("large", "broad", "migration", "multi-step")):
+            return "L"
+        return "M"
+
+    def _resolve_selected_implementation_item(self, backlog: list[dict[str, Any]]) -> dict[str, Any] | None:
+        if not backlog:
+            return None
+        if self.next_task_requested:
+            completed = set(self._completed_implementation_task_ids())
+            for item in backlog:
+                if str(item.get("id")) not in completed:
+                    return item
+        if self.selected_task_ref:
+            ref = self.selected_task_ref.strip()
+            if ref.isdigit():
+                index = int(ref) - 1
+                if 0 <= index < len(backlog):
+                    return backlog[index]
+            for item in backlog:
+                if str(item.get("id")) == ref:
+                    return item
+            return None
+        if self.config["workflow"]["mode"] == "auto":
+            print(self._format_implementation_backlog(backlog, self._implementation_backlog_source or "research"))
+            return backlog[0]
+        print(self._format_implementation_backlog(backlog, self._implementation_backlog_source or "research"))
+        while True:
+            answer = input("Choose implementation task number: ").strip()
+            if answer.isdigit():
+                index = int(answer) - 1
+                if 0 <= index < len(backlog):
+                    return backlog[index]
+            print("Invalid task number.")
+
+    @staticmethod
+    def _format_implementation_backlog(backlog: list[dict[str, Any]], backlog_source: str) -> str:
+        lines = [f"Implementation backlog (source={backlog_source or 'research'})"]
+        for index, item in enumerate(backlog, start=1):
+            files = ", ".join(item.get("allowed_paths") or []) or "policy default"
+            acceptance = "; ".join(item.get("acceptance_criteria") or []) or "n/a"
+            lines.extend(
+                [
+                    f"{index}. {item['title']}",
+                    f"   id: {item['id']}",
+                    f"   priority: {item['priority']}",
+                    f"   scope: {item['scope']}",
+                    f"   allowed paths: {files}",
+                    f"   acceptance: {acceptance}",
+                    f"   risk: {item['risk_level']}",
+                    f"   effort: {item['estimated_effort']}",
+                ]
+            )
+        return "\n".join(lines)
+
+    def _build_selected_task_contract_context(self, limit: int = 4000) -> str:
+        if not self._selected_implementation_item:
+            return ""
+        item = self._selected_implementation_item
+        lines = [
+            "[selected-task-contract]",
+            f"id: {item.get('id', '')}",
+            f"title: {item.get('title', '')}",
+            f"priority: {item.get('priority', '')}",
+            f"scope: {item.get('scope', '')}",
+            "allowed_paths:",
+        ]
+        lines.extend(f"- {path}" for path in (item.get("allowed_paths") or []))
+        lines.append("forbidden_paths:")
+        lines.extend(f"- {path}" for path in (item.get("forbidden_paths") or []))
+        lines.append("acceptance_criteria:")
+        lines.extend(f"- {criterion}" for criterion in (item.get("acceptance_criteria") or []))
+        lines.append(f"risk_level: {item.get('risk_level', '')}")
+        lines.append(f"estimated_effort: {item.get('estimated_effort', '')}")
+        text = "\n".join(lines)
+        return text[:limit]
+
+    def _completed_implementation_task_ids(self) -> list[str]:
+        completed = self.project_settings.get("completed_implementation_tasks", [])
+        if not isinstance(completed, list):
+            return []
+        return [str(item).strip() for item in completed if str(item).strip()]
+
+    def _mark_implementation_task_completed(self) -> None:
+        if not self._selected_implementation_item:
+            return
+        task_id = str(self._selected_implementation_item.get("id") or "").strip()
+        if not task_id:
+            return
+        completed = self._completed_implementation_task_ids()
+        if task_id not in completed:
+            completed.append(task_id)
+            self.project_settings["completed_implementation_tasks"] = completed
+            self._save_project_settings()
+
+    def _prompt_post_implementation_action(self) -> str:
+        if self.config["workflow"]["mode"] == "auto":
+            return "stop"
+        backlog = self._implementation_backlog_cache or []
+        completed = set(self._completed_implementation_task_ids())
+        has_next = any(str(item.get("id")) not in completed for item in backlog)
+        while True:
+            answer = input("Next action [1 next item / 2 deployment / 3 stop]: ").strip().lower()
+            if answer in {"1", "next"} and has_next:
+                return "next"
+            if answer in {"2", "deploy", "deployment"}:
+                return "deployment"
+            if answer in {"3", "stop", ""}:
+                return "stop"
+            print("Invalid choice.")
 
     @staticmethod
     def _join_context_sections(sections: list[tuple[str, str]], limit: int) -> str:
@@ -2789,14 +3238,28 @@ class WorkflowOrchestrator:
         for name in ("context", "memory", "logs", "summaries"):
             (base / name).mkdir(parents=True, exist_ok=True)
         settings_path = base / "settings.yaml"
-        settings_payload = {
-            "project_id": self.project_id,
-            "git_remote": self.git_remote,
-            "target_workspace": str(self.target_workspace),
-            "engine_root": str(self.engine_root),
-        }
+        settings_payload: dict[str, Any] = {}
+        if settings_path.exists():
+            settings_payload = yaml.safe_load(settings_path.read_text(encoding="utf-8")) or {}
+        settings_payload.update(
+            {
+                "project_id": self.project_id,
+                "git_remote": self.git_remote,
+                "target_workspace": str(self.target_workspace),
+                "engine_root": str(self.engine_root),
+                "completed_implementation_tasks": settings_payload.get("completed_implementation_tasks", []),
+            }
+        )
         settings_path.write_text(yaml.safe_dump(settings_payload, sort_keys=False), encoding="utf-8")
         return base
+
+    def _load_project_settings(self) -> dict[str, Any]:
+        if not self.project_settings_path.exists():
+            return {}
+        return yaml.safe_load(self.project_settings_path.read_text(encoding="utf-8")) or {}
+
+    def _save_project_settings(self) -> None:
+        self.project_settings_path.write_text(yaml.safe_dump(self.project_settings, sort_keys=False), encoding="utf-8")
 
     def _log_startup_diagnostics(self) -> None:
         self.logger.info(f"Startup diagnostic: engine_root={self.engine_root}")

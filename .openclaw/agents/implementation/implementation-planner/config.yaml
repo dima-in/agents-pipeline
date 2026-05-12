@@ -1,0 +1,6 @@
+name: implementation-planner
+phase: implementation
+description: "Convert the architect plan into a prioritized implementation backlog"
+timeout: 900
+commands:
+  - echo "Plan implementation backlog"
