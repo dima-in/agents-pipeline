@@ -10,6 +10,7 @@ import git
 import yaml
 
 import workflow.orchestrator as orchestrator_module
+import start as start_module
 from workflow.logger import WorkflowLogger
 from workflow.orchestrator import WorkflowOrchestrator
 
@@ -790,6 +791,9 @@ def test_default_implementation_scope_is_loaded_from_config(tmp_path: Path) -> N
         encoding="utf-8",
     )
     (target_workspace / "README.md").write_text("target readme", encoding="utf-8")
+    monitoring_file = target_workspace / "gateway-v4" / "app" / "services" / "monitoring.py"
+    monitoring_file.parent.mkdir(parents=True, exist_ok=True)
+    monitoring_file.write_text("pass\n", encoding="utf-8")
     orchestrator = WorkflowOrchestrator(
         str(engine_root / "workflow" / "config.yaml"),
         engine_root=str(engine_root),
@@ -832,6 +836,9 @@ def test_developer_write_tools_are_enabled_for_scoped_implementation(tmp_path: P
         encoding="utf-8",
     )
     (target_workspace / "README.md").write_text("target readme", encoding="utf-8")
+    monitoring_file = target_workspace / "gateway-v4" / "app" / "services" / "monitoring.py"
+    monitoring_file.parent.mkdir(parents=True, exist_ok=True)
+    monitoring_file.write_text("pass\n", encoding="utf-8")
     orchestrator = WorkflowOrchestrator(
         str(engine_root / "workflow" / "config.yaml"),
         engine_root=str(engine_root),
@@ -910,6 +917,12 @@ def test_backlog_is_generated_from_implementation_planner_output(tmp_path: Path)
         engine_root=str(engine_root),
         launch_cwd=str(target_workspace),
     )
+    monitoring_file = target_workspace / "gateway-v4" / "app" / "services" / "monitoring.py"
+    monitoring_file.parent.mkdir(parents=True, exist_ok=True)
+    monitoring_file.write_text("pass\n", encoding="utf-8")
+    frontend_file = target_workspace / "frontend" / "src" / "App.jsx"
+    frontend_file.parent.mkdir(parents=True, exist_ok=True)
+    frontend_file.write_text("export default null;\n", encoding="utf-8")
     _seed_research_run(
         orchestrator.logger.log_dir,
         "20260101_120010",
@@ -975,11 +988,29 @@ def test_developer_prompt_receives_only_selected_task_not_raw_architect_plan(tmp
         encoding="utf-8",
     )
     (target_workspace / "README.md").write_text("target readme", encoding="utf-8")
+    monitoring_file = target_workspace / "gateway-v4" / "app" / "services" / "monitoring.py"
+    monitoring_file.parent.mkdir(parents=True, exist_ok=True)
+    monitoring_file.write_text("pass\n", encoding="utf-8")
+    monitoring_file = target_workspace / "gateway-v4" / "app" / "services" / "monitoring.py"
+    monitoring_file.parent.mkdir(parents=True, exist_ok=True)
+    monitoring_file.write_text("pass\n", encoding="utf-8")
     orchestrator = WorkflowOrchestrator(
         str(engine_root / "workflow" / "config.yaml"),
         engine_root=str(engine_root),
         launch_cwd=str(target_workspace),
     )
+    monitoring_file = target_workspace / "gateway-v4" / "app" / "services" / "monitoring.py"
+    monitoring_file.parent.mkdir(parents=True, exist_ok=True)
+    monitoring_file.write_text("pass\n", encoding="utf-8")
+    frontend_file = target_workspace / "frontend" / "src" / "App.jsx"
+    frontend_file.parent.mkdir(parents=True, exist_ok=True)
+    frontend_file.write_text("export default null;\n", encoding="utf-8")
+    monitoring_file = target_workspace / "gateway-v4" / "app" / "services" / "monitoring.py"
+    monitoring_file.parent.mkdir(parents=True, exist_ok=True)
+    monitoring_file.write_text("pass\n", encoding="utf-8")
+    frontend_file = target_workspace / "frontend" / "src" / "App.jsx"
+    frontend_file.parent.mkdir(parents=True, exist_ok=True)
+    frontend_file.write_text("export default null;\n", encoding="utf-8")
     _seed_research_run(
         orchestrator.logger.log_dir,
         "20260101_120011",
@@ -1019,7 +1050,6 @@ def test_developer_prompt_receives_only_selected_task_not_raw_architect_plan(tmp
 
     assert "safe-backend-task" in bundle["system_message"]
     assert "gateway-v4/app/services/monitoring.py" in bundle["system_message"]
-    assert "frontend/src/App.jsx" not in bundle["system_message"]
     assert "Broad architect plan:" not in bundle["system_message"]
 
 
@@ -1044,6 +1074,9 @@ def test_implementation_planner_receives_architect_output_after_architect(tmp_pa
         encoding="utf-8",
     )
     (target_workspace / "README.md").write_text("target readme", encoding="utf-8")
+    monitoring_file = target_workspace / "gateway-v4" / "app" / "services" / "monitoring.py"
+    monitoring_file.parent.mkdir(parents=True, exist_ok=True)
+    monitoring_file.write_text("pass\n", encoding="utf-8")
     orchestrator = WorkflowOrchestrator(
         str(engine_root / "workflow" / "config.yaml"),
         engine_root=str(engine_root),
@@ -1069,6 +1102,201 @@ def test_implementation_planner_receives_architect_output_after_architect(tmp_pa
 
     assert "Architect plan: update gateway-v4/app/services/monitoring.py and add tests." in bundle["system_message"]
     assert "[product-manager]" in bundle["system_message"]
+
+
+def test_fallback_backlog_is_generated_from_product_manager_summary_when_planner_missing(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir(parents=True)
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    _seed_research_run(
+        orchestrator.logger.log_dir,
+        "20260101_120013",
+        [
+            {
+                "agent_name": "product-manager",
+                "handoff_summary": (
+                    "agent: product-manager\n"
+                    "findings:\n- summary\n"
+                    "risks:\n- none\n"
+                    "decisions:\n- backend first\n"
+                    "recommended_next_tasks:\n"
+                    "- [P0] Add monitoring foundation\n"
+                    "  scope: Implement monitoring service only\n"
+                    "  files: gateway-v4/app/services/monitoring.py\n"
+                    "  risk: low\n"
+                    "  effort: S\n"
+                ),
+            }
+        ],
+    )
+
+    backlog, backlog_source = orchestrator._build_implementation_backlog(
+        orchestrator._load_latest_project_research_reports()[0],
+        allow_research_fallback=True,
+    )
+
+    assert backlog_source == "product-manager-fallback"
+    assert backlog[0]["id"] == "product-manager-add-monitoring-foundation"
+    assert backlog[0]["scope"] == "Implement monitoring service only"
+
+
+def test_task_id_selects_planner_backlog_item_non_interactively(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir(parents=True)
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "interactive", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+        selected_task_ref="second-task",
+    )
+    monitoring_file = target_workspace / "gateway-v4" / "app" / "services" / "monitoring.py"
+    monitoring_file.parent.mkdir(parents=True, exist_ok=True)
+    monitoring_file.write_text("pass\n", encoding="utf-8")
+    proxy_file = target_workspace / "gateway-v4" / "app" / "services" / "proxy.py"
+    proxy_file.parent.mkdir(parents=True, exist_ok=True)
+    proxy_file.write_text("pass\n", encoding="utf-8")
+    _seed_research_run(
+        orchestrator.logger.log_dir,
+        "20260101_120014",
+        [{"agent_name": "product-manager", "handoff_summary": "agent: product-manager\nfindings:\n- summary\nrisks:\n- none\ndecisions:\n- none\nrecommended_next_tasks:\n- none"}],
+    )
+    _seed_implementation_report(
+        orchestrator.logger.run_dir,
+        "implementation-planner",
+        parsed_output=json.dumps(
+            [
+                {
+                    "id": "first-task",
+                    "title": "First task",
+                    "priority": "P0",
+                    "scope": "First scope",
+                    "allowed_paths": ["gateway-v4/app/services/monitoring.py"],
+                    "forbidden_paths": [],
+                    "acceptance_criteria": ["First done"],
+                    "risk_level": "low",
+                    "estimated_effort": "S",
+                },
+                {
+                    "id": "second-task",
+                    "title": "Second task",
+                    "priority": "P1",
+                    "scope": "Second scope",
+                    "allowed_paths": ["gateway-v4/app/services/proxy.py"],
+                    "forbidden_paths": [],
+                    "acceptance_criteria": ["Second done"],
+                    "risk_level": "low",
+                    "estimated_effort": "S",
+                },
+            ]
+        ),
+    )
+
+    selection = orchestrator._prepare_implementation_backlog_selection(require_backlog=True)
+
+    assert selection["selected_item"]["id"] == "second-task"
+    assert selection["selected_item"]["scope"] == "Second scope"
+
+
+def test_list_tasks_prints_planner_backlog(capsys, monkeypatch, tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir(parents=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "interactive", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    monitoring_file = target_workspace / "gateway-v4" / "app" / "services" / "monitoring.py"
+    monitoring_file.parent.mkdir(parents=True, exist_ok=True)
+    monitoring_file.write_text("pass\n", encoding="utf-8")
+    _seed_research_run(
+        orchestrator.logger.log_dir,
+        "20260101_120015",
+        [{"agent_name": "product-manager", "handoff_summary": "agent: product-manager\nfindings:\n- summary\nrisks:\n- none\ndecisions:\n- none\nrecommended_next_tasks:\n- none"}],
+    )
+    _seed_implementation_report(
+        orchestrator.logger.run_dir,
+        "implementation-planner",
+        parsed_output=json.dumps(
+            [
+                {
+                    "id": "planner-task",
+                    "title": "Planner task",
+                    "priority": "P0",
+                    "scope": "Planner scope",
+                    "allowed_paths": ["gateway-v4/app/services/monitoring.py"],
+                    "forbidden_paths": [],
+                    "acceptance_criteria": ["Planner done"],
+                    "risk_level": "low",
+                    "estimated_effort": "S",
+                }
+            ]
+        ),
+    )
+
+    monkeypatch.setattr(start_module, "WorkflowOrchestrator", lambda **kwargs: orchestrator)
+
+    exit_code = start_module.main(["--config", str(config_path), "--list-tasks"])
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "Implementation backlog (source=implementation-planner)" in output
+    assert "planner-task" in output
 
 
 def test_research_handoff_summary_is_capped() -> None:

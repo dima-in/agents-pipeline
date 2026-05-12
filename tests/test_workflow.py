@@ -476,6 +476,9 @@ def test_implementation_planner_runs_after_architect(tmp_path: Path, monkeypatch
         engine_root=str(engine_root),
         launch_cwd=str(target_workspace),
     )
+    monitoring_file = target_workspace / "gateway-v4" / "app" / "services" / "monitoring.py"
+    monitoring_file.parent.mkdir(parents=True, exist_ok=True)
+    monitoring_file.write_text("pass\n", encoding="utf-8")
     monkeypatch.setattr(orchestrator, "_wait_for_user", lambda _prompt: True)
     calls: list[str] = []
 
@@ -522,6 +525,51 @@ def test_implementation_planner_runs_after_architect(tmp_path: Path, monkeypatch
     assert calls[:2] == ["architect", "implementation-planner"]
 
 
+def test_developer_is_blocked_when_planner_output_is_invalid(tmp_path: Path, monkeypatch) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    marketplace_file = target_workspace / "gateway-v4" / "app" / "services" / "marketplace.py"
+    marketplace_file.parent.mkdir(parents=True, exist_ok=True)
+    marketplace_file.write_text("pass\n", encoding="utf-8")
+    monkeypatch.setattr(orchestrator, "_wait_for_user", lambda _prompt: True)
+    calls: list[str] = []
+
+    def fake_run_agent(agent_config, phase_key, index=None, total=None):
+        calls.append(agent_config["name"])
+        if agent_config["name"] == "implementation-planner":
+            orchestrator.logger.save_agent_report(
+                "implementation",
+                "implementation-planner",
+                {
+                    "status": "success",
+                    "result": "completed",
+                    "elapsed_s": 1,
+                    "returncode": 0,
+                    "message": "prompt",
+                    "stdout": "",
+                    "stderr": "",
+                    "parsed_output": "not valid yaml or json backlog",
+                },
+            )
+        return True
+
+    monkeypatch.setattr(orchestrator, "_run_agent", fake_run_agent)
+    phase = {"agents": [{"name": "architect"}, {"name": "implementation-planner"}, {"name": "developer"}]}
+
+    ok = orchestrator._run_phase_agents(phase, "implementation")
+
+    assert ok is False
+    assert calls == ["architect", "implementation-planner", "implementation-planner"]
+
+
 def test_developer_blocked_when_selected_task_plans_marketplace_file(tmp_path: Path, monkeypatch) -> None:
     engine_root = tmp_path / "engine"
     target_workspace = tmp_path / "target"
@@ -533,6 +581,9 @@ def test_developer_blocked_when_selected_task_plans_marketplace_file(tmp_path: P
         engine_root=str(engine_root),
         launch_cwd=str(target_workspace),
     )
+    marketplace_file = target_workspace / "gateway-v4" / "app" / "services" / "marketplace.py"
+    marketplace_file.parent.mkdir(parents=True, exist_ok=True)
+    marketplace_file.write_text("pass\n", encoding="utf-8")
     monkeypatch.setattr(orchestrator, "_wait_for_user", lambda _prompt: True)
     calls: list[str] = []
 
@@ -693,6 +744,12 @@ def test_allow_scope_expansion_bypasses_watchdog_with_warning(tmp_path: Path, mo
         launch_cwd=str(target_workspace),
         allow_scope_expansion=True,
     )
+    frontend_file = target_workspace / "frontend" / "src" / "App.jsx"
+    frontend_file.parent.mkdir(parents=True, exist_ok=True)
+    frontend_file.write_text("export default null;\n", encoding="utf-8")
+    frontend_file = target_workspace / "frontend" / "src" / "App.jsx"
+    frontend_file.parent.mkdir(parents=True, exist_ok=True)
+    frontend_file.write_text("export default null;\n", encoding="utf-8")
     monkeypatch.setattr(orchestrator, "_wait_for_user", lambda _prompt: True)
     warnings: list[str] = []
     monkeypatch.setattr(orchestrator.logger, "warning", warnings.append)
@@ -793,3 +850,182 @@ def test_scope_watchdog_uses_selected_task_allowed_paths(tmp_path: Path) -> None
 
     assert diagnostics["allowed"] is True
     assert diagnostics["allowed_paths_matched"] == [allowed_path]
+
+
+def test_planner_nonexistent_services_path_is_rejected(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    orchestrator.logger.save_agent_report(
+        "implementation",
+        "implementation-planner",
+        {
+            "status": "success",
+            "result": "completed",
+            "parsed_output": json.dumps(
+                [
+                    {
+                        "id": "bad-services-path",
+                        "title": "Bad services path",
+                        "priority": "P0",
+                        "scope": "Invalid path",
+                        "allowed_paths": ["services/foo.py"],
+                        "new_files": [],
+                        "forbidden_paths": [],
+                        "acceptance_criteria": ["n/a"],
+                        "reason_each_path_is_needed": {"services/foo.py": "Needed."},
+                        "risk_level": "low",
+                        "estimated_effort": "S",
+                    }
+                ]
+            ),
+        },
+    )
+
+    diagnostics = orchestrator._validate_implementation_planner_output()
+
+    assert diagnostics["valid"] is False
+    assert any("services/foo.py" in item for item in diagnostics["invalid_paths"])
+
+
+def test_planner_existing_target_file_passes_validation(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    file_path = target_workspace / "workflow" / "orchestrator.py"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text("pass\n", encoding="utf-8")
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    orchestrator.logger.save_agent_report(
+        "implementation",
+        "implementation-planner",
+        {
+            "status": "success",
+            "result": "completed",
+            "parsed_output": json.dumps(
+                [
+                    {
+                        "id": "good-existing-file",
+                        "title": "Good existing file",
+                        "priority": "P0",
+                        "scope": "Valid path",
+                        "allowed_paths": ["workflow/orchestrator.py"],
+                        "existing_paths": ["workflow/orchestrator.py"],
+                        "new_files": [],
+                        "forbidden_paths": [],
+                        "acceptance_criteria": ["n/a"],
+                        "reason_each_path_is_needed": {"workflow/orchestrator.py": "Needed."},
+                        "risk_level": "low",
+                        "estimated_effort": "S",
+                    }
+                ]
+            ),
+        },
+    )
+
+    diagnostics = orchestrator._validate_implementation_planner_output()
+
+    assert diagnostics["valid"] is True
+    assert diagnostics["task_count"] == 1
+
+
+def test_planner_new_file_under_existing_directory_passes_when_marked_new_file(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    existing_dir = target_workspace / "docs"
+    existing_dir.mkdir(parents=True, exist_ok=True)
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    orchestrator.logger.save_agent_report(
+        "implementation",
+        "implementation-planner",
+        {
+            "status": "success",
+            "result": "completed",
+            "parsed_output": json.dumps(
+                [
+                    {
+                        "id": "new-doc-file",
+                        "title": "New doc file",
+                        "priority": "P1",
+                        "scope": "Create docs file",
+                        "allowed_paths": ["docs/new-plan.md"],
+                        "existing_paths": [],
+                        "new_files": ["docs/new-plan.md"],
+                        "forbidden_paths": [],
+                        "acceptance_criteria": ["n/a"],
+                        "reason_each_path_is_needed": {"docs/new-plan.md": "Needed."},
+                        "risk_level": "low",
+                        "estimated_effort": "S",
+                    }
+                ]
+            ),
+        },
+    )
+
+    diagnostics = orchestrator._validate_implementation_planner_output()
+
+    assert diagnostics["valid"] is True
+
+
+def test_planner_generic_nonexistent_api_path_is_rejected(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    orchestrator.logger.save_agent_report(
+        "implementation",
+        "implementation-planner",
+        {
+            "status": "success",
+            "result": "completed",
+            "parsed_output": json.dumps(
+                [
+                    {
+                        "id": "bad-api-path",
+                        "title": "Bad api path",
+                        "priority": "P0",
+                        "scope": "Invalid path",
+                        "allowed_paths": ["api/routing.py"],
+                        "existing_paths": ["api/routing.py"],
+                        "new_files": [],
+                        "forbidden_paths": [],
+                        "acceptance_criteria": ["n/a"],
+                        "reason_each_path_is_needed": {"api/routing.py": "Needed."},
+                        "risk_level": "low",
+                        "estimated_effort": "S",
+                    }
+                ]
+            ),
+        },
+    )
+
+    diagnostics = orchestrator._validate_implementation_planner_output()
+
+    assert diagnostics["valid"] is False
+    assert any("api/routing.py" in item for item in diagnostics["invalid_paths"])

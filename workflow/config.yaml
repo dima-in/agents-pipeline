@@ -120,7 +120,7 @@ phases:
         description: "Convert the architect plan into a prioritized implementation backlog"
         timeout: 900
         provider: openrouter
-        model: openrouter/deepseek/deepseek-chat-v3
+        model: openrouter/anthropic/claude-sonnet-4.5
         thinking: low
       - name: developer
         description: "Implement the task"
