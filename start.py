@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+from pathlib import Path
 
 from workflow.orchestrator import WorkflowOrchestrator
 
@@ -34,6 +36,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to workflow config",
     )
     parser.add_argument(
+        "--workspace",
+        default=None,
+        help="Target workspace path to analyze",
+    )
+    parser.add_argument(
+        "--project-id",
+        default=None,
+        help="Optional stable target project id override",
+    )
+    parser.add_argument(
+        "--no-memory",
+        action="store_true",
+        help="Do not load previous summaries or memory context",
+    )
+    parser.add_argument(
+        "--fresh-run",
+        action="store_true",
+        help="Do not reuse any previous run context",
+    )
+    parser.add_argument(
+        "--task-scope",
+        default=None,
+        help="Explicit implementation task scope override",
+    )
+    parser.add_argument(
+        "--research-run",
+        default=None,
+        help="Specific research run id to use for implementation context",
+    )
+    parser.add_argument(
+        "--allow-scope-expansion",
+        action="store_true",
+        help="Bypass implementation scope watchdog with a warning",
+    )
+    parser.add_argument(
         "--preflight-only",
         action="store_true",
         help="Only validate runtime configuration and exit",
@@ -57,7 +94,24 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
-    orchestrator = WorkflowOrchestrator(config_path=args.config)
+    engine_root = Path(__file__).resolve().parent
+    launch_cwd = Path(os.environ.get("AGENTS_PIPELINE_LAUNCH_CWD") or os.getcwd()).resolve()
+    config_path = Path(args.config)
+    if not config_path.is_absolute():
+        config_path = engine_root / config_path
+
+    orchestrator = WorkflowOrchestrator(
+        config_path=str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(launch_cwd),
+        workspace=args.workspace,
+        project_id=args.project_id,
+        no_memory=args.no_memory,
+        fresh_run=args.fresh_run,
+        task_scope=args.task_scope,
+        research_run=args.research_run,
+        allow_scope_expansion=args.allow_scope_expansion,
+    )
     orchestrator.config["workflow"]["mode"] = args.mode
     orchestrator.config["git"]["enabled"] = not args.skip_git
     orchestrator.config["logging"]["level"] = args.log_level

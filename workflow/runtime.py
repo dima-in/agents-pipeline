@@ -4,6 +4,7 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -34,20 +35,32 @@ class RuntimeConfig:
         return env
 
 
-def load_runtime_config(settings_path: str = ".openclaw/config/settings.yaml") -> RuntimeConfig:
+def load_runtime_config(
+    settings_path: str = ".openclaw/config/settings.yaml",
+    *,
+    engine_root: str | Path | None = None,
+    workflow_settings: dict[str, Any] | None = None,
+    workspace: str | Path | None = None,
+) -> RuntimeConfig:
+    engine_base = Path(engine_root).resolve() if engine_root is not None else Path.cwd().resolve()
     settings_file = Path(settings_path)
+    if not settings_file.is_absolute():
+        settings_file = engine_base / settings_file
     settings = {}
     if settings_file.exists():
         settings = yaml.safe_load(settings_file.read_text(encoding="utf-8")) or {}
-    workflow_settings_path = Path("workflow/config.yaml")
-    workflow_settings = {}
-    if workflow_settings_path.exists():
-        workflow_settings = yaml.safe_load(workflow_settings_path.read_text(encoding="utf-8")) or {}
+    loaded_workflow_settings = workflow_settings
+    if loaded_workflow_settings is None:
+        workflow_settings_path = engine_base / "workflow/config.yaml"
+        loaded_workflow_settings = {}
+        if workflow_settings_path.exists():
+            loaded_workflow_settings = yaml.safe_load(workflow_settings_path.read_text(encoding="utf-8")) or {}
 
     openclaw_settings = settings.get("openclaw", {})
     project_settings = settings.get("project", {})
-    workflow_settings_block = workflow_settings.get("workflow", {})
-    workflow_runtime = workflow_settings.get("runtime", {})
+    workflow_settings_block = loaded_workflow_settings.get("workflow", {})
+    workflow_runtime = loaded_workflow_settings.get("runtime", {})
+    resolved_workspace = str(Path(workspace).resolve()) if workspace is not None else str(project_settings.get("workspace", "."))
     return RuntimeConfig(
         executor=str(workflow_settings_block.get("executor", "openclaw")),
         runner_bin=os.getenv("OPENCLAW_BIN", openclaw_settings.get("bin", "openclaw")),
@@ -59,7 +72,7 @@ def load_runtime_config(settings_path: str = ".openclaw/config/settings.yaml") -
         require_model_list_preflight=bool(workflow_settings_block.get("require_model_list_preflight", os.name != "nt")),
         run_mode=str(openclaw_settings.get("run_mode", "local")),
         thinking=str(workflow_runtime.get("thinking", openclaw_settings.get("thinking", "medium"))),
-        workspace=str(project_settings.get("workspace", ".")),
+        workspace=resolved_workspace,
     )
 
 

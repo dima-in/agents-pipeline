@@ -1,0 +1,4 @@
+project_id: github.com-dima-in-agents-pipeline
+git_remote: https://github.com/dima-in/agents-pipeline.git
+target_workspace: D:\agentic-dev-loop\agents-pipeline
+engine_root: D:\agentic-dev-loop\agents-pipeline

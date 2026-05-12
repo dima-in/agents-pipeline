@@ -1,3 +1,4 @@
+import http.client
 import io
 import json
 import subprocess
@@ -5,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib.error import HTTPError
 
+import git
 import yaml
 
 import workflow.orchestrator as orchestrator_module
@@ -101,6 +103,28 @@ class _FakeHTTPResponse:
     def read(self) -> bytes:
         return json.dumps(self.payload).encode("utf-8")
 
+
+def _seed_research_run(log_root: Path, run_id: str, reports: list[dict[str, object]]) -> Path:
+    run_dir = log_root / f"run_{run_id}" / "agents" / "research"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    for report in reports:
+        agent_name = str(report["agent_name"])
+        payload = {
+            "agent_name": agent_name,
+            "agent": agent_name,
+            "status": "success",
+            "handoff_summary": report.get("handoff_summary", ""),
+            "parsed_output": report.get("parsed_output", ""),
+        }
+        (run_dir / f"{agent_name}.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return run_dir.parent.parent
+
+
+def _ensure_temp_agent_prompt(engine_root: Path, phase: str, agent_name: str) -> None:
+    prompt_dir = engine_root / ".openclaw" / "agents" / phase / agent_name
+    prompt_dir.mkdir(parents=True, exist_ok=True)
+    (prompt_dir / "prompt.md").write_text(f"# {agent_name}\n\nFollow the task.\n", encoding="utf-8")
+
     def __enter__(self) -> "_FakeHTTPResponse":
         return self
 
@@ -160,8 +184,19 @@ def test_openrouter_model_normalization_works() -> None:
     orchestrator = WorkflowOrchestrator("workflow/config.yaml")
 
     assert orchestrator._normalize_openrouter_model("openrouter/deepseek/deepseek-chat-v3") == "deepseek/deepseek-chat-v3"
-    assert orchestrator._normalize_openrouter_model("openrouter/anthropic/claude-3.7-sonnet") == "anthropic/claude-3.7-sonnet"
+    assert orchestrator._normalize_openrouter_model("openrouter/anthropic/claude-sonnet-4.5") == "anthropic/claude-sonnet-4.5"
     assert orchestrator._normalize_openrouter_model("perplexity/sonar") == "perplexity/sonar"
+
+
+def test_direct_api_404_no_endpoints_becomes_model_not_found() -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+    assert (
+        orchestrator._classify_direct_api_error(
+            404,
+            '{"error":{"message":"No endpoints found for anthropic/claude-sonnet-4.5.","code":404}}',
+        )
+        == "model_not_found"
+    )
 
 
 def test_direct_api_401_becomes_auth_failed(monkeypatch, tmp_path: Path) -> None:
@@ -206,7 +241,7 @@ def test_direct_api_successful_response_saves_report(monkeypatch, tmp_path: Path
     def fake_urlopen(_request, timeout=0):
         return _FakeHTTPResponse(
             {
-                "model": "anthropic/claude-3.7-sonnet",
+                "model": "anthropic/claude-sonnet-4.5",
                 "choices": [
                     {
                         "message": {
@@ -227,7 +262,7 @@ def test_direct_api_successful_response_saves_report(monkeypatch, tmp_path: Path
             "description": "Analyze competitors",
             "timeout": 5,
             "provider": "openrouter",
-            "model": "openrouter/anthropic/claude-3.7-sonnet",
+            "model": "openrouter/anthropic/claude-sonnet-4.5",
         },
         "research",
     )
@@ -239,6 +274,13 @@ def test_direct_api_successful_response_saves_report(monkeypatch, tmp_path: Path
     assert payload["status"] == "success"
     assert payload["returncode"] == 0
     assert "Russian translation" in payload["parsed_output"]
+    assert payload["handoff_summary"].startswith("agent: competitor-analyst")
+    assert "findings:" in payload["handoff_summary"]
+    assert payload["context_profile"] == "external_comparison"
+    assert payload["retrieval_enabled"] is False
+    assert payload["repository_context_chars"] > 0
+    assert payload["handoff_summary_chars"] == 0
+    assert payload["retrieval_rounds"] == 0
     assert payload["usage"]["input_tokens"] == 21
     assert payload["usage"]["output_tokens"] == 13
     assert payload["usage"]["total_tokens"] == 34
@@ -247,10 +289,47 @@ def test_direct_api_successful_response_saves_report(monkeypatch, tmp_path: Path
 def test_project_context_includes_workflow_config() -> None:
     orchestrator = WorkflowOrchestrator("workflow/config.yaml")
 
-    context = orchestrator._build_direct_api_repository_context(limit=12000)
+    context = orchestrator._build_direct_api_repository_context(agent_name="project-analyst", limit=12000)
 
     assert "## workflow/config.yaml" in context
     assert "workflow:" in context
+
+
+def test_project_context_reads_readme_from_target_workspace(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir(parents=True)
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (target_workspace / "README.md").write_text("target workspace readme", encoding="utf-8")
+    (engine_root / "README.md").write_text("engine readme", encoding="utf-8")
+
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+
+    context = orchestrator._build_direct_api_repository_context(agent_name="project-analyst", limit=12000)
+
+    assert "target workspace readme" in context
+    assert "engine readme" not in context
+    assert "workflow/orchestrator.py" not in context
+    assert orchestrator.context_mode == "external_project_analysis"
 
 
 def test_project_context_is_capped(monkeypatch) -> None:
@@ -260,13 +339,22 @@ def test_project_context_is_capped(monkeypatch) -> None:
     monkeypatch.setattr(orchestrator, "_read_file_excerpt", lambda *args, **kwargs: "C" * 20000)
     monkeypatch.setattr(orchestrator, "_build_python_outline", lambda *args, **kwargs: "D" * 20000)
     monkeypatch.setattr(orchestrator, "_build_tests_file_list", lambda: "E" * 20000)
+    monkeypatch.setattr(orchestrator, "_build_fallback_project_summary", lambda: "F" * 20000)
+    monkeypatch.setattr(orchestrator, "_build_compact_architecture_summary", lambda: "G" * 20000)
+    monkeypatch.setattr(orchestrator, "_build_positioning_summary", lambda: "H" * 20000)
+    monkeypatch.setattr(orchestrator, "_build_workflow_goals_summary", lambda: "I" * 20000)
+    monkeypatch.setattr(orchestrator, "_build_target_users_summary", lambda: "J" * 20000)
+    monkeypatch.setattr(orchestrator, "_build_execution_architecture_summary", lambda: "K" * 20000)
+    monkeypatch.setattr(orchestrator, "_build_known_constraints_summary", lambda: "L" * 20000)
+    monkeypatch.setattr(orchestrator, "_build_tests_subset", lambda *args, **kwargs: "M" * 20000)
+    monkeypatch.setattr(orchestrator, "_read_python_sections", lambda *args, **kwargs: "N" * 20000)
 
-    context = orchestrator._build_direct_api_repository_context(limit=12000)
+    context = orchestrator._build_direct_api_repository_context(agent_name="project-analyst", limit=12000)
 
     assert len(context) <= 12000
 
 
-def test_project_analyst_direct_api_prompt_includes_repository_context() -> None:
+def test_project_analyst_receives_full_repo_profile() -> None:
     orchestrator = WorkflowOrchestrator("workflow/config.yaml")
 
     bundle = orchestrator._build_agent_message_bundle(
@@ -278,11 +366,72 @@ def test_project_analyst_direct_api_prompt_includes_repository_context() -> None
 
     assert "Repository context collected locally:" in bundle["system_message"]
     assert "## workflow/config.yaml" in bundle["system_message"]
+    assert "## workflow/orchestrator.py outline" in bundle["system_message"]
     assert "Repository context collected locally:" in bundle["combined_message"]
+    assert bundle["context_profile"] == "repo_overview_full"
+    assert orchestrator.context_mode == "engine_self_analysis"
 
 
-def test_non_project_analyst_prompt_is_unchanged() -> None:
+def test_external_project_analyst_excludes_engine_files(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir(parents=True)
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (target_workspace / "README.md").write_text("external product readme", encoding="utf-8")
+    (target_workspace / "package.json").write_text('{"name":"external-app"}', encoding="utf-8")
+
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    bundle = orchestrator._build_agent_message_bundle(
+        "project-analyst",
+        {"name": "project-analyst", "description": "Analyze repo"},
+        Path(".openclaw/agents/research/project-analyst/prompt.md"),
+        "research",
+    )
+
+    assert "external product readme" in bundle["system_message"]
+    assert "workflow/orchestrator.py outline" not in bundle["system_message"]
+    assert "manage_agents.py outline" not in bundle["system_message"]
+    assert "package.json" in bundle["system_message"]
+
+
+def test_competitor_analyst_does_not_receive_full_orchestrator_outline(tmp_path: Path) -> None:
     orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+    orchestrator.logger = WorkflowLogger(log_dir=str(tmp_path / "logs"))
+    orchestrator.logger.save_agent_report(
+        "research",
+        "project-analyst",
+        {
+            "status": "success",
+            "result": "completed",
+            "elapsed_s": 1,
+            "returncode": 0,
+            "message": "prompt",
+            "stdout": "",
+            "stderr": "",
+            "parsed_output": "Repo findings.\n\nRussian translation\nРепо.",
+                "handoff_summary": "agent: project-analyst\nfindings:\n- Repo findings.\nrisks:\n- none\ndecisions:\n- none\nrecommended_next_tasks:\n- none",
+                "runtime": {"provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.5", "thinking": "low"},
+            },
+        )
 
     bundle = orchestrator._build_agent_message_bundle(
         "competitor-analyst",
@@ -291,8 +440,994 @@ def test_non_project_analyst_prompt_is_unchanged() -> None:
         "research",
     )
 
+    assert "Repository context collected locally:" in bundle["system_message"]
+    assert "## workflow/orchestrator.py outline" not in bundle["system_message"]
+    assert "Default competitors" in bundle["system_message"]
+    assert "[project-analyst]" in bundle["system_message"]
+    assert bundle["context_profile"] == "external_comparison"
+    assert bundle["retrieval_enabled"] is False
+
+
+def test_market_analyst_receives_no_code_context_by_default() -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+
+    bundle = orchestrator._build_agent_message_bundle(
+        "market-analyst",
+        {"name": "market-analyst", "description": "Analyze market"},
+        Path(".openclaw/agents/research/market-analyst/prompt.md"),
+        "research",
+    )
+
+    assert "Positioning" in bundle["system_message"]
+    assert "Target users and use cases" in bundle["system_message"]
+    assert "workflow/orchestrator.py outline" not in bundle["system_message"]
+    assert "workflow/runtime.py" not in bundle["system_message"]
+    assert "workflow/config.yaml" not in bundle["system_message"]
+    assert bundle["context_profile"] == "market_positioning"
+    assert bundle["retrieval_enabled"] is False
+
+
+def test_market_analyst_external_mode_receives_no_agents_pipeline_positioning(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir(parents=True)
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (target_workspace / "README.md").write_text("AI Getaway is a gateway for model routing and chat delivery.", encoding="utf-8")
+
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    bundle = orchestrator._build_agent_message_bundle(
+        "market-analyst",
+        {"name": "market-analyst", "description": "Analyze market"},
+        Path(".openclaw/agents/research/market-analyst/prompt.md"),
+        "research",
+    )
+
+    assert "AI Getaway is a gateway for model routing and chat delivery." in bundle["system_message"]
+    assert "agents-pipeline is a local-first multi-agent workflow" not in bundle["system_message"]
+
+
+def test_tech_analyst_receives_direct_api_and_retrieval_context() -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+
+    bundle = orchestrator._build_agent_message_bundle(
+        "tech-analyst",
+        {"name": "tech-analyst", "description": "Review technical options"},
+        Path(".openclaw/agents/research/tech-analyst/prompt.md"),
+        "research",
+    )
+
+    assert "direct_api implementation" in bundle["system_message"]
+    assert "retrieval-loop implementation" in bundle["system_message"]
+    assert "def _run_direct_api_agent(" in bundle["system_message"]
+    assert bundle["context_profile"] == "technical_architecture"
+    assert bundle["retrieval_enabled"] is True
+
+
+def test_tech_analyst_external_mode_receives_target_files_not_engine_internals(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    (target_workspace / "frontend").mkdir(parents=True)
+    (target_workspace / "gateway-v4").mkdir(parents=True)
+    target_workspace.mkdir(parents=True, exist_ok=True)
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (target_workspace / "frontend" / "package.json").write_text('{"name":"frontend"}', encoding="utf-8")
+    (target_workspace / "gateway-v4" / "requirements.txt").write_text("fastapi", encoding="utf-8")
+    (target_workspace / "docker-compose.yml").write_text("services: {}", encoding="utf-8")
+    (target_workspace / "test_api.py").write_text("def test_ok(): pass", encoding="utf-8")
+
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    bundle = orchestrator._build_agent_message_bundle(
+        "tech-analyst",
+        {"name": "tech-analyst", "description": "Review technical options"},
+        Path(".openclaw/agents/research/tech-analyst/prompt.md"),
+        "research",
+    )
+
+    assert "frontend/package.json" in bundle["system_message"]
+    assert "gateway-v4/requirements.txt" in bundle["system_message"]
+    assert "docker-compose.yml" in bundle["system_message"]
+    assert "direct_api implementation" not in bundle["system_message"]
+    assert "retrieval-loop implementation" not in bundle["system_message"]
+
+
+def test_innovation_scout_receives_compressed_context_without_repo_dump() -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+
+    bundle = orchestrator._build_agent_message_bundle(
+        "innovation-scout",
+        {"name": "innovation-scout", "description": "Scout ideas"},
+        Path(".openclaw/agents/research/innovation-scout/prompt.md"),
+        "research",
+    )
+
+    assert "Compact architecture summary" in bundle["system_message"]
+    assert "Known constraints and problems" in bundle["system_message"]
+    assert "Top-level file tree up to depth 3" not in bundle["system_message"]
+    assert "workflow/orchestrator.py outline" not in bundle["system_message"]
+    assert bundle["retrieval_enabled"] is False
+
+
+def test_product_manager_receives_summaries_from_previous_agents(tmp_path: Path) -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+    orchestrator.logger = WorkflowLogger(log_dir=str(tmp_path / "logs"))
+
+    for agent_name, summary in [
+        ("project-analyst", "agent: project-analyst\nfindings:\n- repo summary\nrisks:\n- none\ndecisions:\n- none\nrecommended_next_tasks:\n- none"),
+        ("competitor-analyst", "agent: competitor-analyst\nfindings:\n- competitor summary\nrisks:\n- none\ndecisions:\n- none\nrecommended_next_tasks:\n- none"),
+        ("market-analyst", "agent: market-analyst\nfindings:\n- market summary\nrisks:\n- none\ndecisions:\n- none\nrecommended_next_tasks:\n- none"),
+    ]:
+        orchestrator.logger.save_agent_report(
+            "research",
+            agent_name,
+            {
+                "status": "success",
+                "result": "completed",
+                "elapsed_s": 1,
+                "returncode": 0,
+                "message": "prompt",
+                "stdout": "",
+                "stderr": "",
+                "parsed_output": summary,
+                "handoff_summary": summary,
+                "runtime": {"provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.5", "thinking": "low"},
+            },
+        )
+
+    bundle = orchestrator._build_agent_message_bundle(
+        "product-manager",
+        {"name": "product-manager", "description": "Summarize and prepare requirements"},
+        Path(".openclaw/agents/research/product-manager/prompt.md"),
+        "research",
+    )
+
+    assert "[project-analyst]" in bundle["system_message"]
+    assert "[competitor-analyst]" in bundle["system_message"]
+    assert "[market-analyst]" in bundle["system_message"]
     assert "Repository context collected locally:" not in bundle["system_message"]
-    assert "Repository context collected locally:" not in bundle["combined_message"]
+    assert bundle["context_profile"] == "research_synthesis"
+    assert bundle["retrieval_enabled"] is False
+
+
+def test_no_memory_keeps_current_run_handoff_summaries(tmp_path: Path) -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml", no_memory=True)
+    orchestrator.logger = WorkflowLogger(log_dir=str(tmp_path / "logs"))
+    orchestrator.logger.save_agent_report(
+        "research",
+        "project-analyst",
+        {
+            "status": "success",
+            "result": "completed",
+            "elapsed_s": 1,
+            "returncode": 0,
+            "message": "prompt",
+            "stdout": "",
+            "stderr": "",
+            "parsed_output": "summary",
+            "handoff_summary": "agent: project-analyst\nfindings:\n- summary\nrisks:\n- none\ndecisions:\n- none\nrecommended_next_tasks:\n- none",
+            "runtime": {"provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.5", "thinking": "low"},
+        },
+    )
+
+    bundle = orchestrator._build_agent_message_bundle(
+        "competitor-analyst",
+        {"name": "competitor-analyst", "description": "Analyze competitors"},
+        Path(".openclaw/agents/research/competitor-analyst/prompt.md"),
+        "research",
+    )
+
+    assert "Previous agent context:" in bundle["system_message"]
+    assert "[project-analyst]" in bundle["system_message"]
+
+
+def test_direct_api_retries_on_incomplete_read(monkeypatch, tmp_path: Path) -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+    orchestrator.logger = WorkflowLogger(log_dir=str(tmp_path / "logs"))
+    attempts = {"count": 0}
+
+    def fake_urlopen(_request, timeout=0):
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            raise http.client.IncompleteRead(b'{"partial":true}', 100)
+        return _FakeHTTPResponse(
+            {
+                "model": "anthropic/claude-sonnet-4.5",
+                "choices": [
+                    {
+                        "message": {
+                            "content": "English summary.\n\nRussian translation\nПеревод."
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+            }
+        )
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.setattr(orchestrator_module.urllib_request, "urlopen", fake_urlopen)
+
+    ok = orchestrator._run_agent(
+        {
+            "name": "product-manager",
+            "description": "Summarize and prepare requirements",
+            "timeout": 5,
+            "provider": "openrouter",
+            "model": "openrouter/anthropic/claude-sonnet-4.5",
+        },
+        "research",
+    )
+
+    assert ok is True
+    assert attempts["count"] == 3
+
+
+def test_task_scope_override_is_used_for_implementation(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir(parents=True)
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (target_workspace / "README.md").write_text("target readme", encoding="utf-8")
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+        task_scope="Ship observability only.",
+    )
+    _seed_research_run(
+        orchestrator.logger.log_dir,
+        "20260101_120002",
+        [{"agent_name": "product-manager", "handoff_summary": "agent: product-manager\nfindings:\n- summary\nrisks:\n- none\ndecisions:\n- none\nrecommended_next_tasks:\n- none"}],
+    )
+
+    bundle = orchestrator._build_agent_message_bundle(
+        "architect",
+        {"name": "architect", "description": "Prepare technical plan"},
+        Path(".openclaw/agents/implementation/architect/prompt.md"),
+        "implementation",
+    )
+
+    assert bundle["selected_task_scope"] == "Ship observability only."
+    assert "Ship observability only." in bundle["system_message"]
+
+
+def test_default_implementation_scope_is_loaded_from_config(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir(parents=True)
+    default_scope = "Implement backend-only monitoring only."
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {
+                    "executor": "direct_api",
+                    "mode": "auto",
+                    "default_implementation_scope": default_scope,
+                    "require_registry_preflight": False,
+                    "require_model_list_preflight": False,
+                },
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (target_workspace / "README.md").write_text("target readme", encoding="utf-8")
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    _seed_research_run(
+        orchestrator.logger.log_dir,
+        "20260101_120004",
+        [{"agent_name": "product-manager", "handoff_summary": "agent: product-manager\nfindings:\n- summary\nrisks:\n- none\ndecisions:\n- none\nrecommended_next_tasks:\n- none"}],
+    )
+
+    bundle = orchestrator._build_agent_message_bundle(
+        "architect",
+        {"name": "architect", "description": "Prepare technical plan"},
+        Path(".openclaw/agents/implementation/architect/prompt.md"),
+        "implementation",
+    )
+
+    assert bundle["selected_task_scope"] == default_scope
+
+
+def test_developer_write_tools_are_enabled_for_scoped_implementation(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir(parents=True)
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (target_workspace / "README.md").write_text("target readme", encoding="utf-8")
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    _seed_research_run(
+        orchestrator.logger.log_dir,
+        "20260101_120003",
+        [{"agent_name": "product-manager", "handoff_summary": "agent: product-manager\nfindings:\n- summary\nrisks:\n- none\ndecisions:\n- none\nrecommended_next_tasks:\n- none"}],
+    )
+
+    bundle = orchestrator._build_agent_message_bundle(
+        "developer",
+        {"name": "developer", "description": "Implement the task"},
+        Path(".openclaw/agents/implementation/developer/prompt.md"),
+        "implementation",
+    )
+
+    assert bundle["implementation_retrieval_enabled"] is True
+    assert bundle["selected_task_scope"]
+    assert bundle["selected_task_scope"] in bundle["system_message"]
+    assert '"tool":"write_file"' in bundle["system_message"]
+    assert '"tool":"apply_patch"' in bundle["system_message"]
+    assert "Developer must produce real file edits via write_file/apply_patch" in bundle["system_message"]
+    assert "Do not implement marketplace." in bundle["system_message"]
+    assert "Do not change Stripe or billing flows." in bundle["system_message"]
+    assert "Do not make broad frontend changes." in bundle["system_message"]
+
+
+def test_research_handoff_summary_is_capped() -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+    summary = orchestrator._build_research_handoff_summary("project-analyst", "A" * 5000)
+    assert summary.startswith("agent: project-analyst")
+    assert "findings:" in summary
+    assert "recommended_next_tasks:" in summary
+    assert len(summary) <= 2000
+
+
+def test_research_handoff_summary_uses_deterministic_sections() -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+    summary = orchestrator._build_research_handoff_summary(
+        "tech-analyst",
+        "\n".join(
+            [
+                "Findings:",
+                "- The direct_api path is the active executor.",
+                "Risks:",
+                "- Retrieval rounds can grow prompt size.",
+                "Decisions:",
+                "- Keep repository tools bounded to the target workspace.",
+                "Recommended next tasks:",
+                "- Add diagnostics for retrieval rounds.",
+                "",
+                "Russian translation",
+                "Перевод.",
+            ]
+        ),
+    )
+
+    assert summary == "\n".join(
+        [
+            "agent: tech-analyst",
+            "findings:",
+            "- The direct_api path is the active executor.",
+            "risks:",
+            "- Retrieval rounds can grow prompt size.",
+            "decisions:",
+            "- Keep repository tools bounded to the target workspace.",
+            "recommended_next_tasks:",
+            "- Add diagnostics for retrieval rounds.",
+        ]
+    )
+
+
+def test_architect_receives_product_manager_summary_from_previous_research_run(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir(parents=True)
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (target_workspace / "README.md").write_text("target readme", encoding="utf-8")
+    (target_workspace / "frontend").mkdir()
+    (target_workspace / "frontend" / "package.json").write_text('{"name":"frontend"}', encoding="utf-8")
+    (target_workspace / "gateway-v4").mkdir()
+    (target_workspace / "gateway-v4" / "requirements.txt").write_text("fastapi", encoding="utf-8")
+
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    _seed_research_run(
+        orchestrator.logger.log_dir,
+        "20260101_120000",
+        [
+            {"agent_name": "product-manager", "handoff_summary": "agent: product-manager\nfindings:\n- P0 deliver monitoring foundation\nrisks:\n- none\ndecisions:\n- Build provider metrics first\nrecommended_next_tasks:\n- Implement provider performance monitoring"},
+            {"agent_name": "project-analyst", "handoff_summary": "agent: project-analyst\nfindings:\n- Target has frontend and gateway-v4\nrisks:\n- no tests\ndecisions:\n- keep scope narrow\nrecommended_next_tasks:\n- add observability"},
+            {"agent_name": "tech-analyst", "handoff_summary": "agent: tech-analyst\nfindings:\n- FastAPI backend with React frontend\nrisks:\n- missing monitoring\ndecisions:\n- add routing metrics\nrecommended_next_tasks:\n- add provider telemetry"},
+        ],
+    )
+
+    bundle = orchestrator._build_agent_message_bundle(
+        "architect",
+        {"name": "architect", "description": "Prepare technical plan"},
+        Path(".openclaw/agents/implementation/architect/prompt.md"),
+        "implementation",
+    )
+
+    assert "Repository context collected locally:" in bundle["system_message"]
+    assert "[product-manager]" in bundle["system_message"]
+    assert "[project-analyst]" in bundle["system_message"]
+    assert "[tech-analyst]" in bundle["system_message"]
+    assert "Build provider metrics first" in bundle["system_message"]
+    assert bundle["implementation_context_chars"] > 0
+    assert "Do not implement marketplace." in bundle["system_message"]
+    assert "Do not change Stripe or billing flows." in bundle["system_message"]
+
+
+def test_architect_receives_target_project_context(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir(parents=True)
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (target_workspace / "README.md").write_text("target readme", encoding="utf-8")
+    (target_workspace / "frontend").mkdir()
+    (target_workspace / "frontend" / "package.json").write_text('{"name":"frontend"}', encoding="utf-8")
+    (target_workspace / "gateway-v4").mkdir()
+    (target_workspace / "gateway-v4" / "requirements.txt").write_text("fastapi", encoding="utf-8")
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    _seed_research_run(
+        orchestrator.logger.log_dir,
+        "20260101_120001",
+        [{"agent_name": "product-manager", "handoff_summary": "agent: product-manager\nfindings:\n- summary\nrisks:\n- none\ndecisions:\n- none\nrecommended_next_tasks:\n- none"}],
+    )
+
+    bundle = orchestrator._build_agent_message_bundle(
+        "architect",
+        {"name": "architect", "description": "Prepare technical plan"},
+        Path(".openclaw/agents/implementation/architect/prompt.md"),
+        "implementation",
+    )
+
+    assert "target readme" in bundle["system_message"]
+    assert "frontend/package.json" in bundle["system_message"]
+    assert "gateway-v4/requirements.txt" in bundle["system_message"]
+    assert "Selected implementation scope" in bundle["system_message"]
+
+
+
+def test_direct_api_retrieval_reads_local_file_and_requeries(monkeypatch, tmp_path: Path) -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+    orchestrator.logger = WorkflowLogger(log_dir=str(tmp_path / "logs"))
+    requests: list[dict[str, object]] = []
+    responses = [
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"tool":"read_files","paths":["workflow/config.yaml"]}'
+                    }
+                }
+            ],
+            "model": "deepseek/deepseek-chat-v3",
+        },
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": "English summary.\n\nRussian translation\nРусский перевод."
+                    }
+                }
+            ],
+            "model": "deepseek/deepseek-chat-v3",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        },
+    ]
+
+    def fake_urlopen(request, timeout=0):
+        requests.append(json.loads(request.data.decode("utf-8")))
+        return _FakeHTTPResponse(responses[len(requests) - 1])
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.setattr(orchestrator_module.urllib_request, "urlopen", fake_urlopen)
+
+    ok = orchestrator._run_agent(
+        {
+            "name": "project-analyst",
+            "description": "Analyze repo",
+            "timeout": 5,
+            "provider": "openrouter",
+            "model": "openrouter/deepseek/deepseek-chat-v3",
+        },
+        "research",
+    )
+
+    assert ok is True
+    assert len(requests) == 2
+    assert "workflow/config.yaml" in requests[1]["messages"][-1]["content"]
+    payload = json.loads(
+        (orchestrator.logger.run_dir / "agents" / "research" / "project-analyst.json").read_text(encoding="utf-8")
+    )
+    assert payload["retrieval_enabled"] is True
+    assert payload["retrieval_rounds"] == 1
+    assert payload["repository_context_chars"] > 0
+    assert payload["target_workspace"] == str(orchestrator.target_workspace)
+    assert payload["project_id"] == orchestrator.project_id
+
+
+def test_direct_api_retrieval_cannot_escape_target_workspace(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    outside_file = tmp_path / "secret.txt"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir(parents=True)
+    outside_file.write_text("secret", encoding="utf-8")
+    (target_workspace / "inside.txt").write_text("inside", encoding="utf-8")
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+
+    assert orchestrator._direct_api_read_files(["../secret.txt"], limit=2000) == ""
+    assert orchestrator._direct_api_list_files("..", max_depth=2) == ""
+    assert "inside.txt" in orchestrator._direct_api_list_files(".", max_depth=2)
+
+
+def test_developer_write_file_changes_target_file(monkeypatch, tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir(parents=True)
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    target_file = target_workspace / "gateway-v4" / "app" / "services" / "monitoring.py"
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    target_file.write_text("initial\n", encoding="utf-8")
+    (target_workspace / "README.md").write_text("target readme", encoding="utf-8")
+    _ensure_temp_agent_prompt(engine_root, "implementation", "developer")
+
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    _seed_research_run(
+        orchestrator.logger.log_dir,
+        "20260101_120010",
+        [{"agent_name": "product-manager", "handoff_summary": "agent: product-manager\nfindings:\n- implement monitoring\nrisks:\n- none\ndecisions:\n- backend only\nrecommended_next_tasks:\n- edit monitoring file"}],
+    )
+
+    responses = [
+        {"choices": [{"message": {"content": '{"tool":"write_file","path":"gateway-v4/app/services/monitoring.py","content":"updated\\n"}'}}], "model": "anthropic/claude-sonnet-4.5"},
+        {"choices": [{"message": {"content": "Implemented change.\n\nRussian translation\nИзменение выполнено."}}], "model": "anthropic/claude-sonnet-4.5", "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}},
+    ]
+    calls: list[dict[str, object]] = []
+
+    def fake_urlopen(request, timeout=0):
+        calls.append(json.loads(request.data.decode("utf-8")))
+        return _FakeHTTPResponse(responses[len(calls) - 1])
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.setattr(orchestrator_module.urllib_request, "urlopen", fake_urlopen)
+
+    ok = orchestrator._run_agent(
+        {"name": "developer", "description": "Implement the task", "timeout": 5, "provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.5"},
+        "implementation",
+    )
+
+    assert ok is True
+    assert target_file.read_text(encoding="utf-8") == "updated\n"
+    payload = json.loads((orchestrator.logger.run_dir / "agents" / "implementation" / "developer.json").read_text(encoding="utf-8"))
+    assert payload["write_tools_used"] == ["write_file"]
+
+
+def test_developer_apply_patch_changes_target_file(monkeypatch, tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir(parents=True)
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    target_file = target_workspace / "gateway-v4" / "app" / "services" / "proxy.py"
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    target_file.write_text("return old_value\n", encoding="utf-8")
+    (target_workspace / "README.md").write_text("target readme", encoding="utf-8")
+    _ensure_temp_agent_prompt(engine_root, "implementation", "developer")
+
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    _seed_research_run(
+        orchestrator.logger.log_dir,
+        "20260101_120011",
+        [{"agent_name": "product-manager", "handoff_summary": "agent: product-manager\nfindings:\n- patch proxy\nrisks:\n- none\ndecisions:\n- backend only\nrecommended_next_tasks:\n- patch proxy file"}],
+    )
+
+    responses = [
+        {"choices": [{"message": {"content": '{"tool":"apply_patch","path":"gateway-v4/app/services/proxy.py","search":"old_value","replace":"new_value"}'}}], "model": "anthropic/claude-sonnet-4.5"},
+        {"choices": [{"message": {"content": "Patched file.\n\nRussian translation\nФайл изменен."}}], "model": "anthropic/claude-sonnet-4.5", "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}},
+    ]
+    calls: list[dict[str, object]] = []
+
+    def fake_urlopen(request, timeout=0):
+        calls.append(json.loads(request.data.decode("utf-8")))
+        return _FakeHTTPResponse(responses[len(calls) - 1])
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.setattr(orchestrator_module.urllib_request, "urlopen", fake_urlopen)
+
+    ok = orchestrator._run_agent(
+        {"name": "developer", "description": "Implement the task", "timeout": 5, "provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.5"},
+        "implementation",
+    )
+
+    assert ok is True
+    assert "new_value" in target_file.read_text(encoding="utf-8")
+    payload = json.loads((orchestrator.logger.run_dir / "agents" / "implementation" / "developer.json").read_text(encoding="utf-8"))
+    assert payload["write_tools_used"] == ["apply_patch"]
+
+
+def test_developer_write_cannot_escape_target_workspace(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    outside_file = tmp_path / "secret.txt"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir(parents=True)
+    outside_file.write_text("secret", encoding="utf-8")
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+
+    result = orchestrator._execute_direct_api_retrieval_request(
+        {"tool": "write_file", "path": "../secret.txt", "content": "changed"},
+        phase="implementation",
+        agent_name="developer",
+    )
+
+    assert "escapes target_workspace" in result
+    assert outside_file.read_text(encoding="utf-8") == "secret"
+
+
+def test_developer_write_forbidden_path_is_blocked(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir(parents=True)
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+
+    result = orchestrator._execute_direct_api_retrieval_request(
+        {"tool": "write_file", "path": "frontend/src/App.jsx", "content": "changed"},
+        phase="implementation",
+        agent_name="developer",
+    )
+
+    assert "violates implementation scope policy" in result
+
+
+def test_no_git_diff_after_developer_marks_no_changes(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    (engine_root / "workflow").mkdir(parents=True)
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    repo = git.Repo.init(target_workspace)
+    with repo.config_writer() as writer:
+        writer.set_value("user", "name", "Test")
+        writer.set_value("user", "email", "test@example.com")
+    file_path = target_workspace / "gateway-v4" / "app" / "services" / "monitoring.py"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text("pass\n", encoding="utf-8")
+    repo.index.add([str(file_path.relative_to(target_workspace)).replace("\\", "/")])
+    repo.index.commit("init")
+
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    orchestrator.logger.save_agent_report(
+        "implementation",
+        "developer",
+        {"status": "success", "result": "completed", "elapsed_s": 1, "returncode": 0, "message": "prompt", "stdout": "", "stderr": "", "parsed_output": "status=no_changes", "usage": {}},
+    )
+
+    ok = orchestrator._enforce_implementation_scope_diff()
+
+    assert ok is False
+    payload = json.loads((orchestrator.logger.run_dir / "agents" / "implementation" / "developer.json").read_text(encoding="utf-8"))
+    assert payload["status"] == "no_changes"
+    assert payload["no_changes_detected"] is True
+
+
+def test_qa_fails_if_no_diff_exists(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir(parents=True)
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (target_workspace / "README.md").write_text("target readme", encoding="utf-8")
+    _ensure_temp_agent_prompt(engine_root, "implementation", "qa")
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    _seed_research_run(
+        orchestrator.logger.log_dir,
+        "20260101_120012",
+        [{"agent_name": "product-manager", "handoff_summary": "agent: product-manager\nfindings:\n- qa should inspect diff\nrisks:\n- none\ndecisions:\n- none\nrecommended_next_tasks:\n- none"}],
+    )
+
+    ok = orchestrator._run_agent(
+        {"name": "qa", "description": "Run checks", "timeout": 5, "provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.5"},
+        "implementation",
+    )
+
+    assert ok is False
+    payload = json.loads((orchestrator.logger.run_dir / "agents" / "implementation" / "qa.json").read_text(encoding="utf-8"))
+    assert payload["status"] == "no_changes"
+
+
+def test_qa_receives_git_diff_when_changes_exist(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir(parents=True)
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    repo = git.Repo.init(target_workspace)
+    with repo.config_writer() as writer:
+        writer.set_value("user", "name", "Test")
+        writer.set_value("user", "email", "test@example.com")
+    diff_file = target_workspace / "gateway-v4" / "app" / "services" / "monitoring.py"
+    diff_file.parent.mkdir(parents=True, exist_ok=True)
+    diff_file.write_text("before\n", encoding="utf-8")
+    repo.index.add([str(diff_file.relative_to(target_workspace)).replace("\\", "/")])
+    repo.index.commit("init")
+    diff_file.write_text("after\n", encoding="utf-8")
+    (target_workspace / "README.md").write_text("target readme", encoding="utf-8")
+    _ensure_temp_agent_prompt(engine_root, "implementation", "qa")
+
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    _seed_research_run(
+        orchestrator.logger.log_dir,
+        "20260101_120013",
+        [{"agent_name": "product-manager", "handoff_summary": "agent: product-manager\nfindings:\n- qa should inspect diff\nrisks:\n- none\ndecisions:\n- none\nrecommended_next_tasks:\n- none"}],
+    )
+
+    bundle = orchestrator._build_agent_message_bundle(
+        "qa",
+        {"name": "qa", "description": "Run checks and report regressions"},
+        Path(".openclaw/agents/implementation/qa/prompt.md"),
+        "implementation",
+    )
+
+    assert "Target git diff" in bundle["system_message"]
+    assert "-before" in bundle["system_message"] or "+after" in bundle["system_message"]
 
 
 def test_successful_agent_run_creates_report_files(monkeypatch, tmp_path: Path) -> None:
@@ -423,6 +1558,56 @@ def test_previous_context_is_limited_to_4000_characters(tmp_path: Path) -> None:
     context = orchestrator._build_previous_agent_context("research", "competitor-analyst")
 
     assert "[project-analyst]" in context
+    assert len(context) <= 4000
+
+
+def test_project_analyst_context_is_prioritized_for_later_research_agents(tmp_path: Path) -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+    orchestrator.runtime.executor = "openclaw"
+    orchestrator.logger = WorkflowLogger(log_dir=str(tmp_path / "logs"))
+    long_text = "B" * 3800
+
+    for agent_name in ("competitor-analyst", "innovation-scout", "market-analyst"):
+        orchestrator.logger.save_agent_report(
+            "research",
+            agent_name,
+            {
+                "status": "success",
+                "result": "completed",
+                "elapsed_s": 12.3,
+                "returncode": 0,
+                "message": "prompt",
+                "stdout": "",
+                "stderr": "",
+                "parsed_output": long_text,
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+            },
+        )
+
+    orchestrator.logger.save_agent_report(
+        "research",
+        "project-analyst",
+        {
+            "status": "success",
+            "result": "completed",
+            "elapsed_s": 12.3,
+            "returncode": 0,
+            "message": "prompt",
+            "stdout": "",
+            "stderr": "",
+            "parsed_output": "Critical repository findings.\n\nRussian translation\nКлючевые выводы по репозиторию.",
+            "runtime": {
+                "provider": "openrouter",
+                "model": "openrouter/anthropic/claude-sonnet-4.6",
+                "thinking": "low",
+            },
+        },
+    )
+
+    context = orchestrator._build_previous_agent_context("research", "product-manager")
+
+    assert "[project-analyst]" in context
+    assert "Critical repository findings." in context
     assert len(context) <= 4000
 
 

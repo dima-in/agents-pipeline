@@ -2,6 +2,46 @@ workflow:
   executor: direct_api
   mode: interactive
   auto_continue_delay: 3
+  max_phase_cost_usd:
+  default_implementation_scope: "Implement backend-only MVP provider performance monitoring and smart routing foundation. No marketplace, no Stripe changes, no frontend changes except API client stubs if required."
+  implementation_scope_policy:
+    allowed_paths:
+      - gateway-v4/app/services/monitoring.py
+      - gateway-v4/app/services/routing.py
+      - gateway-v4/app/services/proxy.py
+      - gateway-v4/app/routers/chat.py
+      - gateway-v4/app/routers/admin.py
+      - gateway-v4/app/models.py
+      - gateway-v4/app/database.py
+      - gateway-v4/alembic/versions/*
+      - gateway-v4/tests/*
+      - tests/*
+      - docs/*
+      - README.md
+      - gateway-v4/README.md
+    forbidden_paths:
+      - frontend/*
+      - gateway-v4/app/routers/billing.py
+      - gateway-v4/app/routers/auth.py
+      - gateway-v4/app/services/auth.py
+      - gateway-v4/app/services/billing.py
+      - gateway-v4/app/services/marketplace.py
+      - .github/*
+      - docker-compose.yml
+      - docker-compose.prod.yml
+      - gateway-v4/docker-compose.yml
+      - gateway-v4/docker-compose.prod.yml
+      - gateway-v4/Dockerfile
+      - gateway-v4/Dockerfile.prod
+    forbidden_keywords:
+      - stripe
+      - billing
+      - subscription
+      - payment
+      - checkout
+      - marketplace
+    max_changed_files: 8
+    max_diff_lines: 320
   require_registry_preflight: false
   require_model_list_preflight: false
   phase_order:
@@ -16,7 +56,7 @@ project:
 
 runtime:
   provider: openrouter
-  model: openrouter/deepseek/deepseek-chat-v3
+  model: openrouter/anthropic/claude-sonnet-4.5
   thinking: low
 
 paths:
@@ -34,7 +74,7 @@ phases:
         description: "Analyze the current repository, constraints, gaps, and immediate opportunities"
         timeout: 900
         provider: openrouter
-        model: openrouter/deepseek/deepseek-chat-v3
+        model: openrouter/anthropic/claude-sonnet-4.5
         thinking: low
       - name: competitor-analyst
         description: "Analyze competitors"
@@ -46,13 +86,13 @@ phases:
         description: "Analyze market and trends"
         timeout: 600
         provider: openrouter
-        model: openrouter/deepseek/deepseek-chat-v3
+        model: openrouter/anthropic/claude-sonnet-4.5
         thinking: low
       - name: tech-analyst
         description: "Review technical options"
         timeout: 600
         provider: openrouter
-        model: openrouter/deepseek/deepseek-chat-v3
+        model: openrouter/anthropic/claude-sonnet-4.5
         thinking: low
       - name: innovation-scout
         description: "Find adjacent product and workflow innovations"
@@ -64,7 +104,7 @@ phases:
         description: "Summarize and prepare requirements"
         timeout: 900
         provider: openrouter
-        model: openrouter/deepseek/deepseek-chat-v3
+        model: openrouter/anthropic/claude-sonnet-4.5
         thinking: low
 
   implementation:
