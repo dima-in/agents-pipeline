@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 
 import start
+from tools import repo_map as repo_map_tool
 
 
 PHASE_ALIASES = {
@@ -46,6 +47,14 @@ def format_normalized_args(argv: list[str]) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     raw_args = list(sys.argv[1:] if argv is None else argv)
+    if raw_args and raw_args[0].strip().lower() == "repo-map":
+        forwarded = list(raw_args[1:])
+        if "--workspace" not in forwarded:
+            forwarded = ["--workspace", str(start.Path(start.os.environ.get("AGENTS_PIPELINE_LAUNCH_CWD") or start.os.getcwd()).resolve()), *forwarded]
+        if "--project-id" not in forwarded:
+            forwarded = ["--project-id", start.Path(start.os.environ.get("AGENTS_PIPELINE_LAUNCH_CWD") or start.os.getcwd()).resolve().name.lower().replace(" ", "-"), *forwarded]
+        print(f"normalized_args=python tools/repo_map.py {' '.join(forwarded)}")
+        return repo_map_tool.main(forwarded)
     normalized_args = normalize_cli_args(raw_args)
     print(f"normalized_args={format_normalized_args(normalized_args)}")
     return start.main(normalized_args)

@@ -86,6 +86,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bypass implementation scope watchdog with a warning",
     )
     parser.add_argument(
+        "--retry-agent",
+        default=None,
+        help="Retry only the specified agent using saved context",
+    )
+    parser.add_argument(
+        "--from-agent",
+        default=None,
+        help="Start implementation flow from the specified agent",
+    )
+    parser.add_argument(
+        "--reuse-architect",
+        action="store_true",
+        help="Reuse the latest successful architect output instead of rerunning architect",
+    )
+    parser.add_argument(
         "--preflight-only",
         action="store_true",
         help="Only validate runtime configuration and exit",
@@ -128,6 +143,9 @@ def main(argv: list[str] | None = None) -> int:
         next_task=args.next_task,
         research_run=args.research_run,
         allow_scope_expansion=args.allow_scope_expansion,
+        retry_agent=args.retry_agent,
+        from_agent=args.from_agent,
+        reuse_architect=args.reuse_architect,
     )
     orchestrator.config["workflow"]["mode"] = args.mode
     orchestrator.config["git"]["enabled"] = not args.skip_git

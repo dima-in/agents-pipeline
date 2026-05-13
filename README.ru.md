@@ -120,6 +120,12 @@ Copy-Item .env.example .env
 ```powershell
 .\run.bat python manage_agents.py bootstrap --force
 ```
+мое 
+git checkout main
+git branch -D feature/task_1
+
+C:\Users\fb.cadman\Desktop\Иноземцев\agents-pipeline\run.bat --phase implementation --mode interactive
+
 
 ## Примечание
 

@@ -13,3 +13,4 @@ env/
 Thumbs.db
 .openclaw/logs/
 .openclaw/feedback/
+.agents-pipeline/projects/*/context/*.json

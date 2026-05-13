@@ -1,4 +1,4 @@
-import http.client
+﻿import http.client
 import io
 import json
 import subprocess
@@ -21,7 +21,7 @@ class _FakePopen:
             "output_text": (
                 "English summary.\n\n"
                 "Russian translation\n"
-                "Русское резюме."
+                "Р СѓСЃСЃРєРѕРµ СЂРµР·СЋРјРµ."
             ),
             "usage": {
                 "input_tokens": 1000,
@@ -46,7 +46,7 @@ class _FakePopenNoUsage:
             "output_text": (
                 "English summary.\n\n"
                 "Russian translation\n"
-                "Русское резюме."
+                "Р СѓСЃСЃРєРѕРµ СЂРµР·СЋРјРµ."
             )
         }
         self.stdout = io.StringIO(json.dumps(payload))
@@ -74,7 +74,7 @@ def _fake_models_list(*_args, **_kwargs) -> SimpleNamespace:
         returncode=0,
         stdout=(
             "openrouter/deepseek/deepseek-chat-v3\n"
-            "claude-sonnet-4-5-20250929\n"
+            "claude-sonnet-4-6-20251001\n"
             "anthropic/claude-sonnet-4-6\n"
             "openrouter/anthropic/claude-sonnet-4.6\n"
             "perplexity/sonar\n"
@@ -171,7 +171,7 @@ def test_openrouter_request_includes_authorization_bearer_header(monkeypatch, tm
                 "choices": [
                     {
                         "message": {
-                            "content": "English summary.\n\nRussian translation\nРусский перевод."
+                            "content": "English summary.\n\nRussian translation\nР СѓСЃСЃРєРёР№ РїРµСЂРµРІРѕРґ."
                         }
                     }
                 ],
@@ -205,7 +205,7 @@ def test_openrouter_model_normalization_works() -> None:
     orchestrator = WorkflowOrchestrator("workflow/config.yaml")
 
     assert orchestrator._normalize_openrouter_model("openrouter/deepseek/deepseek-chat-v3") == "deepseek/deepseek-chat-v3"
-    assert orchestrator._normalize_openrouter_model("openrouter/anthropic/claude-sonnet-4.5") == "anthropic/claude-sonnet-4.5"
+    assert orchestrator._normalize_openrouter_model("openrouter/anthropic/claude-sonnet-4.6") == "anthropic/claude-sonnet-4.6"
     assert orchestrator._normalize_openrouter_model("perplexity/sonar") == "perplexity/sonar"
 
 
@@ -214,7 +214,7 @@ def test_direct_api_404_no_endpoints_becomes_model_not_found() -> None:
     assert (
         orchestrator._classify_direct_api_error(
             404,
-            '{"error":{"message":"No endpoints found for anthropic/claude-sonnet-4.5.","code":404}}',
+            '{"error":{"message":"No endpoints found for anthropic/claude-sonnet-4.6.","code":404}}',
         )
         == "model_not_found"
     )
@@ -262,11 +262,11 @@ def test_direct_api_successful_response_saves_report(monkeypatch, tmp_path: Path
     def fake_urlopen(_request, timeout=0):
         return _FakeHTTPResponse(
             {
-                "model": "anthropic/claude-sonnet-4.5",
+                "model": "anthropic/claude-sonnet-4.6",
                 "choices": [
                     {
                         "message": {
-                            "content": "English summary.\n\nRussian translation\nРусский перевод."
+                            "content": "English summary.\n\nRussian translation\nР СѓСЃСЃРєРёР№ РїРµСЂРµРІРѕРґ."
                         }
                     }
                 ],
@@ -283,7 +283,7 @@ def test_direct_api_successful_response_saves_report(monkeypatch, tmp_path: Path
             "description": "Analyze competitors",
             "timeout": 5,
             "provider": "openrouter",
-            "model": "openrouter/anthropic/claude-sonnet-4.5",
+            "model": "openrouter/anthropic/claude-sonnet-4.6",
         },
         "research",
     )
@@ -448,9 +448,9 @@ def test_competitor_analyst_does_not_receive_full_orchestrator_outline(tmp_path:
             "message": "prompt",
             "stdout": "",
             "stderr": "",
-            "parsed_output": "Repo findings.\n\nRussian translation\nРепо.",
+            "parsed_output": "Repo findings.\n\nRussian translation\nР РµРїРѕ.",
                 "handoff_summary": "agent: project-analyst\nfindings:\n- Repo findings.\nrisks:\n- none\ndecisions:\n- none\nrecommended_next_tasks:\n- none",
-                "runtime": {"provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.5", "thinking": "low"},
+                "runtime": {"provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.6", "thinking": "low"},
             },
         )
 
@@ -628,7 +628,7 @@ def test_product_manager_receives_summaries_from_previous_agents(tmp_path: Path)
                 "stderr": "",
                 "parsed_output": summary,
                 "handoff_summary": summary,
-                "runtime": {"provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.5", "thinking": "low"},
+                "runtime": {"provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.6", "thinking": "low"},
             },
         )
 
@@ -663,7 +663,7 @@ def test_no_memory_keeps_current_run_handoff_summaries(tmp_path: Path) -> None:
             "stderr": "",
             "parsed_output": "summary",
             "handoff_summary": "agent: project-analyst\nfindings:\n- summary\nrisks:\n- none\ndecisions:\n- none\nrecommended_next_tasks:\n- none",
-            "runtime": {"provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.5", "thinking": "low"},
+            "runtime": {"provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.6", "thinking": "low"},
         },
     )
 
@@ -689,11 +689,11 @@ def test_direct_api_retries_on_incomplete_read(monkeypatch, tmp_path: Path) -> N
             raise http.client.IncompleteRead(b'{"partial":true}', 100)
         return _FakeHTTPResponse(
             {
-                "model": "anthropic/claude-sonnet-4.5",
+                "model": "anthropic/claude-sonnet-4.6",
                 "choices": [
                     {
                         "message": {
-                            "content": "English summary.\n\nRussian translation\nПеревод."
+                            "content": "English summary.\n\nRussian translation\nРџРµСЂРµРІРѕРґ."
                         }
                     }
                 ],
@@ -710,7 +710,7 @@ def test_direct_api_retries_on_incomplete_read(monkeypatch, tmp_path: Path) -> N
             "description": "Summarize and prepare requirements",
             "timeout": 5,
             "provider": "openrouter",
-            "model": "openrouter/anthropic/claude-sonnet-4.5",
+            "model": "openrouter/anthropic/claude-sonnet-4.6",
         },
         "research",
     )
@@ -815,6 +815,96 @@ def test_default_implementation_scope_is_loaded_from_config(tmp_path: Path) -> N
     assert bundle["selected_task_scope"] == default_scope
 
 
+def test_agents_pipeline_self_analysis_uses_reliability_default_scope() -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+    reports = [{"agent_name": "product-manager", "status": "success", "handoff_summary": "summary"}]
+
+    scope = orchestrator._select_implementation_scope(reports)
+
+    assert "agents-pipeline orchestration reliability" in scope
+    assert "status/resume/doctor/repo-map/validation improvements" in scope
+    assert "provider marketplace" in scope
+
+
+def test_architect_prompt_includes_no_generic_root_warning_for_self_analysis() -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+    bundle = orchestrator._build_agent_message_bundle(
+        "architect",
+        {"name": "architect", "description": "Prepare technical plan"},
+        Path(".openclaw/agents/implementation/architect/prompt.md"),
+        "implementation",
+    )
+
+    assert "Do not propose src/, api/, services/, models/, or config/ root directories unless they already exist." in bundle["system_message"]
+
+
+def test_planner_can_translate_invalid_architect_path_into_valid_workflow_path(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir(parents=True)
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (target_workspace / "README.md").write_text("target readme", encoding="utf-8")
+    workflow_file = target_workspace / "workflow" / "orchestrator.py"
+    workflow_file.parent.mkdir(parents=True, exist_ok=True)
+    workflow_file.write_text("pass\n", encoding="utf-8")
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    _seed_research_run(
+        orchestrator.logger.log_dir,
+        "20260101_120016",
+        [{"agent_name": "product-manager", "handoff_summary": "agent: product-manager\nfindings:\n- improve repo map\nrisks:\n- none\ndecisions:\n- none\nrecommended_next_tasks:\n- none"}],
+    )
+    _seed_implementation_report(
+        orchestrator.logger.run_dir,
+        "architect",
+        parsed_output="Architect plan: add services/provider_monitor.py",
+    )
+    _seed_implementation_report(
+        orchestrator.logger.run_dir,
+        "implementation-planner",
+        parsed_output=json.dumps(
+            [
+                {
+                    "id": "workflow-fix",
+                    "title": "Workflow reliability fix",
+                    "priority": "P0",
+                    "scope": "Improve orchestration validation in workflow/orchestrator.py.",
+                    "existing_paths": ["workflow/orchestrator.py"],
+                    "allowed_paths": ["workflow/orchestrator.py"],
+                    "forbidden_paths": [],
+                    "required_test_paths": ["tests/test_workflow.py"],
+                    "acceptance_criteria": ["Workflow validation improved."],
+                    "reason_each_path_is_needed": {"workflow/orchestrator.py": "Needed."},
+                    "risk_level": "low",
+                    "estimated_effort": "S",
+                }
+            ]
+        ),
+    )
+
+    diagnostics = orchestrator._validate_implementation_planner_output()
+
+    assert diagnostics["valid"] is True
+
+
 def test_developer_write_tools_are_enabled_for_scoped_implementation(tmp_path: Path) -> None:
     engine_root = tmp_path / "engine"
     target_workspace = tmp_path / "target"
@@ -861,6 +951,7 @@ def test_developer_write_tools_are_enabled_for_scoped_implementation(tmp_path: P
                     "scope": "Edit monitoring service only.",
                     "allowed_paths": ["gateway-v4/app/services/monitoring.py"],
                     "forbidden_paths": ["frontend/*"],
+                    "required_test_paths": ["tests/test_monitoring.py"],
                     "acceptance_criteria": ["Monitoring service is updated."],
                     "risk_level": "low",
                     "estimated_effort": "S",
@@ -951,6 +1042,7 @@ def test_backlog_is_generated_from_implementation_planner_output(tmp_path: Path)
                     "scope": "Touch backend only.",
                     "allowed_paths": ["gateway-v4/app/services/monitoring.py"],
                     "forbidden_paths": [],
+                    "required_test_paths": ["tests/test_monitoring.py"],
                     "acceptance_criteria": ["Backend updated."],
                     "risk_level": "low",
                     "estimated_effort": "S",
@@ -1033,6 +1125,7 @@ def test_developer_prompt_receives_only_selected_task_not_raw_architect_plan(tmp
                     "scope": "Touch gateway-v4/app/services/monitoring.py only.",
                     "allowed_paths": ["gateway-v4/app/services/monitoring.py"],
                     "forbidden_paths": ["frontend/*", "gateway-v4/app/services/marketplace.py"],
+                    "required_test_paths": ["tests/test_monitoring.py"],
                     "acceptance_criteria": ["Monitoring file updated."],
                     "risk_level": "low",
                     "estimated_effort": "S",
@@ -1210,6 +1303,7 @@ def test_task_id_selects_planner_backlog_item_non_interactively(tmp_path: Path) 
                     "scope": "First scope",
                     "allowed_paths": ["gateway-v4/app/services/monitoring.py"],
                     "forbidden_paths": [],
+                    "required_test_paths": ["tests/test_monitoring.py"],
                     "acceptance_criteria": ["First done"],
                     "risk_level": "low",
                     "estimated_effort": "S",
@@ -1221,6 +1315,7 @@ def test_task_id_selects_planner_backlog_item_non_interactively(tmp_path: Path) 
                     "scope": "Second scope",
                     "allowed_paths": ["gateway-v4/app/services/proxy.py"],
                     "forbidden_paths": [],
+                    "required_test_paths": ["tests/test_proxy.py"],
                     "acceptance_criteria": ["Second done"],
                     "risk_level": "low",
                     "estimated_effort": "S",
@@ -1281,6 +1376,7 @@ def test_list_tasks_prints_planner_backlog(capsys, monkeypatch, tmp_path: Path) 
                     "scope": "Planner scope",
                     "allowed_paths": ["gateway-v4/app/services/monitoring.py"],
                     "forbidden_paths": [],
+                    "required_test_paths": ["tests/test_monitoring.py"],
                     "acceptance_criteria": ["Planner done"],
                     "risk_level": "low",
                     "estimated_effort": "S",
@@ -1324,7 +1420,7 @@ def test_research_handoff_summary_uses_deterministic_sections() -> None:
                 "- Add diagnostics for retrieval rounds.",
                 "",
                 "Russian translation",
-                "Перевод.",
+                "РџРµСЂРµРІРѕРґ.",
             ]
         ),
     )
@@ -1471,7 +1567,7 @@ def test_direct_api_retrieval_reads_local_file_and_requeries(monkeypatch, tmp_pa
             "choices": [
                 {
                     "message": {
-                        "content": "English summary.\n\nRussian translation\nРусский перевод."
+                        "content": "English summary.\n\nRussian translation\nР СѓСЃСЃРєРёР№ РїРµСЂРµРІРѕРґ."
                     }
                 }
             ],
@@ -1584,8 +1680,8 @@ def test_developer_write_file_changes_target_file(monkeypatch, tmp_path: Path) -
     )
 
     responses = [
-        {"choices": [{"message": {"content": '{"tool":"write_file","path":"gateway-v4/app/services/monitoring.py","content":"updated\\n"}'}}], "model": "anthropic/claude-sonnet-4.5"},
-        {"choices": [{"message": {"content": "Implemented change.\n\nRussian translation\nИзменение выполнено."}}], "model": "anthropic/claude-sonnet-4.5", "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}},
+        {"choices": [{"message": {"content": '{"tool":"write_file","path":"gateway-v4/app/services/monitoring.py","content":"updated\\n"}'}}], "model": "anthropic/claude-sonnet-4.6"},
+        {"choices": [{"message": {"content": "Implemented change.\n\nRussian translation\nРР·РјРµРЅРµРЅРёРµ РІС‹РїРѕР»РЅРµРЅРѕ."}}], "model": "anthropic/claude-sonnet-4.6", "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}},
     ]
     calls: list[dict[str, object]] = []
 
@@ -1597,7 +1693,7 @@ def test_developer_write_file_changes_target_file(monkeypatch, tmp_path: Path) -
     monkeypatch.setattr(orchestrator_module.urllib_request, "urlopen", fake_urlopen)
 
     ok = orchestrator._run_agent(
-        {"name": "developer", "description": "Implement the task", "timeout": 5, "provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.5"},
+        {"name": "developer", "description": "Implement the task", "timeout": 5, "provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.6"},
         "implementation",
     )
 
@@ -1645,8 +1741,8 @@ def test_developer_apply_patch_changes_target_file(monkeypatch, tmp_path: Path) 
     )
 
     responses = [
-        {"choices": [{"message": {"content": '{"tool":"apply_patch","path":"gateway-v4/app/services/proxy.py","search":"old_value","replace":"new_value"}'}}], "model": "anthropic/claude-sonnet-4.5"},
-        {"choices": [{"message": {"content": "Patched file.\n\nRussian translation\nФайл изменен."}}], "model": "anthropic/claude-sonnet-4.5", "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}},
+        {"choices": [{"message": {"content": '{"tool":"apply_patch","path":"gateway-v4/app/services/proxy.py","search":"old_value","replace":"new_value"}'}}], "model": "anthropic/claude-sonnet-4.6"},
+        {"choices": [{"message": {"content": "Patched file.\n\nRussian translation\nР¤Р°Р№Р» РёР·РјРµРЅРµРЅ."}}], "model": "anthropic/claude-sonnet-4.6", "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}},
     ]
     calls: list[dict[str, object]] = []
 
@@ -1658,7 +1754,7 @@ def test_developer_apply_patch_changes_target_file(monkeypatch, tmp_path: Path) 
     monkeypatch.setattr(orchestrator_module.urllib_request, "urlopen", fake_urlopen)
 
     ok = orchestrator._run_agent(
-        {"name": "developer", "description": "Implement the task", "timeout": 5, "provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.5"},
+        {"name": "developer", "description": "Implement the task", "timeout": 5, "provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.6"},
         "implementation",
     )
 
@@ -1824,7 +1920,7 @@ def test_qa_fails_if_no_diff_exists(tmp_path: Path) -> None:
     )
 
     ok = orchestrator._run_agent(
-        {"name": "qa", "description": "Run checks", "timeout": 5, "provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.5"},
+        {"name": "qa", "description": "Run checks", "timeout": 5, "provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.6"},
         "implementation",
     )
 
@@ -1973,7 +2069,7 @@ def test_second_agent_message_includes_previous_agent_output(tmp_path: Path) -> 
             "message": "prompt",
             "stdout": "stdout text",
             "stderr": "",
-            "parsed_output": "English summary.\n\nRussian translation\nРусский перевод.",
+            "parsed_output": "English summary.\n\nRussian translation\nР СѓСЃСЃРєРёР№ РїРµСЂРµРІРѕРґ.",
             "runtime": {"provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.6", "thinking": "low"},
         },
     )
@@ -2053,7 +2149,7 @@ def test_project_analyst_context_is_prioritized_for_later_research_agents(tmp_pa
             "message": "prompt",
             "stdout": "",
             "stderr": "",
-            "parsed_output": "Critical repository findings.\n\nRussian translation\nКлючевые выводы по репозиторию.",
+            "parsed_output": "Critical repository findings.\n\nRussian translation\nРљР»СЋС‡РµРІС‹Рµ РІС‹РІРѕРґС‹ РїРѕ СЂРµРїРѕР·РёС‚РѕСЂРёСЋ.",
             "runtime": {
                 "provider": "openrouter",
                 "model": "openrouter/anthropic/claude-sonnet-4.6",
@@ -2085,7 +2181,7 @@ def test_failed_agents_are_excluded_from_previous_context_and_phase_summary_json
             "message": "prompt",
             "stdout": "",
             "stderr": "",
-            "parsed_output": "English summary.\n\nRussian translation\nРусский перевод.",
+            "parsed_output": "English summary.\n\nRussian translation\nР СѓСЃСЃРєРёР№ РїРµСЂРµРІРѕРґ.",
             "runtime": {"provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.6", "thinking": "low"},
             "usage": {"input_tokens": 100, "output_tokens": 50, "total_tokens": 150, "estimated_cost_usd": 0.00105, "usage_status": "captured"},
         },
@@ -2714,3 +2810,4 @@ def test_models_list_is_not_called_repeatedly_after_first_timeout(monkeypatch, t
 
     assert validation["error"] == ""
     assert calls["models"] == 1
+

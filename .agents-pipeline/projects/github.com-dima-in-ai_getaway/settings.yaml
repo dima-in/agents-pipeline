@@ -1,4 +1,7 @@
 project_id: github.com-dima-in-ai_getaway
 git_remote: https://github.com/dima-in/ai_getaway.git
-target_workspace: D:\MYAI
-engine_root: D:\agentic-dev-loop\agents-pipeline
+target_workspace: "C:\\Users\\fb.cadman\\Desktop\\\u0418\u043D\u043E\u0437\u0435\u043C\
+  \u0446\u0435\u0432\\vps"
+engine_root: "C:\\Users\\fb.cadman\\Desktop\\\u0418\u043D\u043E\u0437\u0435\u043C\u0446\
+  \u0435\u0432\\agents-pipeline"
+completed_implementation_tasks: []

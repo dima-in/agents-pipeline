@@ -8,7 +8,7 @@ import yaml
 
 DEFAULT_MODELS = {
     "openrouter": "openrouter/deepseek/deepseek-chat-v3",
-    "claude": "anthropic/claude-sonnet-4-5",
+    "claude": "anthropic/claude-sonnet-4-6",
 }
 
 
