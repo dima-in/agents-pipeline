@@ -949,6 +949,7 @@ def test_developer_write_tools_are_enabled_for_scoped_implementation(tmp_path: P
                     "title": "Implement monitoring service changes",
                     "priority": "P0",
                     "scope": "Edit monitoring service only.",
+                    "existing_paths": ["gateway-v4/app/services/monitoring.py"],
                     "allowed_paths": ["gateway-v4/app/services/monitoring.py"],
                     "forbidden_paths": ["frontend/*"],
                     "required_test_paths": ["tests/test_monitoring.py"],
@@ -1029,6 +1030,7 @@ def test_backlog_is_generated_from_implementation_planner_output(tmp_path: Path)
                     "title": "Frontend follow-up",
                     "priority": "P1",
                     "scope": "Touch frontend.",
+                    "existing_paths": ["frontend/src/App.jsx"],
                     "allowed_paths": ["frontend/src/App.jsx"],
                     "forbidden_paths": [],
                     "acceptance_criteria": ["Frontend updated."],
@@ -1040,6 +1042,7 @@ def test_backlog_is_generated_from_implementation_planner_output(tmp_path: Path)
                     "title": "Backend first task",
                     "priority": "P0",
                     "scope": "Touch backend only.",
+                    "existing_paths": ["gateway-v4/app/services/monitoring.py"],
                     "allowed_paths": ["gateway-v4/app/services/monitoring.py"],
                     "forbidden_paths": [],
                     "required_test_paths": ["tests/test_monitoring.py"],
@@ -1123,6 +1126,7 @@ def test_developer_prompt_receives_only_selected_task_not_raw_architect_plan(tmp
                     "title": "Safe backend task",
                     "priority": "P0",
                     "scope": "Touch gateway-v4/app/services/monitoring.py only.",
+                    "existing_paths": ["gateway-v4/app/services/monitoring.py"],
                     "allowed_paths": ["gateway-v4/app/services/monitoring.py"],
                     "forbidden_paths": ["frontend/*", "gateway-v4/app/services/marketplace.py"],
                     "required_test_paths": ["tests/test_monitoring.py"],
@@ -1301,6 +1305,7 @@ def test_task_id_selects_planner_backlog_item_non_interactively(tmp_path: Path) 
                     "title": "First task",
                     "priority": "P0",
                     "scope": "First scope",
+                    "existing_paths": ["gateway-v4/app/services/monitoring.py"],
                     "allowed_paths": ["gateway-v4/app/services/monitoring.py"],
                     "forbidden_paths": [],
                     "required_test_paths": ["tests/test_monitoring.py"],
@@ -1313,6 +1318,7 @@ def test_task_id_selects_planner_backlog_item_non_interactively(tmp_path: Path) 
                     "title": "Second task",
                     "priority": "P1",
                     "scope": "Second scope",
+                    "existing_paths": ["gateway-v4/app/services/proxy.py"],
                     "allowed_paths": ["gateway-v4/app/services/proxy.py"],
                     "forbidden_paths": [],
                     "required_test_paths": ["tests/test_proxy.py"],
@@ -1391,8 +1397,108 @@ def test_list_tasks_prints_planner_backlog(capsys, monkeypatch, tmp_path: Path) 
     output = capsys.readouterr().out
 
     assert exit_code == 0
-    assert "Implementation backlog (source=implementation-planner)" in output
+    assert "Бэклог реализации (источник=implementation-planner)" in output
     assert "planner-task" in output
+
+
+def test_english_backlog_labels_print_when_console_language_en(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir(parents=True)
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "console_language": "en", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    orchestrator = WorkflowOrchestrator(str(engine_root / "workflow" / "config.yaml"), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+
+    text = orchestrator._format_implementation_backlog(
+        [
+            {
+                "id": "TASK-001",
+                "title": "Planner task",
+                "priority": "P0",
+                "scope": "Backend only.",
+                "existing_paths": ["gateway-v4/app/services/proxy.py"],
+                "new_directories": [],
+                "new_files": ["gateway-v4/tests/test_proxy_metrics.py"],
+                "allowed_paths": ["gateway-v4/app/services/proxy.py", "gateway-v4/tests/test_proxy_metrics.py"],
+                "required_test_paths": ["gateway-v4/tests/test_proxy_metrics.py"],
+                "acceptance_criteria": ["done"],
+                "risk_level": "low",
+                "estimated_effort": "S",
+            }
+        ],
+        "implementation-planner",
+    )
+
+    assert "Implementation backlog (source=implementation-planner)" in text
+    assert "existing files: gateway-v4/app/services/proxy.py" in text
+    assert "new files: gateway-v4/tests/test_proxy_metrics.py" in text
+    assert "required tests: gateway-v4/tests/test_proxy_metrics.py" in text
+    assert "TASK-001" in text
+    assert "gateway-v4/app/services/proxy.py" in text
+
+
+def test_russian_backlog_labels_keep_ids_and_paths_unchanged(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir(parents=True)
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "console_language": "ru", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    orchestrator = WorkflowOrchestrator(str(engine_root / "workflow" / "config.yaml"), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+
+    text = orchestrator._format_implementation_backlog(
+        [
+            {
+                "id": "TASK-007",
+                "title": "Planner task",
+                "priority": "P2",
+                "scope": "Backend only.",
+                "existing_paths": ["frontend/src/lib/api.js"],
+                "new_directories": [],
+                "new_files": [],
+                "allowed_paths": ["frontend/src/lib/api.js"],
+                "required_test_paths": [],
+                "acceptance_criteria": ["done"],
+                "risk_level": "low",
+                "estimated_effort": "1 час",
+            }
+        ],
+        "implementation-planner",
+    )
+
+    assert "Бэклог реализации (источник=implementation-planner)" in text
+    assert "существующие файлы: frontend/src/lib/api.js" in text
+    assert "разрешённые пути: frontend/src/lib/api.js" in text
+    assert "обязательные тесты: none" in text
+    assert "TASK-007" in text
+    assert "frontend/src/lib/api.js" in text
 
 
 def test_research_handoff_summary_is_capped() -> None:

@@ -1,6 +1,7 @@
 workflow:
   executor: direct_api
   mode: interactive
+  console_language: ru
   auto_continue_delay: 3
   max_phase_cost_usd:
   default_implementation_scope: "Implement backend-only MVP provider performance monitoring and smart routing foundation. No marketplace, no Stripe changes, no frontend changes except API client stubs if required."

@@ -19,6 +19,7 @@ def _write_minimal_workflow_config(config_path: Path, workspace: str = ".") -> N
                 "workflow": {
                     "executor": "direct_api",
                     "mode": "auto",
+                    "console_language": "ru",
                     "max_phase_cost_usd": None,
                     "default_implementation_scope": "Implement backend-only MVP provider performance monitoring and smart routing foundation. No marketplace, no Stripe changes, no frontend changes except API client stubs if required.",
                     "implementation_scope_policy": {
@@ -538,6 +539,7 @@ def test_implementation_planner_runs_after_architect(tmp_path: Path, monkeypatch
                                 "title": "Backend task",
                                 "priority": "P0",
                                 "scope": "Touch backend only.",
+                                "existing_paths": ["gateway-v4/app/services/monitoring.py"],
                                 "allowed_paths": ["gateway-v4/app/services/monitoring.py"],
                                 "forbidden_paths": [],
                                 "required_test_paths": ["tests/test_monitoring.py"],
@@ -644,6 +646,7 @@ def test_developer_blocked_when_selected_task_plans_marketplace_file(tmp_path: P
                                 "title": "Marketplace billing task",
                                 "priority": "P0",
                                 "scope": "Touch marketplace code.",
+                                "existing_paths": ["gateway-v4/app/services/marketplace.py"],
                                 "allowed_paths": ["gateway-v4/app/services/marketplace.py"],
                                 "forbidden_paths": [],
                                 "required_test_paths": ["tests/test_marketplace.py"],
@@ -669,6 +672,85 @@ def test_developer_blocked_when_selected_task_plans_marketplace_file(tmp_path: P
     )
     assert payload["status"] == "scope_violation"
     assert "marketplace" in payload["result"]
+
+
+def test_task_with_forbidden_paths_passes_when_allowed_paths_do_not_touch_them(tmp_path: Path, monkeypatch) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    monitoring_file = target_workspace / "gateway-v4" / "app" / "services" / "monitoring.py"
+    monitoring_file.parent.mkdir(parents=True, exist_ok=True)
+    monitoring_file.write_text("pass\n", encoding="utf-8")
+    monkeypatch.setattr(orchestrator, "_wait_for_user", lambda _prompt: True)
+    calls: list[str] = []
+
+    def fake_run_agent(agent_config, phase_key, index=None, total=None):
+        calls.append(agent_config["name"])
+        if agent_config["name"] == "implementation-planner":
+            orchestrator.logger.save_agent_report(
+                "implementation",
+                "implementation-planner",
+                {
+                    "status": "success",
+                    "result": "completed",
+                    "elapsed_s": 1,
+                    "returncode": 0,
+                    "message": "prompt",
+                    "stdout": "",
+                    "stderr": "",
+                    "parsed_output": json.dumps(
+                        [
+                            {
+                                "id": "planner-safe-task",
+                                "title": "Safe task",
+                                "priority": "P0",
+                                "scope": "Touch monitoring only.",
+                                "existing_paths": ["gateway-v4/app/services/monitoring.py"],
+                                "allowed_paths": ["gateway-v4/app/services/monitoring.py"],
+                                "forbidden_paths": ["gateway-v4/app/routers/billing.py", "frontend/src/lib/api.js"],
+                                "required_test_paths": ["tests/test_monitoring.py"],
+                                "acceptance_criteria": ["Monitoring updated."],
+                                "risk_level": "low",
+                                "estimated_effort": "S",
+                            }
+                        ]
+                    ),
+                },
+            )
+        return True
+
+    monkeypatch.setattr(orchestrator, "_run_agent", fake_run_agent)
+    monkeypatch.setattr(orchestrator, "_collect_scope_watchdog_diff_diagnostics", lambda: {
+        "allowed": True,
+        "changed_files": ["gateway-v4/app/services/monitoring.py"],
+        "changed_files_count": 1,
+        "diff_lines_count": 8,
+        "forbidden_hits": [],
+        "allowed_paths_matched": ["gateway-v4/app/services/monitoring.py"],
+        "scope_policy_result": "allowed",
+        "selected_task_forbidden_paths": ["gateway-v4/app/routers/billing.py", "frontend/src/lib/api.js"],
+        "planned_edit_paths": ["gateway-v4/app/services/monitoring.py"],
+        "forbidden_hits_source": "",
+    })
+    phase = {"agents": [{"name": "architect"}, {"name": "implementation-planner"}, {"name": "developer"}, {"name": "qa"}]}
+
+    ok = orchestrator._run_phase_agents(phase, "implementation")
+
+    assert ok is True
+    planner_payload = json.loads(
+        (orchestrator.logger.run_dir / "agents" / "implementation" / "implementation-planner.json").read_text(encoding="utf-8")
+    )
+    assert planner_payload["scope_policy_result"] == "allowed"
+    assert planner_payload["selected_task_forbidden_paths"] == ["gateway-v4/app/routers/billing.py", "frontend/src/lib/api.js"]
+    assert planner_payload["planned_edit_paths"] == ["gateway-v4/app/services/monitoring.py"]
+    assert planner_payload["forbidden_hits_source"] == "precheck"
 
 
 def test_scope_watchdog_blocks_billing_diff(tmp_path: Path) -> None:
@@ -697,6 +779,7 @@ def test_scope_watchdog_blocks_billing_diff(tmp_path: Path) -> None:
 
     assert diagnostics["allowed"] is False
     assert any("billing" in hit or "stripe" in hit for hit in diagnostics["forbidden_hits"])
+    assert diagnostics["forbidden_hits_source"] == "diff"
 
 
 def test_scope_watchdog_blocks_when_too_many_files_changed(tmp_path: Path) -> None:
@@ -813,6 +896,7 @@ def test_allow_scope_expansion_bypasses_watchdog_with_warning(tmp_path: Path, mo
                                 "title": "Frontend task",
                                 "priority": "P1",
                                 "scope": "Touch frontend code.",
+                                "existing_paths": ["frontend/src/App.jsx"],
                                 "allowed_paths": ["frontend/src/App.jsx"],
                                 "forbidden_paths": [],
                                 "acceptance_criteria": ["Frontend code updated."],
@@ -1025,6 +1109,55 @@ def test_planner_existing_target_file_passes_validation(tmp_path: Path) -> None:
     assert diagnostics["task_count"] == 1
 
 
+def test_planner_allowed_path_must_be_declared(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    file_path = target_workspace / "workflow" / "orchestrator.py"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text("pass\n", encoding="utf-8")
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    orchestrator.logger.save_agent_report(
+        "implementation",
+        "implementation-planner",
+        {
+            "status": "success",
+            "result": "completed",
+            "parsed_output": json.dumps(
+                [
+                    {
+                        "id": "undeclared-allowed-path",
+                        "title": "Undeclared allowed path",
+                        "priority": "P0",
+                        "scope": "Touch one file but forget to declare it properly.",
+                        "allowed_paths": ["workflow/orchestrator.py"],
+                        "existing_paths": [],
+                        "new_directories": [],
+                        "new_files": [],
+                        "forbidden_paths": [],
+                        "required_test_paths": ["tests/test_workflow.py"],
+                        "acceptance_criteria": ["n/a"],
+                        "reason_each_path_is_needed": {"workflow/orchestrator.py": "Needed."},
+                        "risk_level": "low",
+                        "estimated_effort": "S",
+                    }
+                ]
+            ),
+        },
+    )
+
+    diagnostics = orchestrator._validate_implementation_planner_output()
+
+    assert diagnostics["valid"] is False
+    assert any("allowed_path_not_declared" in item for item in diagnostics["invalid_paths"])
+
+
 def test_planner_new_file_under_existing_directory_passes_when_marked_new_file(tmp_path: Path) -> None:
     engine_root = tmp_path / "engine"
     target_workspace = tmp_path / "target"
@@ -1068,6 +1201,122 @@ def test_planner_new_file_under_existing_directory_passes_when_marked_new_file(t
     diagnostics = orchestrator._validate_implementation_planner_output()
 
     assert diagnostics["valid"] is True
+
+
+def test_planner_validates_new_test_package_scaffolding(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    (target_workspace / "gateway-v4" / "app" / "services").mkdir(parents=True, exist_ok=True)
+    (target_workspace / "gateway-v4" / "app" / "services" / "router.py").write_text(
+        "def route():\n    return None\n",
+        encoding="utf-8",
+    )
+
+    positive = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    positive.logger.save_agent_report(
+        "implementation",
+        "implementation-planner",
+        {
+            "status": "success",
+            "result": "completed",
+            "parsed_output": json.dumps(
+                [
+                    {
+                        "id": "new-test-package-positive",
+                        "title": "Add smart routing test package",
+                        "priority": "P1",
+                        "scope": "Backend-only test scaffolding",
+                        "existing_paths": ["gateway-v4/app/services/router.py"],
+                        "new_directories": ["gateway-v4/tests"],
+                        "new_files": [
+                            "gateway-v4/tests/__init__.py",
+                            "gateway-v4/tests/test_router_smart.py",
+                        ],
+                        "allowed_paths": [
+                            "gateway-v4/app/services/router.py",
+                            "gateway-v4/tests/__init__.py",
+                            "gateway-v4/tests/test_router_smart.py",
+                        ],
+                        "forbidden_paths": [],
+                        "required_test_paths": ["gateway-v4/tests/test_router_smart.py"],
+                        "acceptance_criteria": ["n/a"],
+                        "reason_each_path_is_needed": {
+                            "gateway-v4/app/services/router.py": "Existing router service under test.",
+                            "gateway-v4/tests/__init__.py": "Package marker for new tests.",
+                            "gateway-v4/tests/test_router_smart.py": "Smart routing test file.",
+                        },
+                        "risk_level": "low",
+                        "estimated_effort": "S",
+                    }
+                ]
+            ),
+        },
+    )
+
+    positive_diagnostics = positive._validate_implementation_planner_output()
+
+    assert positive_diagnostics["valid"] is True
+    assert not any(
+        "new-test-package-positive" in item and "allowed_path_not_declared" in item
+        for item in positive_diagnostics["invalid_paths"]
+    )
+
+    negative = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    negative.logger.save_agent_report(
+        "implementation",
+        "implementation-planner",
+        {
+            "status": "success",
+            "result": "completed",
+            "parsed_output": json.dumps(
+                [
+                    {
+                        "id": "new-test-package-negative",
+                        "title": "Broken smart routing test package",
+                        "priority": "P1",
+                        "scope": "Backend-only test scaffolding",
+                        "existing_paths": ["gateway-v4/app/services/router.py"],
+                        "new_directories": ["gateway-v4/tests"],
+                        "new_files": ["gateway-v4/tests/test_router_smart.py"],
+                        "allowed_paths": [
+                            "gateway-v4/app/services/router.py",
+                            "gateway-v4/tests/__init__.py",
+                            "gateway-v4/tests/test_router_smart.py",
+                        ],
+                        "forbidden_paths": [],
+                        "required_test_paths": ["gateway-v4/tests/test_router_smart.py"],
+                        "acceptance_criteria": ["n/a"],
+                        "reason_each_path_is_needed": {
+                            "gateway-v4/app/services/router.py": "Existing router service under test.",
+                            "gateway-v4/tests/__init__.py": "Package marker for new tests.",
+                            "gateway-v4/tests/test_router_smart.py": "Smart routing test file.",
+                        },
+                        "risk_level": "low",
+                        "estimated_effort": "S",
+                    }
+                ]
+            ),
+        },
+    )
+
+    negative_diagnostics = negative._validate_implementation_planner_output()
+
+    assert negative_diagnostics["valid"] is False
+    assert any(
+        "gateway-v4/tests/__init__.py" in item and "allowed_path_not_declared" in item
+        for item in negative_diagnostics["invalid_paths"]
+    )
 
 
 def test_planner_new_directory_and_file_passes(tmp_path: Path) -> None:
@@ -1354,6 +1603,84 @@ def test_planner_rejection_prints_reasons_and_feedback_contains_block(tmp_path: 
     assert "generic_root_dirs_rejected" in feedback_text
 
 
+def test_feedback_path_is_project_and_run_scoped_with_metadata(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True, exist_ok=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    orchestrator._implementation_attempt = 2
+
+    feedback_file = orchestrator._save_feedback(1, "implementation-planner", "Planner feedback body")
+
+    assert feedback_file == (
+        engine_root
+        / ".openclaw"
+        / "feedback"
+        / orchestrator.project_id
+        / orchestrator.logger.run_dir.name
+        / "attempt_2"
+        / "implementation-planner.md"
+    )
+    feedback_text = feedback_file.read_text(encoding="utf-8")
+    assert "project_id:" in feedback_text
+    assert f"project_id: {orchestrator.project_id}" in feedback_text
+    assert f"run_id: {orchestrator.logger.run_dir.name}" in feedback_text
+    assert "attempt: 2" in feedback_text
+    assert "phase: implementation" in feedback_text
+    assert "agent: implementation-planner" in feedback_text
+    assert f"target_workspace: {orchestrator.target_workspace}" in feedback_text
+    assert f"repo_map_target_workspace: {orchestrator.target_workspace}" in feedback_text
+    latest_file = engine_root / ".openclaw" / "feedback" / orchestrator.project_id / "latest" / "implementation-planner.md"
+    assert latest_file.exists()
+    assert latest_file.read_text(encoding="utf-8") == feedback_text
+
+
+def test_feedback_does_not_overwrite_between_projects_or_attempts(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    first_workspace = tmp_path / "first-target"
+    second_workspace = tmp_path / "second-target"
+    first_workspace.mkdir(parents=True, exist_ok=True)
+    second_workspace.mkdir(parents=True, exist_ok=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    first = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(first_workspace), project_id="project-one")
+    second = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(second_workspace), project_id="project-two")
+    first._implementation_attempt = 1
+    second._implementation_attempt = 2
+
+    first_feedback = first._save_feedback(1, "implementation-planner", "First project")
+    second_feedback = second._save_feedback(1, "implementation-planner", "Second project")
+
+    assert "project-one" in first_feedback.as_posix()
+    assert "project-two" in second_feedback.as_posix()
+    assert "attempt_1" in first_feedback.as_posix()
+    assert "attempt_2" in second_feedback.as_posix()
+    assert first_feedback.read_text(encoding="utf-8") != second_feedback.read_text(encoding="utf-8")
+
+
+def test_feedback_does_not_overwrite_between_attempts_for_same_project(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True, exist_ok=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace), project_id="same-project")
+    orchestrator._implementation_attempt = 1
+    first_feedback = orchestrator._save_feedback(1, "implementation-planner", "Attempt one")
+    orchestrator._implementation_attempt = 2
+    second_feedback = orchestrator._save_feedback(1, "implementation-planner", "Attempt two")
+
+    assert first_feedback != second_feedback
+    assert first_feedback.exists()
+    assert second_feedback.exists()
+    assert "attempt_1" in first_feedback.as_posix()
+    assert "attempt_2" in second_feedback.as_posix()
+    latest_file = engine_root / ".openclaw" / "feedback" / "same-project" / "latest" / "implementation-planner.md"
+    assert "Attempt two" in latest_file.read_text(encoding="utf-8")
+
+
 def test_fenced_yaml_with_russian_translation_parses_correctly(tmp_path: Path) -> None:
     engine_root = tmp_path / "engine"
     target_workspace = tmp_path / "target"
@@ -1562,6 +1889,56 @@ def test_wrong_repo_map_target_workspace_fails_clearly(tmp_path: Path) -> None:
 
     assert diagnostics["valid"] is False
     assert diagnostics["parse_error"] == "repo_map_target_workspace_mismatch"
+    assert any("repo_map_path=" in item for item in diagnostics["schema_errors"])
+
+
+def test_repo_map_target_mismatch_blocks_implementation_planner_before_run(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True, exist_ok=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    orchestrator.repo_map_path.parent.mkdir(parents=True, exist_ok=True)
+    orchestrator.repo_map_path.write_text(
+        json.dumps({"target_workspace": str(tmp_path / "other"), "top_level_tree": [], "directories": [], "files": []}),
+        encoding="utf-8",
+    )
+    orchestrator._repo_map_cache = None
+    orchestrator._wait_for_user = lambda _prompt: True
+    calls: list[str] = []
+    orchestrator._run_agent = lambda agent, phase, index=None, total=None: calls.append(agent["name"]) or True
+
+    ok = orchestrator._run_phase_agents({"agents": [{"name": "implementation-planner"}]}, "implementation")
+
+    assert ok is False
+    assert calls == []
+    assert orchestrator._phase_failure_status == "repo_map_target_workspace_mismatch"
+
+
+def test_repo_map_target_mismatch_blocks_developer_before_run(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True, exist_ok=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    orchestrator.repo_map_path.parent.mkdir(parents=True, exist_ok=True)
+    orchestrator.repo_map_path.write_text(
+        json.dumps({"target_workspace": str(tmp_path / "other"), "top_level_tree": [], "directories": [], "files": []}),
+        encoding="utf-8",
+    )
+    orchestrator._repo_map_cache = None
+    orchestrator._wait_for_user = lambda _prompt: True
+    orchestrator._prepare_implementation_backlog_selection = lambda require_backlog=True: {"error": "", "item": None}
+    calls: list[str] = []
+    orchestrator._run_agent = lambda agent, phase, index=None, total=None: calls.append(agent["name"]) or True
+
+    ok = orchestrator._run_phase_agents({"agents": [{"name": "developer"}]}, "implementation")
+
+    assert ok is False
+    assert calls == []
+    assert orchestrator._phase_failure_status == "repo_map_target_workspace_mismatch"
 
 
 def test_later_task_may_use_file_created_earlier(tmp_path: Path) -> None:
@@ -2196,6 +2573,133 @@ def test_rerun_architect_option_still_works(tmp_path: Path, monkeypatch) -> None
 
     assert ok is True
     assert calls == ["architect", "implementation-planner", "implementation-planner", "architect", "implementation-planner"]
+
+
+def test_retry_prompt_includes_previous_feedback_block(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (target_workspace / "workflow").mkdir(parents=True, exist_ok=True)
+    (target_workspace / "workflow" / "orchestrator.py").write_text("pass\n", encoding="utf-8")
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    orchestrator._implementation_attempt = 1
+    orchestrator._planner_rejection_reason = "\n".join(
+        [
+            "Implementation planner rejection reasons:",
+            "- invalid_paths: planner-task:workflow/orchestrator.py:allowed_path_not_declared",
+            "- missing_tests: planner-task:missing_required_test_paths",
+        ]
+    )
+    orchestrator._planner_invalid_paths = ["planner-task:workflow/orchestrator.py:allowed_path_not_declared"]
+    orchestrator._planner_missing_tests = ["planner-task:missing_required_test_paths"]
+    orchestrator._capture_planner_rejection_feedback()
+
+    prompt = orchestrator._build_implementation_planner_retry_prompt({"name": "implementation-planner", "description": "Convert plan to backlog"})
+
+    assert "Previous validation feedback to repair" in prompt
+    assert "allowed_path_not_declared" in prompt
+    assert "missing_required_test_paths" in prompt
+    assert "Do not repeat invalid allowed_paths." in prompt
+    assert "Every backend task must include required_test_paths." in prompt
+    assert "Every allowed_path must be explicitly declared in existing_paths, new_files, or new_directories." in prompt
+    assert "If adding gateway-v4/tests/__init__.py and it does not already exist, declare it in new_files and include it in allowed_paths." in prompt
+    assert "Return only corrected YAML/JSON." in prompt
+    assert orchestrator._planner_feedback_source.endswith("implementation-planner.md")
+    assert orchestrator._planner_feedback_chars > 0
+
+
+def test_retry_prompt_warns_when_feedback_file_missing(tmp_path: Path, monkeypatch) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (target_workspace / "workflow").mkdir(parents=True, exist_ok=True)
+    (target_workspace / "workflow" / "orchestrator.py").write_text("pass\n", encoding="utf-8")
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    warnings: list[str] = []
+    monkeypatch.setattr(orchestrator.logger, "warning", warnings.append)
+    orchestrator._planner_feedback_file = str(engine_root / "missing-feedback.md")
+
+    prompt = orchestrator._build_implementation_planner_retry_prompt({"name": "implementation-planner", "description": "Convert plan to backlog"})
+
+    assert "Previous validation feedback to repair" in prompt
+    assert "No previous validation feedback file was available for this retry." in prompt
+    assert any("Planner feedback file is missing" in warning for warning in warnings)
+
+
+def test_retry_injects_feedback_without_rerunning_architect_and_keeps_scope(tmp_path: Path, monkeypatch) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (target_workspace / "workflow").mkdir(parents=True, exist_ok=True)
+    (target_workspace / "workflow" / "orchestrator.py").write_text("pass\n", encoding="utf-8")
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+        task_scope="Scoped backend-only retry task.",
+    )
+    orchestrator.config["workflow"]["mode"] = "interactive"
+    monkeypatch.setattr(orchestrator, "_wait_for_user", lambda _prompt: True)
+    answers = iter(["r"])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
+    captured_retry_descriptions: list[str] = []
+    calls: list[str] = []
+    planner_calls = {"count": 0}
+
+    def fake_run_agent(agent_config, phase_key, index=None, total=None):
+        calls.append(agent_config["name"])
+        if agent_config["name"] == "architect":
+            orchestrator.logger.save_agent_report("implementation", "architect", {"status": "success", "result": "completed", "parsed_output": "Architect output"})
+            return True
+        if agent_config["name"] == "implementation-planner":
+            planner_calls["count"] += 1
+            if planner_calls["count"] >= 2:
+                captured_retry_descriptions.append(str(agent_config.get("description") or ""))
+            orchestrator.logger.save_agent_report(
+                "implementation",
+                "implementation-planner",
+                {
+                    "status": "success",
+                    "result": "completed",
+                    "parsed_output": json.dumps(
+                        [
+                            {
+                                "id": "planner-task",
+                                "title": "Planner task",
+                                "priority": "P0",
+                                "scope": "Improve backend validation.",
+                                "existing_paths": ["workflow/orchestrator.py"] if planner_calls["count"] >= 3 else [],
+                                "allowed_paths": ["workflow/orchestrator.py"] if planner_calls["count"] >= 3 else ["workflow/orchestrator.py"],
+                                "new_files": [],
+                                "forbidden_paths": [],
+                                "required_test_paths": ["tests/test_workflow.py"] if planner_calls["count"] >= 3 else [],
+                                "acceptance_criteria": ["done"],
+                                "reason_each_path_is_needed": {"workflow/orchestrator.py": "Needed."},
+                                "risk_level": "low",
+                                "estimated_effort": "S",
+                            }
+                        ]
+                    ),
+                },
+            )
+        return True
+
+    monkeypatch.setattr(orchestrator, "_run_agent", fake_run_agent)
+
+    ok = orchestrator._run_phase_agents({"agents": [{"name": "architect"}, {"name": "implementation-planner"}]}, "implementation")
+
+    assert ok is True
+    assert calls == ["architect", "implementation-planner", "implementation-planner", "implementation-planner"]
+    assert captured_retry_descriptions
+    retry_prompt = captured_retry_descriptions[0]
+    assert "Previous validation feedback to repair" in retry_prompt
+    assert "missing_required_test_paths" in retry_prompt
+    assert "allowed_path_not_declared" in retry_prompt
+    assert "Scoped backend-only retry task." not in retry_prompt
+    assert orchestrator._select_implementation_scope([]) == "Scoped backend-only retry task."
 
 
 def test_backend_task_without_tests_fails(tmp_path: Path) -> None:

@@ -7,6 +7,7 @@ import re
 import subprocess
 import time
 import traceback
+from datetime import datetime
 from fnmatch import fnmatch
 from queue import Empty, Queue
 from pathlib import Path
@@ -109,6 +110,9 @@ class WorkflowOrchestrator:
         self._planner_dependency_validation_errors: list[str] = []
         self._planner_rejection_reason = ""
         self._planner_feedback_file = ""
+        self._planner_feedback_payload: dict[str, Any] = {}
+        self._planner_feedback_source = ""
+        self._planner_feedback_chars = 0
         self._planner_parse_error = ""
         self._planner_schema_errors: list[str] = []
         self._planner_raw_output_excerpt = ""
@@ -118,6 +122,7 @@ class WorkflowOrchestrator:
         self._architect_output_source = ""
         self._planner_retry_count = 0
         self._planner_retry_reason = ""
+        self._implementation_attempt = 0
         self._repo_map_cache: dict[str, Any] | None = None
         self._repo_map_before: dict[str, Any] | None = None
         self._repo_map_after: dict[str, Any] | None = None
@@ -201,6 +206,9 @@ class WorkflowOrchestrator:
         self._planner_dependency_validation_errors = []
         self._planner_rejection_reason = ""
         self._planner_feedback_file = ""
+        self._planner_feedback_payload = {}
+        self._planner_feedback_source = ""
+        self._planner_feedback_chars = 0
         self._planner_parse_error = ""
         self._planner_schema_errors = []
         self._planner_raw_output_excerpt = ""
@@ -210,6 +218,7 @@ class WorkflowOrchestrator:
         self._architect_output_source = ""
         self._planner_retry_count = 0
         self._planner_retry_reason = ""
+        self._implementation_attempt = 0
         self.logger.phase_start(phase["name"])
         research_reports, _run_dir = self._load_latest_project_research_reports()
         if not research_reports:
@@ -241,6 +250,7 @@ class WorkflowOrchestrator:
             3,
         )
         for attempt in range(1, max_retries + 1):
+            self._implementation_attempt = attempt
             self.logger.info(f"Попытка реализации {attempt}/{max_retries}")
             ok = self._run_phase_agents(phase, "implementation")
             if not ok and self._phase_failure_status in {"scope_violation", "no_changes", "planner_invalid"}:
@@ -291,6 +301,10 @@ class WorkflowOrchestrator:
             if not self._wait_for_user(f"Запустить агента {agent['name']} ({index}/{total})?"):
                 self.logger.warning(f"Агент пропущен: {agent['name']}")
                 continue
+            if phase_key == "implementation" and agent["name"] in {"implementation-planner", "developer"}:
+                if not self._ensure_repo_map_workspace_consistency(agent["name"]):
+                    had_failures = True
+                    return False
             if phase_key == "implementation" and agent["name"] == "developer":
                 selection = self._prepare_implementation_backlog_selection(require_backlog=True)
                 if selection["error"]:
@@ -420,6 +434,8 @@ class WorkflowOrchestrator:
         self.logger.agent_progress(agent_name, f"Diagnostic planner_dependency_validation_errors={message_bundle['planner_dependency_validation_errors']}")
         self.logger.agent_progress(agent_name, f"Diagnostic planner_rejection_reason={message_bundle['planner_rejection_reason']}")
         self.logger.agent_progress(agent_name, f"Diagnostic planner_feedback_file={message_bundle['planner_feedback_file']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic planner_feedback_source={message_bundle['planner_feedback_source']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic planner_feedback_chars={message_bundle['planner_feedback_chars']}")
         self.logger.agent_progress(agent_name, f"Diagnostic planner_parse_error={message_bundle['planner_parse_error']}")
         self.logger.agent_progress(agent_name, f"Diagnostic planner_schema_errors={message_bundle['planner_schema_errors']}")
         self.logger.agent_progress(agent_name, f"Diagnostic planner_validation_stage={message_bundle['planner_validation_stage']}")
@@ -487,6 +503,8 @@ class WorkflowOrchestrator:
                     "planner_dependency_validation_errors": message_bundle["planner_dependency_validation_errors"],
                     "planner_rejection_reason": message_bundle["planner_rejection_reason"],
                     "planner_feedback_file": message_bundle["planner_feedback_file"],
+                    "planner_feedback_source": message_bundle["planner_feedback_source"],
+                    "planner_feedback_chars": message_bundle["planner_feedback_chars"],
                     "planner_parse_error": message_bundle["planner_parse_error"],
                     "planner_schema_errors": message_bundle["planner_schema_errors"],
                     "planner_raw_output_excerpt": message_bundle["planner_raw_output_excerpt"],
@@ -1164,6 +1182,8 @@ class WorkflowOrchestrator:
         planner_dependency_validation_errors: list[str] = []
         planner_rejection_reason = ""
         planner_feedback_file = ""
+        planner_feedback_source = ""
+        planner_feedback_chars = 0
         planner_parse_error = ""
         planner_schema_errors: list[str] = []
         planner_raw_output_excerpt = ""
@@ -1209,6 +1229,8 @@ class WorkflowOrchestrator:
             planner_dependency_validation_errors = implementation_context["planner_dependency_validation_errors"]
             planner_rejection_reason = implementation_context["planner_rejection_reason"]
             planner_feedback_file = implementation_context["planner_feedback_file"]
+            planner_feedback_source = implementation_context["planner_feedback_source"]
+            planner_feedback_chars = implementation_context["planner_feedback_chars"]
             planner_parse_error = implementation_context["planner_parse_error"]
             planner_schema_errors = implementation_context["planner_schema_errors"]
             planner_raw_output_excerpt = implementation_context["planner_raw_output_excerpt"]
@@ -1287,6 +1309,8 @@ class WorkflowOrchestrator:
             "planner_dependency_validation_errors": planner_dependency_validation_errors if phase == "implementation" else [],
             "planner_rejection_reason": planner_rejection_reason if phase == "implementation" else "",
             "planner_feedback_file": planner_feedback_file if phase == "implementation" else "",
+            "planner_feedback_source": planner_feedback_source if phase == "implementation" else "",
+            "planner_feedback_chars": planner_feedback_chars if phase == "implementation" else 0,
             "planner_parse_error": planner_parse_error if phase == "implementation" else "",
             "planner_schema_errors": planner_schema_errors if phase == "implementation" else [],
             "planner_raw_output_excerpt": planner_raw_output_excerpt if phase == "implementation" else "",
@@ -2688,6 +2712,20 @@ class WorkflowOrchestrator:
             "allowed_paths_matched": sorted(set(allowed_paths_matched)),
         }
 
+    def _build_selected_task_planned_edit_paths(self) -> list[str]:
+        selected_item = self._selected_implementation_item or {}
+        candidates = [
+            *list(selected_item.get("allowed_paths") or []),
+            *list(selected_item.get("new_files") or []),
+            *list(selected_item.get("existing_paths") or []),
+        ]
+        normalized: list[str] = []
+        for path in candidates:
+            value = self._normalize_repo_relative_path(path)
+            if value:
+                normalized.append(value)
+        return sorted(set(normalized))
+
     def _enforce_implementation_scope_plan(self) -> bool:
         planner_report = self._load_saved_agent_report("implementation", "implementation-planner")
         if not planner_report or not self._selected_implementation_item:
@@ -2697,6 +2735,9 @@ class WorkflowOrchestrator:
                 "diff_lines_count": 0,
                 "forbidden_hits": ["missing_implementation_planner_output"],
                 "allowed_paths_matched": [],
+                "selected_task_forbidden_paths": [],
+                "planned_edit_paths": [],
+                "forbidden_hits_source": "precheck",
             }
             return self._handle_scope_violation(
                 "developer",
@@ -2704,22 +2745,22 @@ class WorkflowOrchestrator:
                 diagnostics,
             )
 
-        planned_files = list(self._selected_implementation_item.get("allowed_paths") or [])
+        planned_files = self._build_selected_task_planned_edit_paths()
         path_check = self._evaluate_scope_paths(planned_files)
-        forbidden_paths = [
-            path
-            for path in (self._selected_implementation_item.get("forbidden_paths") or [])
-            if self._path_matches_any(path, self.implementation_scope_policy["forbidden_paths"])
-        ]
         forbidden_hits = list(path_check["forbidden_hits"])
-        if forbidden_paths:
-            forbidden_hits.extend(f"forbidden_path:{path}" for path in forbidden_paths)
         diagnostics = {
-            "scope_policy_result": "allowed" if path_check["allowed"] and not forbidden_paths else "blocked",
+            "scope_policy_result": "allowed" if path_check["allowed"] else "blocked",
             "changed_files_count": len(planned_files),
             "diff_lines_count": 0,
             "forbidden_hits": forbidden_hits,
             "allowed_paths_matched": path_check["allowed_paths_matched"],
+            "selected_task_forbidden_paths": [
+                self._normalize_repo_relative_path(path)
+                for path in (self._selected_implementation_item.get("forbidden_paths") or [])
+                if self._normalize_repo_relative_path(path)
+            ],
+            "planned_edit_paths": planned_files,
+            "forbidden_hits_source": "precheck",
         }
         self._set_agent_report_extras("implementation", "implementation-planner", diagnostics)
         self.logger.agent_progress("implementation-planner", f"Diagnostic scope_policy_result={diagnostics['scope_policy_result']}")
@@ -2727,16 +2768,19 @@ class WorkflowOrchestrator:
         self.logger.agent_progress("implementation-planner", f"Diagnostic diff_lines_count={diagnostics['diff_lines_count']}")
         self.logger.agent_progress("implementation-planner", f"Diagnostic forbidden_hits={diagnostics['forbidden_hits']}")
         self.logger.agent_progress("implementation-planner", f"Diagnostic allowed_paths_matched={diagnostics['allowed_paths_matched']}")
+        self.logger.agent_progress("implementation-planner", f"Diagnostic selected_task_forbidden_paths={diagnostics['selected_task_forbidden_paths']}")
+        self.logger.agent_progress("implementation-planner", f"Diagnostic planned_edit_paths={diagnostics['planned_edit_paths']}")
+        self.logger.agent_progress("implementation-planner", f"Diagnostic forbidden_hits_source={diagnostics['forbidden_hits_source']}")
         existing_planner = self._load_saved_agent_report("implementation", "implementation-planner")
         if existing_planner:
             self._overwrite_agent_report("implementation", "implementation-planner", {**existing_planner, **diagnostics})
-        if path_check["allowed"] and not forbidden_paths:
+        if path_check["allowed"]:
             self._set_agent_report_extras("implementation", "developer", diagnostics)
             return True
         return self._handle_scope_violation(
             "developer",
             "Implementation planner selected task is outside the allowed implementation scope: "
-            + ", ".join(path_check["violations"] + forbidden_paths),
+            + ", ".join(path_check["violations"]),
             diagnostics,
             warning_only=self.allow_scope_expansion,
         )
@@ -2821,6 +2865,13 @@ class WorkflowOrchestrator:
             "forbidden_hits": forbidden_hits,
             "allowed_paths_matched": path_check["allowed_paths_matched"],
             "scope_policy_result": "allowed" if allowed else "blocked",
+            "selected_task_forbidden_paths": [
+                self._normalize_repo_relative_path(path)
+                for path in ((self._selected_implementation_item or {}).get("forbidden_paths") or [])
+                if self._normalize_repo_relative_path(path)
+            ],
+            "planned_edit_paths": self._build_selected_task_planned_edit_paths(),
+            "forbidden_hits_source": "diff" if forbidden_hits else "",
         }
 
     def _mark_developer_no_changes(self, reason: str) -> bool:
@@ -2975,6 +3026,8 @@ class WorkflowOrchestrator:
             "planner_dependency_validation_errors": list(self._planner_dependency_validation_errors),
             "planner_rejection_reason": self._planner_rejection_reason,
             "planner_feedback_file": self._planner_feedback_file,
+            "planner_feedback_source": self._planner_feedback_source,
+            "planner_feedback_chars": self._planner_feedback_chars,
             "planner_parse_error": self._planner_parse_error,
             "planner_schema_errors": list(self._planner_schema_errors),
             "planner_raw_output_excerpt": self._planner_raw_output_excerpt,
@@ -3308,19 +3361,35 @@ class WorkflowOrchestrator:
     def _build_implementation_planner_retry_prompt(self, agent_config: dict[str, Any]) -> str:
         repo_map = self._load_repo_map()
         available_directories = ", ".join((repo_map.get("directories") or [])[:40]) or "."
-        feedback_text = ""
-        if self._planner_feedback_file and Path(self._planner_feedback_file).exists():
-            try:
-                feedback_text = Path(self._planner_feedback_file).read_text(encoding="utf-8")[:1200]
-            except Exception:
-                feedback_text = ""
+        feedback_text, feedback_path = self._load_planner_feedback_for_retry()
+        if feedback_text:
+            self.logger.info(f"Injecting planner feedback from {feedback_path}")
+        else:
+            self.logger.warning("Planner feedback file is missing; retrying implementation-planner without injected feedback.")
+        self.logger.info(f"planner_retry_count={self._planner_retry_count}")
+        instruction_block = "\n".join(
+            [
+                "Previous validation feedback to repair",
+                feedback_text or "No previous validation feedback file was available for this retry.",
+                "",
+                "Repair requirements",
+                "- The planner must fix all listed validation errors.",
+                "- Do not repeat invalid allowed_paths.",
+                "- Every backend task must include required_test_paths.",
+                "- Every allowed_path must be explicitly declared in existing_paths, new_files, or new_directories.",
+                "- Do not place a file in allowed_paths unless that same file is also present in existing_paths or new_files.",
+                "- If a required test file lives under a new directory such as gateway-v4/tests, declare that directory in new_directories.",
+                "- If adding gateway-v4/tests/__init__.py and it does not already exist, declare it in new_files and include it in allowed_paths.",
+                "- Return only corrected YAML/JSON.",
+            ]
+        )
         return (
             str(agent_config.get("description") or "").strip()
             + " Retry round: reuse the last successful architect output. "
             + "Previous rejection reasons: "
             + (self._planner_rejection_reason or "none")
-            + ". Previous feedback: "
-            + (feedback_text or "none")
+            + ". "
+            + instruction_block
             + ". Invalid paths: "
             + ", ".join(self._planner_invalid_paths[:20] or ["none"])
             + ". Missing parent directories: "
@@ -3336,6 +3405,44 @@ class WorkflowOrchestrator:
             + ". Return corrected YAML/JSON using only paths from repo_map unless declaring a new file under an existing directory."
         ).strip()
 
+    def _planner_feedback_path_for_current_attempt(self) -> Path:
+        feedback_root = self._engine_path(self.config.get("paths", {}).get("feedback_dir", ".openclaw/feedback"))
+        run_id = self.logger.run_dir.name
+        attempt = self._implementation_attempt if self._implementation_attempt > 0 else 1
+        return feedback_root / self.project_id / run_id / f"attempt_{attempt}" / "implementation-planner.md"
+
+    @staticmethod
+    def _extract_planner_feedback_rejection_block(feedback_text: str) -> str:
+        text = str(feedback_text or "").strip()
+        if not text:
+            return ""
+        fence_match = re.search(r"Implementation planner rejection reasons\s*```text\s*(.*?)\s*```", text, re.DOTALL)
+        if fence_match:
+            return fence_match.group(1).strip()
+        return text[:2000].strip()
+
+    def _load_planner_feedback_for_retry(self) -> tuple[str, str]:
+        candidates: list[Path] = []
+        current_attempt_path = self._planner_feedback_path_for_current_attempt()
+        candidates.append(current_attempt_path)
+        if self._planner_feedback_file:
+            candidates.append(Path(self._planner_feedback_file))
+        latest_path = self._engine_path(self.config.get("paths", {}).get("feedback_dir", ".openclaw/feedback")) / self.project_id / "latest" / "implementation-planner.md"
+        candidates.append(latest_path)
+        for candidate in candidates:
+            try:
+                if candidate.exists():
+                    raw = candidate.read_text(encoding="utf-8")
+                    extracted = self._extract_planner_feedback_rejection_block(raw)
+                    self._planner_feedback_source = str(candidate)
+                    self._planner_feedback_chars = len(extracted)
+                    return extracted, str(candidate)
+            except Exception:
+                continue
+        self._planner_feedback_source = ""
+        self._planner_feedback_chars = 0
+        return "", ""
+
     def _retry_implementation_planner(
         self,
         agent_config: dict[str, Any],
@@ -3349,6 +3456,8 @@ class WorkflowOrchestrator:
             return False
         self._planner_retry_count += 1
         self._planner_retry_reason = retry_reason
+        if retry_reason != "rerun_architect":
+            self.logger.info("Reusing architect output")
         retry_agent_config = dict(agent_config)
         retry_agent_config["description"] = self._build_implementation_planner_retry_prompt(agent_config)
         self._set_agent_report_extras(
@@ -3359,6 +3468,8 @@ class WorkflowOrchestrator:
                 "architect_output_source": self._architect_output_source,
                 "planner_retry_count": self._planner_retry_count,
                 "planner_retry_reason": self._planner_retry_reason,
+                "planner_feedback_source": self._planner_feedback_source,
+                "planner_feedback_chars": self._planner_feedback_chars,
             },
         )
         return self._run_agent(retry_agent_config, phase_key, index=index, total=total)
@@ -3367,12 +3478,15 @@ class WorkflowOrchestrator:
         repo_map = self._load_repo_map()
         rejection_payload = self._build_planner_rejection_payload(repo_map)
         self._planner_rejection_reason = self._format_planner_rejection_block(rejection_payload)
+        self._planner_feedback_payload = dict(rejection_payload)
         feedback_file = self._save_feedback(
             self.task_counter or 0,
             "implementation-planner",
             "\n\n".join(["Implementation planner rejection reasons", "```text", self._planner_rejection_reason, "```"]),
         )
         self._planner_feedback_file = str(feedback_file)
+        self._planner_feedback_source = str(feedback_file)
+        self._planner_feedback_chars = len(self._planner_rejection_reason)
 
     def _validate_or_repair_implementation_planner(
         self,
@@ -3386,6 +3500,7 @@ class WorkflowOrchestrator:
         if diagnostics["valid"]:
             return True
         self._planner_repair_attempted = True
+        self._capture_planner_rejection_feedback()
         if self._retry_implementation_planner(agent_config, phase_key, index=index, total=total, retry_reason="initial_repair_round"):
             diagnostics = self._validate_implementation_planner_output()
             if diagnostics["valid"]:
@@ -3439,6 +3554,8 @@ class WorkflowOrchestrator:
                 "planner_future_known_paths": dict(self._planner_future_known_paths),
                 "planner_dependency_validation_errors": list(self._planner_dependency_validation_errors),
                 "planner_feedback_file": self._planner_feedback_file,
+                "planner_feedback_source": self._planner_feedback_source,
+                "planner_feedback_chars": self._planner_feedback_chars,
                 "reused_architect_output": self._reused_architect_output,
                 "architect_output_source": self._architect_output_source,
                 "planner_retry_count": self._planner_retry_count,
@@ -3629,6 +3746,8 @@ class WorkflowOrchestrator:
                 invalid.append(detail)
                 missing_tests.append(detail)
         for path in allowed_paths:
+            if path not in existing_paths and path not in new_files and path not in new_directories:
+                invalid.append(f"{item.get('id', 'task')}:{path}:allowed_path_not_declared")
             if not str(reasons.get(path) or "").strip():
                 invalid.append(f"{item.get('id', 'task')}:{path}:missing_path_reason")
         return invalid, missing_directories, missing_tests, conflicting_forbidden_paths, generic_root_dirs_rejected
@@ -3984,8 +4103,6 @@ class WorkflowOrchestrator:
             }
         else:
             reason_each_path_is_needed = {}
-        if not existing_paths and allowed_paths and not new_files:
-            existing_paths = list(allowed_paths)
         if not reason_each_path_is_needed:
             reason_each_path_is_needed = {path: "Planner selected this path for the scoped task." for path in allowed_paths}
         return {
@@ -4238,6 +4355,7 @@ class WorkflowOrchestrator:
         target_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         self._reused_architect_output = True
         self._architect_output_source = source_path
+        self.logger.info(f"Reusing architect output from {source_path}")
         self._set_agent_report_extras(
             "implementation",
             "implementation-planner",
@@ -4255,6 +4373,7 @@ class WorkflowOrchestrator:
             self._planner_schema_errors = [
                 f"repo_map_target_workspace={repo_map_target}",
                 f"runtime_target_workspace={self.target_workspace}",
+                f"repo_map_path={self.repo_map_path}",
             ]
             return False
         if self.target_workspace.name.lower() == "myai":
@@ -4289,16 +4408,50 @@ class WorkflowOrchestrator:
             return backlog[0]
         print(self._format_implementation_backlog(backlog, self._implementation_backlog_source or "research"))
         while True:
-            answer = input("Choose implementation task number: ").strip()
+            answer = input(self._console_text("choose_task_number")).strip()
             if answer.isdigit():
                 index = int(answer) - 1
                 if 0 <= index < len(backlog):
                     return backlog[index]
-            print("Invalid task number.")
+            print(self._console_text("invalid_task_number"))
 
-    @staticmethod
-    def _format_implementation_backlog(backlog: list[dict[str, Any]], backlog_source: str) -> str:
-        lines = [f"Implementation backlog (source={backlog_source or 'research'})"]
+    def _console_language(self) -> str:
+        return str(self.config.get("workflow", {}).get("console_language", "ru") or "ru").strip().lower()
+
+    def _console_text(self, key: str) -> str:
+        ru = {
+            "backlog_title": "Бэклог реализации",
+            "source": "источник",
+            "existing_files": "существующие файлы",
+            "new_directories": "новые директории",
+            "new_files": "новые файлы",
+            "allowed_paths": "разрешённые пути",
+            "required_tests": "обязательные тесты",
+            "acceptance": "критерии приемки",
+            "risk": "риск",
+            "effort": "оценка трудозатрат",
+            "choose_task_number": "Выберите номер задачи для реализации: ",
+            "invalid_task_number": "Некорректный номер задачи.",
+        }
+        en = {
+            "backlog_title": "Implementation backlog",
+            "source": "source",
+            "existing_files": "existing files",
+            "new_directories": "new directories",
+            "new_files": "new files",
+            "allowed_paths": "allowed paths",
+            "required_tests": "required tests",
+            "acceptance": "acceptance",
+            "risk": "risk",
+            "effort": "effort",
+            "choose_task_number": "Choose implementation task number: ",
+            "invalid_task_number": "Invalid task number.",
+        }
+        catalog = en if self._console_language() == "en" else ru
+        return catalog.get(key, key)
+
+    def _format_implementation_backlog(self, backlog: list[dict[str, Any]], backlog_source: str) -> str:
+        lines = [f"{self._console_text('backlog_title')} ({self._console_text('source')}={backlog_source or 'research'})"]
         for index, item in enumerate(backlog, start=1):
             files = ", ".join(item.get("allowed_paths") or []) or "policy default"
             existing_files = ", ".join(item.get("existing_paths") or []) or "none"
@@ -4312,14 +4465,14 @@ class WorkflowOrchestrator:
                     f"   id: {item['id']}",
                     f"   priority: {item['priority']}",
                     f"   scope: {item['scope']}",
-                    f"   existing files: {existing_files}",
-                    f"   new directories: {new_directories}",
-                    f"   new files: {new_files}",
-                    f"   allowed paths: {files}",
-                    f"   required tests: {required_tests}",
-                    f"   acceptance: {acceptance}",
-                    f"   risk: {item['risk_level']}",
-                    f"   effort: {item['estimated_effort']}",
+                    f"   {self._console_text('existing_files')}: {existing_files}",
+                    f"   {self._console_text('new_directories')}: {new_directories}",
+                    f"   {self._console_text('new_files')}: {new_files}",
+                    f"   {self._console_text('allowed_paths')}: {files}",
+                    f"   {self._console_text('required_tests')}: {required_tests}",
+                    f"   {self._console_text('acceptance')}: {acceptance}",
+                    f"   {self._console_text('risk')}: {item['risk_level']}",
+                    f"   {self._console_text('effort')}: {item['estimated_effort']}",
                 ]
             )
         return "\n".join(lines)
@@ -4409,6 +4562,70 @@ class WorkflowOrchestrator:
                 "agent_relevant_files": [],
             }
         return self._repo_map_cache
+
+    def _save_feedback(self, task_id: int, agent: str, feedback: str) -> Path:
+        feedback_root = self._engine_path(self.config.get("paths", {}).get("feedback_dir", ".openclaw/feedback"))
+        repo_map = self._load_repo_map()
+        repo_map_target_workspace = str(repo_map.get("target_workspace") or "").strip() or str(self.target_workspace)
+        run_id = self.logger.run_dir.name
+        attempt = self._implementation_attempt if self._implementation_attempt > 0 else max(int(task_id or 0), 1)
+        run_feedback_dir = feedback_root / self.project_id / run_id / f"attempt_{attempt}"
+        run_feedback_dir.mkdir(parents=True, exist_ok=True)
+        latest_dir = feedback_root / self.project_id / "latest"
+        latest_dir.mkdir(parents=True, exist_ok=True)
+        feedback_file = run_feedback_dir / f"{agent}.md"
+        latest_file = latest_dir / f"{agent}.md"
+        content = "\n".join(
+            [
+                "---",
+                f"project_id: {self.project_id}",
+                f"run_id: {run_id}",
+                f"attempt: {attempt}",
+                "phase: implementation",
+                f"agent: {agent}",
+                f"target_workspace: {self.target_workspace}",
+                f"repo_map_target_workspace: {repo_map_target_workspace}",
+                f"context_mode: {self.context_mode}",
+                f"created_at: {datetime.now().isoformat()}",
+                "---",
+                "",
+                f"# Feedback from {agent}",
+                "",
+                feedback,
+                "",
+            ]
+        )
+        feedback_file.write_text(content, encoding="utf-8")
+        latest_file.write_text(content, encoding="utf-8")
+        self.logger.info(f"Diagnostic run_feedback_dir={run_feedback_dir}")
+        self.logger.info(f"Diagnostic feedback_file={feedback_file}")
+        self.logger.info(f"Р¤Р°Р№Р» РѕР±СЂР°С‚РЅРѕР№ СЃРІСЏР·Рё СЃРѕС…СЂР°РЅРµРЅ: {feedback_file}")
+        return feedback_file
+
+    def _ensure_repo_map_workspace_consistency(self, agent_name: str) -> bool:
+        repo_map = self._load_repo_map()
+        repo_map_target = str(repo_map.get("target_workspace") or "").strip()
+        if not repo_map_target:
+            return True
+        resolved_repo_map_target = Path(repo_map_target).resolve()
+        resolved_target_workspace = self.target_workspace.resolve()
+        if resolved_repo_map_target == resolved_target_workspace:
+            return True
+        self._planner_parse_error = "repo_map_target_workspace_mismatch"
+        self._planner_schema_errors = [
+            f"repo_map_target_workspace={resolved_repo_map_target}",
+            f"runtime_target_workspace={resolved_target_workspace}",
+            f"repo_map_path={self.repo_map_path}",
+        ]
+        details = (
+            "Repo map target workspace mismatch\n"
+            f"repo_map_target_workspace={resolved_repo_map_target}\n"
+            f"target_workspace={resolved_target_workspace}\n"
+            f"repo_map_path={self.repo_map_path}"
+        )
+        self.logger.error("Repo map target workspace mismatch", details)
+        self._phase_failure_status = "repo_map_target_workspace_mismatch"
+        return False
 
     def _capture_repo_map_after_developer(self) -> None:
         if not self._refresh_repo_map(snapshot_path=self.repo_map_after_path):
