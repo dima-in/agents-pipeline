@@ -228,6 +228,10 @@ class WorkflowOrchestrator:
             if not self._reuse_architect_output_for_current_run():
                 self.logger.phase_end(phase["name"], "failed")
                 return False
+        if self._should_reuse_planner_for_implementation():
+            if not self._reuse_planner_output_for_current_run():
+                self.logger.phase_end(phase["name"], "failed")
+                return False
         self.task_counter += 1
         task_id = self.task_counter
 
@@ -436,6 +440,10 @@ class WorkflowOrchestrator:
         self.logger.agent_progress(agent_name, f"Diagnostic selected_task_scope={message_bundle['selected_task_scope']}")
         self.logger.agent_progress(agent_name, f"Diagnostic selected_task_allowed_paths={message_bundle['selected_task_allowed_paths']}")
         self.logger.agent_progress(agent_name, f"Diagnostic implementation_retrieval_enabled={message_bundle['implementation_retrieval_enabled']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic contract_completeness={message_bundle['contract_completeness']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic contract_compliance={message_bundle['contract_compliance']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic missing_must_contain={message_bundle['missing_must_contain']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic missing_test_file={message_bundle['missing_test_file']}")
 
         def save_agent_report(
             status: str,
@@ -766,7 +774,19 @@ class WorkflowOrchestrator:
             if self.repo.is_dirty(untracked_files=True):
                 self.repo.git.add(A=True)
                 self.repo.index.commit(f"Auto-commit before {branch_name}")
-            self.repo.git.checkout("-b", branch_name)
+            active_branch = None
+            try:
+                active_branch = self.repo.active_branch.name
+            except (TypeError, AttributeError):
+                active_branch = None
+            existing_branches = {head.name for head in self.repo.heads}
+            if active_branch == branch_name:
+                self.logger.info(f"Git: reuse-branch {branch_name} (already checked out)")
+            elif branch_name in existing_branches:
+                self.logger.info(f"Git: reuse-branch {branch_name}")
+                self.repo.git.checkout(branch_name)
+            else:
+                self.repo.git.checkout("-b", branch_name)
             self.current_branch = branch_name
             return True
         except Exception as exc:  # pragma: no cover
@@ -1176,6 +1196,10 @@ class WorkflowOrchestrator:
         repo_map_path = ""
         repo_map_file_count = 0
         repo_map_directory_count = 0
+        contract_completeness = False
+        contract_compliance = False
+        missing_must_contain: list[str] = []
+        missing_test_file = False
         implementation_retrieval_enabled = False
         implementation_context_chars = 0
         retrieval_enabled = self.runtime.executor == "direct_api" and phase == "research"
@@ -1221,6 +1245,10 @@ class WorkflowOrchestrator:
             repo_map_path = implementation_context["repo_map_path"]
             repo_map_file_count = implementation_context["repo_map_file_count"]
             repo_map_directory_count = implementation_context["repo_map_directory_count"]
+            contract_completeness = implementation_context["contract_completeness"]
+            contract_compliance = implementation_context["contract_compliance"]
+            missing_must_contain = implementation_context["missing_must_contain"]
+            missing_test_file = implementation_context["missing_test_file"]
             implementation_context_chars = implementation_context["context_chars"]
             implementation_retrieval_enabled = self.runtime.executor == "direct_api" and self._is_implementation_retrieval_enabled(agent_name)
             retrieval_enabled = implementation_retrieval_enabled
@@ -1299,6 +1327,10 @@ class WorkflowOrchestrator:
             "repo_map_path": repo_map_path if phase == "implementation" else "",
             "repo_map_file_count": repo_map_file_count if phase == "implementation" else 0,
             "repo_map_directory_count": repo_map_directory_count if phase == "implementation" else 0,
+            "contract_completeness": contract_completeness if phase == "implementation" else False,
+            "contract_compliance": contract_compliance if phase == "implementation" else False,
+            "missing_must_contain": missing_must_contain if phase == "implementation" else [],
+            "missing_test_file": missing_test_file if phase == "implementation" else False,
             "backlog_source": backlog_source,
             "selected_task_id": selected_task_id,
             "research_handoff_sources": handoff_sources,
@@ -1991,7 +2023,9 @@ class WorkflowOrchestrator:
                     'You may also request write operations with '
                     '{"tool":"write_file","path":"gateway-v4/app/services/monitoring.py","content":"..."} '
                     'or {"tool":"apply_patch","path":"gateway-v4/app/services/proxy.py","search":"old","replace":"new"}. '
-                    "Before writing, inspect the target files first. "
+                    "Before writing, inspect the exact target files first. "
+                    "If the selected task contract already provides exact file paths, start with read_file/read_files for those exact paths instead of list_files. "
+                    "Use list_files only when the contract does not already provide the concrete file paths you need. "
                     "Make the smallest viable backend-only change. "
                     "Do not return narrative-only output when a safe edit is required. "
                     "If you cannot safely edit within scope, return normal text with status=no_changes and a clear reason. "
@@ -2049,16 +2083,200 @@ class WorkflowOrchestrator:
     @staticmethod
     def _parse_direct_api_retrieval_request(text: str) -> dict[str, Any] | None:
         stripped = text.strip()
-        if not stripped.startswith("{") or not stripped.endswith("}"):
-            return None
-        try:
-            payload = json.loads(stripped)
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(payload, dict):
-            return None
-        tool = payload.get("tool")
-        return payload if isinstance(tool, str) else None
+        candidates: list[str] = []
+        if stripped:
+            candidates.append(stripped)
+            fenced_matches = re.findall(r"```(?:json)?\s*([\s\S]*?)```", stripped, flags=re.IGNORECASE)
+            candidates.extend(match.strip() for match in fenced_matches if match.strip())
+
+        seen: set[str] = set()
+        for candidate in candidates:
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            try:
+                payload = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            tool = payload.get("tool")
+            if isinstance(tool, str):
+                return payload
+        if stripped:
+            tag_matches = list(
+                re.finditer(
+                    r"<(?P<tool>[a-z_][a-z0-9_-]*)\s+(?P<attrs>[^<>]*?)/>",
+                    stripped,
+                    flags=re.IGNORECASE,
+                )
+            )
+            xml_payloads: list[dict[str, Any]] = []
+            for match in tag_matches:
+                tool = str(match.group("tool") or "").strip().lower()
+                attrs_raw = str(match.group("attrs") or "")
+                attrs = {
+                    key.lower(): value
+                    for key, _quote, value in re.findall(
+                        r"([a-zA-Z_][a-zA-Z0-9_-]*)\s*=\s*(['\"])(.*?)\2",
+                        attrs_raw,
+                    )
+                }
+                payload: dict[str, Any] = {"tool": tool}
+                if tool == "read_file" and attrs.get("path"):
+                    payload["path"] = attrs["path"]
+                elif tool == "read_files":
+                    raw_paths = attrs.get("paths", "")
+                    if raw_paths:
+                        payload["paths"] = [part.strip() for part in re.split(r"[,;\n]+", raw_paths) if part.strip()]
+                elif tool == "search_text" and attrs.get("pattern"):
+                    payload["pattern"] = attrs["pattern"]
+                    if attrs.get("limit"):
+                        payload["limit"] = attrs["limit"]
+                elif tool == "list_files":
+                    if attrs.get("directory"):
+                        payload["directory"] = attrs["directory"]
+                    if attrs.get("max_depth"):
+                        payload["max_depth"] = attrs["max_depth"]
+                elif tool == "write_file" and attrs.get("path"):
+                    payload["path"] = attrs["path"]
+                    if attrs.get("content") is not None:
+                        payload["content"] = attrs["content"]
+                elif tool == "apply_patch" and attrs.get("path"):
+                    payload["path"] = attrs["path"]
+                    if attrs.get("search") is not None:
+                        payload["search"] = attrs["search"]
+                    if attrs.get("replace") is not None:
+                        payload["replace"] = attrs["replace"]
+                else:
+                    continue
+                xml_payloads.append(payload)
+            if xml_payloads:
+                if all(payload.get("tool") == "read_file" and payload.get("path") for payload in xml_payloads):
+                    return {
+                        "tool": "read_files",
+                        "paths": [str(payload["path"]) for payload in xml_payloads],
+                    }
+                return xml_payloads[0]
+            call_matches = list(
+                re.finditer(
+                    r"(?P<tool>read_file|read_files|search_text|list_files|write_file|apply_patch)\s*\(\s*(?P<args>\{[\s\S]*?\})\s*\)",
+                    stripped,
+                    flags=re.IGNORECASE,
+                )
+            )
+            call_payloads: list[dict[str, Any]] = []
+            for match in call_matches:
+                tool = str(match.group("tool") or "").strip().lower()
+                args_text = str(match.group("args") or "").strip()
+                try:
+                    args_payload = json.loads(args_text)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(args_payload, dict):
+                    continue
+                payload = {"tool": tool, **args_payload}
+                call_payloads.append(payload)
+            if call_payloads:
+                if all(payload.get("tool") == "read_file" and payload.get("path") for payload in call_payloads):
+                    return {
+                        "tool": "read_files",
+                        "paths": [str(payload["path"]) for payload in call_payloads],
+                    }
+                leading_read_files: list[str] = []
+                for payload in call_payloads:
+                    if payload.get("tool") == "read_file" and payload.get("path"):
+                        leading_read_files.append(str(payload["path"]))
+                        continue
+                    break
+                if len(leading_read_files) >= 2:
+                    return {
+                        "tool": "read_files",
+                        "paths": leading_read_files,
+                    }
+                return call_payloads[0]
+            tool_call_matches = list(
+                re.finditer(
+                    r"(?:<tool_call>\s*)?(?P<tool>read_file|read_files|search_text|list_files|write_file|apply_patch)\s*\(\s*(?P<args>[^()]*)\s*\)",
+                    stripped,
+                    flags=re.IGNORECASE,
+                )
+            )
+            tool_call_payloads: list[dict[str, Any]] = []
+            for match in tool_call_matches:
+                tool = str(match.group("tool") or "").strip().lower()
+                args_text = str(match.group("args") or "").strip()
+                attrs = {
+                    key.lower(): value
+                    for key, _quote, value in re.findall(
+                        r"([a-zA-Z_][a-zA-Z0-9_-]*)\s*=\s*(['\"])(.*?)\2",
+                        args_text,
+                    )
+                }
+                payload: dict[str, Any] = {"tool": tool}
+                if tool == "read_file" and attrs.get("path"):
+                    payload["path"] = attrs["path"]
+                elif tool == "read_files":
+                    raw_paths = attrs.get("paths", "")
+                    if raw_paths:
+                        payload["paths"] = [part.strip() for part in re.split(r"[,;\n]+", raw_paths) if part.strip()]
+                elif tool == "search_text" and attrs.get("pattern"):
+                    payload["pattern"] = attrs["pattern"]
+                    if attrs.get("limit"):
+                        payload["limit"] = attrs["limit"]
+                elif tool == "list_files":
+                    if attrs.get("directory"):
+                        payload["directory"] = attrs["directory"]
+                    if attrs.get("max_depth"):
+                        payload["max_depth"] = attrs["max_depth"]
+                elif tool == "write_file" and attrs.get("path"):
+                    payload["path"] = attrs["path"]
+                    if attrs.get("content") is not None:
+                        payload["content"] = attrs["content"]
+                elif tool == "apply_patch" and attrs.get("path"):
+                    payload["path"] = attrs["path"]
+                    if attrs.get("search") is not None:
+                        payload["search"] = attrs["search"]
+                    if attrs.get("replace") is not None:
+                        payload["replace"] = attrs["replace"]
+                else:
+                    continue
+                tool_call_payloads.append(payload)
+            if tool_call_payloads:
+                if all(payload.get("tool") == "read_file" and payload.get("path") for payload in tool_call_payloads):
+                    return {
+                        "tool": "read_files",
+                        "paths": [str(payload["path"]) for payload in tool_call_payloads],
+                    }
+                leading_read_files = []
+                for payload in tool_call_payloads:
+                    if payload.get("tool") == "read_file" and payload.get("path"):
+                        leading_read_files.append(str(payload["path"]))
+                        continue
+                    break
+                if len(leading_read_files) >= 2:
+                    return {
+                        "tool": "read_files",
+                        "paths": leading_read_files,
+                    }
+                return tool_call_payloads[0]
+            object_matches = re.findall(r"(\{[\s\S]*\})", stripped)
+            object_candidates = [match.strip() for match in object_matches if match.strip()]
+            seen_objects: set[str] = set()
+            for candidate in object_candidates:
+                if candidate in seen_objects:
+                    continue
+                seen_objects.add(candidate)
+                try:
+                    payload = json.loads(candidate)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                tool = payload.get("tool")
+                if isinstance(tool, str):
+                    return payload
+        return None
 
     def _execute_direct_api_retrieval_request(self, payload: dict[str, Any], phase: str = "research", agent_name: str = "") -> str:
         tool = str(payload.get("tool") or "").strip()
@@ -2077,10 +2295,20 @@ class WorkflowOrchestrator:
             limit = self._coerce_int(payload.get("limit")) or 20
             if not pattern:
                 return "Invalid search_text request."
+            if phase == "implementation" and agent_name == "developer":
+                return (
+                    "search_text is disabled for developer in implementation mode. "
+                    "Use read_file/read_files for the exact contract paths, then either write the scoped change or return status=no_changes."
+                )
             return self._direct_api_search_text(pattern, limit=max(1, min(limit, 50)))
         if tool == "list_files":
             directory = str(payload.get("directory") or ".").strip() or "."
             max_depth = self._coerce_int(payload.get("max_depth")) or 3
+            if phase == "implementation" and agent_name == "developer":
+                return (
+                    "list_files is disabled for developer in implementation mode. "
+                    "Use read_file/read_files for the exact contract paths, then either write the scoped change or return status=no_changes."
+                )
             return self._direct_api_list_files(directory, max_depth=max(1, min(max_depth, 6)))
         if tool == "write_file":
             if not (phase == "implementation" and agent_name == "developer"):
@@ -2100,6 +2328,20 @@ class WorkflowOrchestrator:
                 return "Invalid apply_patch request."
             return self._direct_api_apply_patch(path, search, replace)
         return f"Unsupported retrieval tool: {tool}"
+
+    def _build_developer_force_write_instruction(self) -> str:
+        item = self._selected_implementation_item or {}
+        allowed_paths = ", ".join(item.get("allowed_paths") or []) or "none"
+        existing_paths = ", ".join(item.get("existing_paths") or []) or "none"
+        new_files = ", ".join(item.get("new_files") or []) or "none"
+        return (
+            "You now have enough local context for this scoped implementation task. "
+            "Do not request more broad retrieval. "
+            "On your next response, do exactly one of the following: "
+            '1) emit a write tool request using {"tool":"write_file", ...} or {"tool":"apply_patch", ...} within the allowed paths; '
+            "or 2) return normal text with status=no_changes and a concrete missing-scope reason. "
+            f"Allowed paths: {allowed_paths}. Existing reference files: {existing_paths}. New files allowed: {new_files}."
+        )
 
     def _direct_api_read_files(self, paths: list[str], limit: int = 8000) -> str:
         chunks: list[str] = []
@@ -2203,6 +2445,17 @@ class WorkflowOrchestrator:
             for path in (selected_item.get("new_directories") or [])
             if self._normalize_repo_relative_path(path)
         }
+        contract_paths: set[str] = set()
+        target_file = selected_item.get("target_file") or {}
+        test_file = selected_item.get("test_file") or {}
+        if isinstance(target_file, dict):
+            normalized = self._normalize_repo_relative_path(target_file.get("path"))
+            if normalized:
+                contract_paths.add(normalized)
+        if isinstance(test_file, dict):
+            normalized = self._normalize_repo_relative_path(test_file.get("path"))
+            if normalized:
+                contract_paths.add(normalized)
         repo_map = self._load_repo_map()
         repo_file_paths = {
             str(item.get("path") or "").strip()
@@ -2223,6 +2476,8 @@ class WorkflowOrchestrator:
                 new_files = {relative_path}
             else:
                 return False, "Write request targets a path outside repo_map and there is no selected task contract: " + relative_path, None
+        elif contract_paths and relative_path not in contract_paths:
+            return False, "Write request violates developer contract target/test file scope: " + relative_path, None
         elif relative_path not in existing_paths and relative_path not in new_files:
             return False, "Write request targets a path outside the selected task contract: " + relative_path, None
         validation = validate_agent_paths(
@@ -2336,6 +2591,7 @@ class WorkflowOrchestrator:
         last_raw_body = ""
         response_payload: dict[str, Any] | None = None
         retrieval_rounds = 0
+        blocked_retrieval_count = 0
         if phase == "implementation" and agent_name == "developer":
             self._set_agent_report_extras(
                 "implementation",
@@ -2368,6 +2624,12 @@ class WorkflowOrchestrator:
                     agent_name,
                     f"Direct API retrieval turn {turn}: {retrieval_request.get('tool')}",
                 )
+                if (
+                    phase == "implementation"
+                    and agent_name == "developer"
+                    and str(retrieval_request.get("tool") or "") in {"search_text", "list_files"}
+                ):
+                    blocked_retrieval_count += 1
                 messages.append({"role": "assistant", "content": output_text})
                 messages.append(
                     {
@@ -2375,6 +2637,43 @@ class WorkflowOrchestrator:
                         "content": "Local retrieval result:\n" + (retrieval_output or "No matching local results."),
                     }
                 )
+                if (
+                    phase == "implementation"
+                    and agent_name == "developer"
+                    and turn >= 3
+                    and not self._get_agent_report_extras("implementation", "developer").get("write_tools_used")
+                ):
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": self._build_developer_force_write_instruction(),
+                        }
+                    )
+                if (
+                    phase == "implementation"
+                    and agent_name == "developer"
+                    and not self._get_agent_report_extras("implementation", "developer").get("write_tools_used")
+                    and (blocked_retrieval_count >= 2 or turn >= 4)
+                ):
+                    response_payload = {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": (
+                                        "status=no_changes\n"
+                                        "Developer exceeded the allowed retrieval policy without making a scoped file edit. "
+                                        "Use only read_file/read_files for exact contract paths, then write the target/test file or report a concrete scope gap.\n\n"
+                                        "Russian translation\n"
+                                        "status=no_changes\n"
+                                        "Разработчик превысил допустимую политику retrieval, не выполнив scoped-изменение файла. "
+                                        "Используй только read_file/read_files для точных путей из контракта, затем запиши target/test файл или сообщи конкретную нехватку scope."
+                                    )
+                                }
+                            }
+                        ],
+                        "model": normalized_model,
+                    }
+                    break
             else:
                 response_payload = {
                     "choices": [{"message": {"content": "Exceeded retrieval rounds.\n\nRussian translation\nПревышен лимит раундов retrieval."}}],
@@ -2932,11 +3231,16 @@ class WorkflowOrchestrator:
             ("Target dependency and config files", self._build_target_dependency_context(limit=2200)),
             ("Target top-level tree up to depth 4", self._build_top_level_tree(root=self.target_workspace, depth=4)),
         ]
+        if agent_name in {"developer", "qa", "template-validator"}:
+            scoped_excerpts = self._build_selected_task_file_excerpts(limit=4200)
+            if scoped_excerpts:
+                sections.append(("Selected task file excerpts", scoped_excerpts))
         if agent_name == "implementation-planner":
             sections.extend(
                 [
                     ("Existing file list", self._build_target_existing_file_list(limit=3000)),
                     ("Relevant implementation files", self._build_relevant_implementation_file_list(limit=2500)),
+                    ("Relevant implementation file excerpts", self._build_relevant_implementation_file_excerpts(limit=2600)),
                 ]
             )
         if agent_name in {"architect", "qa", "template-validator"}:
@@ -2948,6 +3252,7 @@ class WorkflowOrchestrator:
             sections.append(("Repo map before/after summary", self._build_repo_map_delta_summary(limit=2200)))
 
         repository_context = self._join_context_sections(sections, limit=limit)
+        contract_diag = self._evaluate_selected_task_contract_compliance() if agent_name in {"qa", "template-validator"} else {}
         sources = [
             f"{run_dir.name}:{report.get('agent_name') or report.get('agent')}"
             for report in research_reports
@@ -2988,6 +3293,10 @@ class WorkflowOrchestrator:
             "repo_map_file_count": len(repo_map.get("files") or []),
             "repo_map_directory_count": len(repo_map.get("directories") or []),
             "backlog_source": selection["backlog_source"],
+            "contract_completeness": bool(selected_item.get("contract_completeness", False)),
+            "contract_compliance": bool(contract_diag.get("contract_compliance", False)),
+            "missing_must_contain": list(contract_diag.get("missing_must_contain") or []),
+            "missing_test_file": bool(contract_diag.get("missing_test_file", False)),
             "context_chars": (len(repository_context) + len(previous_context)) if sources else 0,
         }
 
@@ -3008,10 +3317,114 @@ class WorkflowOrchestrator:
         text = "\n".join(sorted(dict.fromkeys(candidates)))
         return text[:limit]
 
+    def _build_relevant_implementation_file_excerpts(self, limit: int = 2600) -> str:
+        repo_map = self._load_repo_map()
+        candidates = [str(path).strip() for path in (repo_map.get("agent_relevant_files") or []) if str(path).strip()]
+        if not candidates:
+            return ""
+        return self._direct_api_read_files(candidates[:4], limit=limit)
+
+    def _build_selected_task_file_excerpts(self, limit: int = 4200) -> str:
+        item = self._selected_implementation_item or {}
+        sections: list[str] = []
+        candidate_paths: list[str] = []
+        for path in item.get("existing_paths") or []:
+            normalized = self._normalize_repo_relative_path(path)
+            if normalized:
+                candidate_paths.append(normalized)
+        for path in item.get("required_test_paths") or []:
+            normalized = self._normalize_repo_relative_path(path)
+            if normalized:
+                candidate_paths.append(normalized)
+        ordered_paths = list(dict.fromkeys(candidate_paths))
+        if ordered_paths:
+            file_excerpt = self._direct_api_read_files(ordered_paths, limit=max(1200, limit // 2))
+            if file_excerpt:
+                sections.append(file_excerpt)
+
+        parent_dirs: list[str] = []
+        for path in item.get("new_files") or []:
+            normalized = self._normalize_repo_relative_path(path)
+            if not normalized:
+                continue
+            parent = Path(normalized).parent.as_posix()
+            if parent and parent != ".":
+                parent_dirs.append(parent)
+        for directory in list(dict.fromkeys(parent_dirs))[:4]:
+            listing = self._direct_api_list_files(directory, max_depth=1)
+            if listing:
+                sections.append(f"### sibling files in {directory}\n{listing[:1200]}")
+            sibling_excerpt = self._build_directory_reference_file_excerpts(directory, limit=max(1200, limit // 3))
+            if sibling_excerpt:
+                sections.append(f"### reference file excerpts from {directory}\n{sibling_excerpt}")
+
+        text = "\n\n".join(section for section in sections if section.strip())
+        return text[:limit]
+
+    def _build_directory_reference_file_excerpts(self, directory: str, limit: int = 1400) -> str:
+        base = (self.target_workspace / directory).resolve()
+        try:
+            base.relative_to(self.target_workspace.resolve())
+        except ValueError:
+            return ""
+        if not base.exists() or not base.is_dir():
+            return ""
+        candidates: list[str] = []
+        for path in sorted(base.iterdir()):
+            if not path.is_file():
+                continue
+            relative = str(path.relative_to(self.target_workspace)).replace("\\", "/")
+            candidates.append(relative)
+            if len(candidates) >= 2:
+                break
+        if not candidates:
+            return ""
+        return self._direct_api_read_files(candidates, limit=limit)
+
+    def _selected_task_has_exact_file_context(self) -> bool:
+        item = self._selected_implementation_item or {}
+        return bool(item.get("existing_paths") or item.get("required_test_paths") or item.get("new_files"))
+
     def _build_implementation_same_phase_context(self, agent_name: str, limit: int = 4000) -> str:
         if agent_name in {"developer", "qa", "template-validator"}:
             return self._build_selected_task_contract_context(limit=limit)
         return self._build_previous_agent_context("implementation", agent_name, limit=limit)
+
+    def _evaluate_selected_task_contract_compliance(self) -> dict[str, Any]:
+        item = self._selected_implementation_item or {}
+        target_file = self._normalize_repo_relative_path((item.get("target_file") or {}).get("path")) if isinstance(item.get("target_file"), dict) else ""
+        test_file = self._normalize_repo_relative_path((item.get("test_file") or {}).get("path")) if isinstance(item.get("test_file"), dict) else ""
+        must_contain = [str(value).strip() for value in (item.get("must_contain") or []) if str(value).strip()]
+        forbidden = [str(value).strip() for value in (item.get("forbidden") or []) if str(value).strip()]
+        target_text = ""
+        test_text = ""
+        target_exists = False
+        test_exists = False
+        if target_file:
+            candidate = self.target_workspace / target_file
+            if candidate.exists() and candidate.is_file():
+                target_exists = True
+                try:
+                    target_text = candidate.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    target_text = ""
+        if test_file:
+            candidate = self.target_workspace / test_file
+            if candidate.exists() and candidate.is_file():
+                test_exists = True
+                try:
+                    test_text = candidate.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    test_text = ""
+        missing_must_contain = [value for value in must_contain if value not in target_text]
+        forbidden_hits = [value for value in forbidden if value and (value in target_text or value in test_text)]
+        return {
+            "contract_completeness": bool(item.get("contract_completeness", False)),
+            "contract_compliance": bool(target_exists and test_exists and not missing_must_contain and not forbidden_hits),
+            "missing_must_contain": missing_must_contain,
+            "missing_test_file": bool(test_file and not test_exists),
+            "forbidden_contract_hits": forbidden_hits,
+        }
 
     def _load_latest_project_research_reports(self) -> tuple[list[dict[str, Any]], Path | None]:
         candidate_run_dirs: list[Path] = []
@@ -3333,6 +3746,7 @@ class WorkflowOrchestrator:
             + ", ".join(self._planner_dependency_validation_errors[:20] or ["none"])
             + ". Available directories: "
             + available_directories
+            + ". Repair rules: every path in allowed_paths must also appear in existing_paths or new_files; existing_paths must contain exact existing files only, never directories; never guess an existing filename from a directory name or naming pattern; if an exact migration or test file is not present in repo_map, do not place it in existing_paths and treat it as new_files or omit it; if a new file lives under a directory missing from repo_map, declare that parent in new_directories; if required_test_paths uses a new test package directory, include that directory in new_directories, add the package __init__.py to new_files, and include that __init__.py in allowed_paths."
             + ". Return corrected YAML/JSON using only paths from repo_map unless declaring a new file under an existing directory."
         ).strip()
 
@@ -3856,6 +4270,20 @@ class WorkflowOrchestrator:
                         str(path): "Fallback path derived from product-manager summary."
                         for path in list(item.get("allowed_paths") or list(self.implementation_scope_policy["allowed_paths"]))
                     },
+                    "target_file": {
+                        "path": (list(item.get("allowed_paths") or list(self.implementation_scope_policy["allowed_paths"])) or [""])[0],
+                        "action": "modify",
+                        "purpose": str(item.get("scope") or "").strip(),
+                    },
+                    "must_contain": [],
+                    "must_import": [],
+                    "integration": [str(item.get("scope") or "").strip()],
+                    "reference_files": list(item.get("allowed_paths") or list(self.implementation_scope_policy["allowed_paths"])),
+                    "reference_excerpts": {},
+                    "test_file": {"path": (fallback_required_tests or [""])[0]},
+                    "must_test": list(fallback_required_tests),
+                    "forbidden": list(self.implementation_scope_policy["forbidden_paths"]),
+                    "contract_completeness": False,
                     "risk_level": str(item.get("risk_level") or "medium").lower(),
                     "estimated_effort": str(item.get("estimated_effort") or "M").upper(),
                 }
@@ -3967,6 +4395,31 @@ class WorkflowOrchestrator:
             for path in (raw_item.get("required_test_paths") or [])
             if self._normalize_repo_relative_path(path)
         ]
+        raw_target_file = raw_item.get("target_file") or {}
+        target_file_path = self._normalize_repo_relative_path(raw_target_file.get("path")) if isinstance(raw_target_file, dict) else ""
+        target_file_action = str(raw_target_file.get("action") or "").strip().lower() if isinstance(raw_target_file, dict) else ""
+        target_file_purpose = str(raw_target_file.get("purpose") or "").strip() if isinstance(raw_target_file, dict) else ""
+        must_contain = [str(item).strip() for item in (raw_item.get("must_contain") or []) if str(item).strip()]
+        must_import = [str(item).strip() for item in (raw_item.get("must_import") or []) if str(item).strip()]
+        integration = [str(item).strip() for item in (raw_item.get("integration") or []) if str(item).strip()]
+        reference_files = [
+            self._normalize_repo_relative_path(path)
+            for path in (raw_item.get("reference_files") or [])
+            if self._normalize_repo_relative_path(path)
+        ]
+        raw_reference_excerpts = raw_item.get("reference_excerpts") or {}
+        if isinstance(raw_reference_excerpts, dict):
+            reference_excerpts = {
+                self._normalize_repo_relative_path(path): str(snippet).strip()
+                for path, snippet in raw_reference_excerpts.items()
+                if self._normalize_repo_relative_path(path) and str(snippet).strip()
+            }
+        else:
+            reference_excerpts = {}
+        raw_test_file = raw_item.get("test_file") or {}
+        test_file_path = self._normalize_repo_relative_path(raw_test_file.get("path")) if isinstance(raw_test_file, dict) else ""
+        must_test = [str(item).strip() for item in (raw_item.get("must_test") or []) if str(item).strip()]
+        contract_forbidden = [str(item).strip() for item in (raw_item.get("forbidden") or []) if str(item).strip()]
         depends_on = [
             str(task_ref).strip()
             for task_ref in (raw_item.get("depends_on") or [])
@@ -3988,6 +4441,25 @@ class WorkflowOrchestrator:
             existing_paths = list(allowed_paths)
         if not reason_each_path_is_needed:
             reason_each_path_is_needed = {path: "Planner selected this path for the scoped task." for path in allowed_paths}
+        if not target_file_path:
+            target_file_path = (new_files or allowed_paths or existing_paths or [""])[0]
+        if not target_file_action:
+            target_file_action = "create" if target_file_path in new_files else "modify"
+        if not target_file_purpose:
+            target_file_purpose = scope
+        if not test_file_path:
+            test_file_path = (required_test_paths or [""])[0]
+        if not reference_files:
+            reference_files = list(dict.fromkeys(existing_paths + required_test_paths))
+        if not must_test:
+            must_test = list(required_test_paths)
+        if not integration:
+            integration = [scope]
+        if not contract_forbidden:
+            contract_forbidden = [str(path) for path in forbidden_paths]
+        contract_completeness = all(
+            [target_file_path, target_file_action in {"create", "modify"}, bool(target_file_purpose), bool(test_file_path)]
+        )
         return {
             "id": task_id,
             "title": title,
@@ -4002,6 +4474,16 @@ class WorkflowOrchestrator:
             "depends_on": depends_on,
             "acceptance_criteria": acceptance_criteria,
             "reason_each_path_is_needed": reason_each_path_is_needed,
+            "target_file": {"path": target_file_path, "action": target_file_action, "purpose": target_file_purpose},
+            "must_contain": must_contain,
+            "must_import": must_import,
+            "integration": integration,
+            "reference_files": reference_files,
+            "reference_excerpts": reference_excerpts,
+            "test_file": {"path": test_file_path},
+            "must_test": must_test,
+            "forbidden": contract_forbidden,
+            "contract_completeness": contract_completeness,
             "risk_level": str(raw_item.get("risk_level") or "medium").lower(),
             "estimated_effort": str(raw_item.get("estimated_effort") or "M").upper(),
         }, []
@@ -4204,16 +4686,31 @@ class WorkflowOrchestrator:
             return True
         if self.retry_agent_name == "implementation-planner":
             return True
-        return self.from_agent_name == "implementation-planner"
+        if self.from_agent_name == "implementation-planner":
+            return True
+        return self.from_agent_name in {"developer", "qa", "template-validator"} or self.retry_agent_name in {"developer", "qa", "template-validator"}
+
+    def _should_reuse_planner_for_implementation(self) -> bool:
+        if self.from_agent_name in {"developer", "qa", "template-validator"}:
+            return True
+        return self.retry_agent_name in {"developer", "qa", "template-validator"}
 
     def _should_skip_implementation_agent(self, agent_name: str) -> bool:
-        if not self._should_reuse_architect_for_implementation():
-            return False
-        if agent_name == "architect":
+        if self._should_reuse_architect_for_implementation() and agent_name == "architect":
+            return True
+        if self._should_reuse_planner_for_implementation() and agent_name == "implementation-planner":
             return True
         if self.retry_agent_name == "implementation-planner" and agent_name in {"developer", "qa", "template-validator"}:
             return True
         if self.from_agent_name == "implementation-planner" and agent_name in {"developer", "qa", "template-validator"}:
+            return True
+        if self.retry_agent_name == "developer" and agent_name in {"qa", "template-validator"}:
+            return True
+        if self.from_agent_name == "developer" and agent_name in {"architect", "implementation-planner"}:
+            return True
+        if self.from_agent_name == "qa" and agent_name in {"architect", "implementation-planner", "developer"}:
+            return True
+        if self.from_agent_name == "template-validator" and agent_name in {"architect", "implementation-planner", "developer", "qa"}:
             return True
         return False
 
@@ -4225,6 +4722,20 @@ class WorkflowOrchestrator:
             report = self._load_saved_agent_report("implementation", agent_name, run_dir=run_dir)
             if report and report.get("status") == "success":
                 return report, str(run_dir / "agents" / "implementation" / f"{agent_name}.json")
+        return None, ""
+
+    def _load_latest_implementation_report_with_selected_task(self) -> tuple[dict[str, Any] | None, str]:
+        candidate_agents = ("developer", "qa", "template-validator", "implementation-planner")
+        current_base = self.logger.run_dir / "agents" / "implementation"
+        for agent_name in candidate_agents:
+            report = self._load_saved_agent_report("implementation", agent_name)
+            if report and str(report.get("selected_task_id") or "").strip():
+                return report, str(current_base / f"{agent_name}.json")
+        for run_dir in sorted(self.logger.log_dir.glob("run_*"), reverse=True):
+            for agent_name in candidate_agents:
+                report = self._load_saved_agent_report("implementation", agent_name, run_dir=run_dir)
+                if report and str(report.get("selected_task_id") or "").strip():
+                    return report, str(run_dir / "agents" / "implementation" / f"{agent_name}.json")
         return None, ""
 
     def _reuse_architect_output_for_current_run(self) -> bool:
@@ -4246,6 +4757,35 @@ class WorkflowOrchestrator:
                 "architect_output_source": source_path,
             },
         )
+        return True
+
+    def _reuse_planner_output_for_current_run(self) -> bool:
+        report, source_path = self._load_latest_successful_implementation_report("implementation-planner")
+        if not report:
+            self.logger.error("Unable to reuse implementation-planner output", "No successful implementation-planner report found.")
+            return False
+        target_dir = self.logger.run_dir / "agents" / "implementation"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = target_dir / "implementation-planner.json"
+        target_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        selected_task_id = str(report.get("selected_task_id") or "").strip()
+        if not selected_task_id:
+            selected_task_report, _selected_source = self._load_latest_implementation_report_with_selected_task()
+            if selected_task_report:
+                selected_task_id = str(selected_task_report.get("selected_task_id") or "").strip()
+        if selected_task_id and not self.selected_task_ref:
+            self.selected_task_ref = selected_task_id
+        self._set_agent_report_extras(
+            "implementation",
+            "implementation-planner",
+            {
+                "reused_architect_output": self._reused_architect_output,
+                "architect_output_source": self._architect_output_source,
+                "planner_retry_count": self._planner_retry_count,
+                "planner_retry_reason": self._planner_retry_reason,
+            },
+        )
+        self.logger.info(f"Reusing implementation-planner output from {source_path}")
         return True
 
     def _validate_repo_map_target(self, repo_map: dict[str, Any]) -> bool:
@@ -4358,6 +4898,29 @@ class WorkflowOrchestrator:
         lines.append("reason_each_path_is_needed:")
         for path, reason in (item.get("reason_each_path_is_needed") or {}).items():
             lines.append(f"- {path}: {reason}")
+        lines.append("developer_contract:")
+        target_file = item.get("target_file") or {}
+        lines.append(f"  target_file.path: {target_file.get('path', '')}")
+        lines.append(f"  target_file.action: {target_file.get('action', '')}")
+        lines.append(f"  target_file.purpose: {target_file.get('purpose', '')}")
+        lines.append("  must_contain:")
+        lines.extend(f"  - {value}" for value in (item.get("must_contain") or []))
+        lines.append("  must_import:")
+        lines.extend(f"  - {value}" for value in (item.get("must_import") or []))
+        lines.append("  integration:")
+        lines.extend(f"  - {value}" for value in (item.get("integration") or []))
+        lines.append("  reference_files:")
+        lines.extend(f"  - {value}" for value in (item.get("reference_files") or []))
+        lines.append("  reference_excerpts:")
+        for path, snippet in (item.get("reference_excerpts") or {}).items():
+            lines.append(f"  - {path}: {str(snippet)[:280]}")
+        test_file = item.get("test_file") or {}
+        lines.append(f"  test_file.path: {test_file.get('path', '')}")
+        lines.append("  must_test:")
+        lines.extend(f"  - {value}" for value in (item.get("must_test") or []))
+        lines.append("  forbidden:")
+        lines.extend(f"  - {value}" for value in (item.get("forbidden") or []))
+        lines.append(f"  contract_completeness: {item.get('contract_completeness', False)}")
         lines.append(f"risk_level: {item.get('risk_level', '')}")
         lines.append(f"estimated_effort: {item.get('estimated_effort', '')}")
         text = "\n".join(lines)

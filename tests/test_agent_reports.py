@@ -794,6 +794,9 @@ def test_default_implementation_scope_is_loaded_from_config(tmp_path: Path) -> N
     monitoring_file = target_workspace / "gateway-v4" / "app" / "services" / "monitoring.py"
     monitoring_file.parent.mkdir(parents=True, exist_ok=True)
     monitoring_file.write_text("pass\n", encoding="utf-8")
+    monitoring_test = target_workspace / "tests" / "test_monitoring.py"
+    monitoring_test.parent.mkdir(parents=True, exist_ok=True)
+    monitoring_test.write_text("def test_monitoring():\n    assert True\n", encoding="utf-8")
     orchestrator = WorkflowOrchestrator(
         str(engine_root / "workflow" / "config.yaml"),
         engine_root=str(engine_root),
@@ -929,6 +932,9 @@ def test_developer_write_tools_are_enabled_for_scoped_implementation(tmp_path: P
     monitoring_file = target_workspace / "gateway-v4" / "app" / "services" / "monitoring.py"
     monitoring_file.parent.mkdir(parents=True, exist_ok=True)
     monitoring_file.write_text("pass\n", encoding="utf-8")
+    monitoring_test = target_workspace / "tests" / "test_monitoring.py"
+    monitoring_test.parent.mkdir(parents=True, exist_ok=True)
+    monitoring_test.write_text("def test_monitoring():\n    assert True\n", encoding="utf-8")
     orchestrator = WorkflowOrchestrator(
         str(engine_root / "workflow" / "config.yaml"),
         engine_root=str(engine_root),
@@ -981,6 +987,92 @@ def test_developer_write_tools_are_enabled_for_scoped_implementation(tmp_path: P
     assert "Do not change Stripe or billing flows." in bundle["system_message"]
     assert "Do not make broad frontend changes." in bundle["system_message"]
     assert "[selected-task-contract]" in bundle["system_message"]
+    assert "Selected task file excerpts" in bundle["system_message"]
+    assert "## gateway-v4/app/services/monitoring.py" in bundle["system_message"]
+    assert "## tests/test_monitoring.py" in bundle["system_message"]
+    assert "start with read_file/read_files for those exact paths instead of list_files" in bundle["system_message"]
+
+
+def test_developer_context_includes_reference_files_for_new_file_parent_directory(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir()
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (target_workspace / "README.md").write_text("target readme", encoding="utf-8")
+    main_file = target_workspace / "gateway-v4" / "app" / "main.py"
+    main_file.parent.mkdir(parents=True, exist_ok=True)
+    main_file.write_text("app = object()\n", encoding="utf-8")
+    versions_dir = target_workspace / "gateway-v4" / "alembic" / "versions"
+    versions_dir.mkdir(parents=True, exist_ok=True)
+    (versions_dir / "000_base.py").write_text("def upgrade():\n    pass\n", encoding="utf-8")
+    (versions_dir / "000_other.py").write_text("def downgrade():\n    pass\n", encoding="utf-8")
+    model_test = target_workspace / "gateway-v4" / "tests" / "test_provider_metrics_model.py"
+    model_test.parent.mkdir(parents=True, exist_ok=True)
+    model_test.write_text("def test_model():\n    assert True\n", encoding="utf-8")
+
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    _seed_research_run(
+        orchestrator.logger.log_dir,
+        "20260101_120099",
+        [{"agent_name": "product-manager", "handoff_summary": "agent: product-manager\nfindings:\n- add migration\nrisks:\n- none\ndecisions:\n- backend only\nrecommended_next_tasks:\n- add migration"}],
+    )
+    _seed_implementation_report(
+        orchestrator.logger.run_dir,
+        "implementation-planner",
+        parsed_output=json.dumps(
+            [
+                {
+                    "id": "task-migration",
+                    "title": "Add migration",
+                    "priority": "P0",
+                    "scope": "Add a migration file.",
+                    "existing_paths": ["gateway-v4/app/main.py"],
+                    "new_files": ["gateway-v4/alembic/versions/001_add_provider_metrics.py"],
+                    "allowed_paths": [
+                        "gateway-v4/app/main.py",
+                        "gateway-v4/alembic/versions/001_add_provider_metrics.py",
+                    ],
+                    "forbidden_paths": ["frontend/*"],
+                    "required_test_paths": ["gateway-v4/tests/test_provider_metrics_model.py"],
+                    "acceptance_criteria": ["Migration added."],
+                    "risk_level": "low",
+                    "estimated_effort": "S",
+                }
+            ]
+        ),
+    )
+
+    bundle = orchestrator._build_agent_message_bundle(
+        "developer",
+        {"name": "developer", "description": "Implement the task"},
+        Path(".openclaw/agents/implementation/developer/prompt.md"),
+        "implementation",
+    )
+
+    assert "Selected task file excerpts" in bundle["system_message"]
+    assert "### sibling files in gateway-v4/alembic/versions" in bundle["system_message"]
+    assert "gateway-v4/alembic/versions/000_base.py" in bundle["system_message"]
+    assert "### reference file excerpts from gateway-v4/alembic/versions" in bundle["system_message"]
+    assert "## gateway-v4/alembic/versions/000_base.py" in bundle["system_message"]
 
 
 def test_backlog_is_generated_from_implementation_planner_output(tmp_path: Path) -> None:
@@ -1144,6 +1236,52 @@ def test_developer_prompt_receives_only_selected_task_not_raw_architect_plan(tmp
     assert "safe-backend-task" in bundle["system_message"]
     assert "gateway-v4/app/services/monitoring.py" in bundle["system_message"]
     assert "Broad architect plan:" not in bundle["system_message"]
+    assert "developer_contract:" in bundle["system_message"]
+
+
+def test_planner_task_normalization_populates_developer_contract() -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+
+    normalized, errors = orchestrator._normalize_planner_task(
+        {
+            "id": "TASK-001",
+            "title": "Add migration",
+            "priority": "P0",
+            "scope": "Create migration.",
+            "existing_paths": ["gateway-v4/app/main.py"],
+            "new_files": ["gateway-v4/alembic/versions/001_add_provider_metrics.py"],
+            "allowed_paths": ["gateway-v4/app/main.py", "gateway-v4/alembic/versions/001_add_provider_metrics.py"],
+            "required_test_paths": ["gateway-v4/tests/test_provider_metrics_model.py"],
+            "target_file": {
+                "path": "gateway-v4/alembic/versions/001_add_provider_metrics.py",
+                "action": "create",
+                "purpose": "Add alembic migration for provider metrics",
+            },
+            "must_contain": ["def upgrade()", "def downgrade()"],
+            "must_import": ["alembic.op", "sqlalchemy as sa"],
+            "integration": ["Migration must align with the provider metrics ORM model."],
+            "reference_files": ["gateway-v4/app/main.py"],
+            "reference_excerpts": {"gateway-v4/app/main.py": "from fastapi import FastAPI"},
+            "test_file": {"path": "gateway-v4/tests/test_provider_metrics_model.py"},
+            "must_test": ["Migration table columns match the model."],
+            "forbidden": ["modify billing code"],
+            "acceptance_criteria": ["Migration exists."],
+            "reason_each_path_is_needed": {
+                "gateway-v4/app/main.py": "Reference wiring.",
+                "gateway-v4/alembic/versions/001_add_provider_metrics.py": "Target migration file.",
+            },
+            "risk_level": "low",
+            "estimated_effort": "S",
+        },
+        item_index=1,
+    )
+
+    assert errors == []
+    assert normalized is not None
+    assert normalized["target_file"]["path"] == "gateway-v4/alembic/versions/001_add_provider_metrics.py"
+    assert normalized["test_file"]["path"] == "gateway-v4/tests/test_provider_metrics_model.py"
+    assert normalized["must_contain"] == ["def upgrade()", "def downgrade()"]
+    assert normalized["contract_completeness"] is True
 
 
 def test_implementation_planner_receives_architect_output_after_architect(tmp_path: Path) -> None:
@@ -1607,6 +1745,72 @@ def test_direct_api_retrieval_reads_local_file_and_requeries(monkeypatch, tmp_pa
     assert payload["project_id"] == orchestrator.project_id
 
 
+def test_direct_api_retrieval_parses_fenced_json_with_preface() -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+
+    payload = orchestrator._parse_direct_api_retrieval_request(
+        "I'll inspect the file first.\n\n```json\n{\"tool\":\"read_file\",\"path\":\"gateway-v4/app/main.py\"}\n```"
+    )
+
+    assert payload == {"tool": "read_file", "path": "gateway-v4/app/main.py"}
+
+
+def test_direct_api_retrieval_parses_multiple_xml_read_file_tags() -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+
+    payload = orchestrator._parse_direct_api_retrieval_request(
+        "I'll inspect both files first.\n\n"
+        "<read_file path=\"gateway-v4/tests/test_provider_metrics_model.py\"/>\n"
+        "<read_file path=\"gateway-v4/app/main.py\"/>"
+    )
+
+    assert payload == {
+        "tool": "read_files",
+        "paths": [
+            "gateway-v4/tests/test_provider_metrics_model.py",
+            "gateway-v4/app/main.py",
+        ],
+    }
+
+
+def test_direct_api_retrieval_parses_function_style_tool_calls() -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+
+    payload = orchestrator._parse_direct_api_retrieval_request(
+        "I'll inspect the reference files first.\n"
+        'read_file({"path": "gateway-v4/app/main.py"})\n'
+        'read_file({"path": "gateway-v4/tests/test_provider_metrics_model.py"})\n'
+        'list_files({"directory": "gateway-v4/alembic", "max_depth": 2})'
+    )
+
+    assert payload == {
+        "tool": "read_files",
+        "paths": [
+            "gateway-v4/app/main.py",
+            "gateway-v4/tests/test_provider_metrics_model.py",
+        ],
+    }
+
+
+def test_direct_api_retrieval_parses_tool_call_prefixed_calls() -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+
+    payload = orchestrator._parse_direct_api_retrieval_request(
+        'I will inspect first.\n'
+        '<tool_call>read_file(path="gateway-v4/app/main.py")\n'
+        '<tool_call>read_file(path="gateway-v4/tests/test_provider_metrics_model.py")\n'
+        '<tool_call>list_files(directory="gateway-v4/alembic", max_depth="3")'
+    )
+
+    assert payload == {
+        "tool": "read_files",
+        "paths": [
+            "gateway-v4/app/main.py",
+            "gateway-v4/tests/test_provider_metrics_model.py",
+        ],
+    }
+
+
 def test_direct_api_retrieval_cannot_escape_target_workspace(tmp_path: Path) -> None:
     engine_root = tmp_path / "engine"
     target_workspace = tmp_path / "target"
@@ -1640,6 +1844,86 @@ def test_direct_api_retrieval_cannot_escape_target_workspace(tmp_path: Path) -> 
     assert orchestrator._direct_api_read_files(["../secret.txt"], limit=2000) == ""
     assert orchestrator._direct_api_list_files("..", max_depth=2) == ""
     assert "inside.txt" in orchestrator._direct_api_list_files(".", max_depth=2)
+
+
+def test_developer_search_text_is_blocked_when_exact_task_context_exists(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir()
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    orchestrator._selected_implementation_item = {
+        "existing_paths": ["gateway-v4/app/main.py"],
+        "new_files": ["gateway-v4/alembic/versions/001_add_provider_metrics.py"],
+        "allowed_paths": ["gateway-v4/app/main.py", "gateway-v4/alembic/versions/001_add_provider_metrics.py"],
+    }
+
+    result = orchestrator._execute_direct_api_retrieval_request(
+        {"tool": "search_text", "pattern": "alembic"},
+        phase="implementation",
+        agent_name="developer",
+    )
+
+    assert "search_text is disabled for developer in implementation mode" in result
+
+
+def test_developer_list_files_is_blocked_in_implementation_mode(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir()
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    orchestrator._selected_implementation_item = {
+        "existing_paths": ["gateway-v4/app/main.py"],
+        "new_files": ["gateway-v4/alembic/versions/001_add_provider_metrics.py"],
+        "allowed_paths": ["gateway-v4/app/main.py", "gateway-v4/alembic/versions/001_add_provider_metrics.py"],
+    }
+
+    result = orchestrator._execute_direct_api_retrieval_request(
+        {"tool": "list_files", "directory": "gateway-v4/alembic", "max_depth": 2},
+        phase="implementation",
+        agent_name="developer",
+    )
+
+    assert "list_files is disabled for developer in implementation mode" in result
 
 
 def test_developer_write_file_changes_target_file(monkeypatch, tmp_path: Path) -> None:

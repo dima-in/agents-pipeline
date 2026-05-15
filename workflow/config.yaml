@@ -74,7 +74,7 @@ phases:
         description: "Analyze the current repository, constraints, gaps, and immediate opportunities"
         timeout: 900
         provider: openrouter
-        model: openrouter/anthropic/claude-sonnet-4.6
+        model: openrouter/deepseek/deepseek-v4-pro
         thinking: low
       - name: competitor-analyst
         description: "Analyze competitors"
@@ -86,13 +86,13 @@ phases:
         description: "Analyze market and trends"
         timeout: 600
         provider: openrouter
-        model: openrouter/anthropic/claude-sonnet-4.6
+        model: openrouter/deepseek/deepseek-v4-pro
         thinking: low
       - name: tech-analyst
         description: "Review technical options"
         timeout: 600
         provider: openrouter
-        model: openrouter/anthropic/claude-sonnet-4.6
+        model: openrouter/deepseek/deepseek-v4-pro
         thinking: low
       - name: innovation-scout
         description: "Find adjacent product and workflow innovations"
@@ -104,7 +104,7 @@ phases:
         description: "Summarize and prepare requirements"
         timeout: 900
         provider: openrouter
-        model: openrouter/anthropic/claude-sonnet-4.6
+        model: openrouter/deepseek/deepseek-v4-pro
         thinking: low
 
   implementation:
@@ -114,32 +114,32 @@ phases:
         description: "Prepare technical plan"
         timeout: 900
         provider: openrouter
-        model: openrouter/deepseek/deepseek-chat-v3
+        model: openrouter/anthropic/claude-sonnet-4.5
         thinking: low
       - name: implementation-planner
         description: "Convert the architect plan into a prioritized implementation backlog"
         timeout: 900
         provider: openrouter
-        model: openrouter/anthropic/claude-sonnet-4.6
+        model: openrouter/anthropic/claude-sonnet-4.5
         thinking: low
       - name: developer
         description: "Implement the task"
         timeout: 2400
         max_retries: 3
         provider: openrouter
-        model: openrouter/deepseek/deepseek-chat-v3
+        model: openrouter/anthropic/claude-sonnet-4.5
         thinking: low
       - name: qa
         description: "Run checks and report regressions"
         timeout: 900
         provider: openrouter
-        model: openrouter/deepseek/deepseek-chat-v3
+        model: openrouter/deepseek/deepseek-v4-pro
         thinking: low
       - name: template-validator
         description: "Validate output against template"
         timeout: 600
         provider: openrouter
-        model: openrouter/deepseek/deepseek-chat-v3
+        model: openrouter/deepseek/deepseek-v4-pro
         thinking: low
 
   deployment:
@@ -151,13 +151,13 @@ phases:
         description: "Check production readiness, release risks, and launch blockers"
         timeout: 900
         provider: openrouter
-        model: openrouter/deepseek/deepseek-chat-v3
+        model: openrouter/deepseek/deepseek-v4-pro
         thinking: low
       - name: launch-strategist
         description: "Prepare launch plan, channels, and rollout checklist after readiness approval"
         timeout: 900
         provider: openrouter
-        model: openrouter/deepseek/deepseek-chat-v3
+        model: openrouter/deepseek/deepseek-v4-pro
         thinking: low
 
 git:

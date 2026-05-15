@@ -137,6 +137,46 @@ def test_start_parser_accepts_retry_resume_flags() -> None:
     assert args.reuse_architect is True
 
 
+def test_start_parser_accepts_from_agent_developer() -> None:
+    args = build_parser().parse_args(
+        [
+            "--phase",
+            "implementation",
+            "--from-agent",
+            "developer",
+        ]
+    )
+
+    assert args.from_agent == "developer"
+
+
+def test_create_git_branch_reuses_existing_branch_on_rerun(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    repo = git.Repo.init(workspace)
+    repo.git.checkout("-b", "main")
+    tracked = workspace / "README.md"
+    tracked.write_text("seed\n", encoding="utf-8")
+    repo.git.add("README.md")
+    repo.index.commit("initial")
+
+    config_path = tmp_path / "workflow.yaml"
+    _write_minimal_workflow_config(config_path, workspace=str(workspace))
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    payload["git"]["enabled"] = True
+    config_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    orchestrator = WorkflowOrchestrator(str(config_path))
+
+    assert orchestrator._create_git_branch(1) is True
+    assert repo.active_branch.name == "feature/task_1"
+    repo.git.checkout("main")
+
+    assert orchestrator._create_git_branch(1) is True
+    assert repo.active_branch.name == "feature/task_1"
+    assert orchestrator.current_branch == "feature/task_1"
+
+
 def test_agent_directories_exist() -> None:
     manager = AgentManager()
     agents = manager.list_agents()
@@ -2030,6 +2070,105 @@ def test_retry_agent_implementation_planner_reuses_architect_output(tmp_path: Pa
     assert orchestrator._architect_output_source.endswith("architect.json")
 
 
+def test_from_agent_developer_reuses_planner_and_selected_task(tmp_path: Path, monkeypatch) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (target_workspace / "workflow").mkdir(parents=True, exist_ok=True)
+    (target_workspace / "workflow" / "orchestrator.py").write_text("pass\n", encoding="utf-8")
+    (target_workspace / "tests").mkdir(parents=True, exist_ok=True)
+    (target_workspace / "tests" / "test_workflow.py").write_text("def test_ok(): pass\n", encoding="utf-8")
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+        from_agent="developer",
+    )
+    orchestrator.config["phases"]["implementation"] = {
+        "name": "Implementation",
+        "max_retries": 1,
+        "agents": [
+            {"name": "architect"},
+            {"name": "implementation-planner"},
+            {"name": "developer"},
+            {"name": "qa"},
+            {"name": "template-validator"},
+        ],
+    }
+    _seed_research_run(
+        orchestrator.logger.log_dir,
+        "20260101_120200",
+        [{"agent_name": "product-manager", "handoff_summary": "agent: product-manager\nfindings:\n- summary\nrisks:\n- none\ndecisions:\n- none\nrecommended_next_tasks:\n- none"}],
+    )
+    previous_run = orchestrator.logger.log_dir / "run_20260101_120201" / "agents" / "implementation"
+    previous_run.mkdir(parents=True, exist_ok=True)
+    (previous_run / "architect.json").write_text(json.dumps({"status": "success", "parsed_output": "Architect output", "result": "completed"}), encoding="utf-8")
+    (previous_run / "implementation-planner.json").write_text(
+        json.dumps(
+            {
+                "status": "success",
+                "result": "completed",
+                "parsed_output": json.dumps(
+                    [
+                        {
+                            "id": "planner-task",
+                            "title": "Planner task",
+                            "priority": "P0",
+                            "scope": "Improve backend validation.",
+                            "existing_paths": ["workflow/orchestrator.py"],
+                            "allowed_paths": ["workflow/orchestrator.py"],
+                            "forbidden_paths": [],
+                            "required_test_paths": ["tests/test_workflow.py"],
+                            "acceptance_criteria": ["done"],
+                            "reason_each_path_is_needed": {"workflow/orchestrator.py": "Needed."},
+                            "risk_level": "low",
+                            "estimated_effort": "S",
+                        }
+                    ]
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (previous_run / "developer.json").write_text(
+        json.dumps(
+            {
+                "status": "no_changes",
+                "result": "Developer completed without modifying target files.",
+                "selected_task_id": "planner-task",
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls: list[str] = []
+
+    def fake_run_agent(agent_config, phase_key, index=None, total=None):
+        calls.append(agent_config["name"])
+        orchestrator.logger.save_agent_report(
+            "implementation",
+            agent_config["name"],
+            {
+                "status": "success",
+                "result": "completed",
+                "parsed_output": "done",
+                "selected_task_id": orchestrator.selected_task_ref,
+            },
+        )
+        return True
+
+    monkeypatch.setattr(orchestrator, "_run_agent", fake_run_agent)
+    monkeypatch.setattr(orchestrator, "_wait_for_user", lambda _prompt: True)
+    monkeypatch.setattr(orchestrator, "_enforce_implementation_scope_diff", lambda: True)
+    monkeypatch.setattr(orchestrator, "_prompt_post_implementation_action", lambda: "stop")
+
+    ok = orchestrator._run_implementation_phase()
+
+    assert ok is True
+    assert calls == ["developer", "qa", "template-validator"]
+    assert orchestrator.selected_task_ref == "planner-task"
+
+
 def test_retry_prompt_includes_previous_rejection_reason(tmp_path: Path, monkeypatch) -> None:
     engine_root = tmp_path / "engine"
     target_workspace = tmp_path / "target"
@@ -2412,6 +2551,75 @@ def test_developer_write_validation_blocks_path_outside_target_workspace(tmp_pat
 
     assert allowed is False
     assert "escapes target_workspace" in detail
+
+
+def test_developer_write_validation_blocks_paths_outside_contract_target_and_test(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (target_workspace / "docs").mkdir(parents=True, exist_ok=True)
+    (target_workspace / "tests").mkdir(parents=True, exist_ok=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    orchestrator._selected_implementation_item = {
+        "id": "docs-task",
+        "title": "Docs task",
+        "priority": "P1",
+        "scope": "Docs only.",
+        "existing_paths": [],
+        "new_files": ["docs/new-plan.md", "tests/test_plan.py"],
+        "allowed_paths": ["docs/new-plan.md", "tests/test_plan.py"],
+        "forbidden_paths": [],
+        "target_file": {"path": "docs/new-plan.md", "action": "create", "purpose": "Add plan"},
+        "test_file": {"path": "tests/test_plan.py"},
+        "acceptance_criteria": ["Docs updated."],
+        "reason_each_path_is_needed": {"docs/new-plan.md": "Needed."},
+        "risk_level": "low",
+        "estimated_effort": "S",
+    }
+    orchestrator._refresh_repo_map()
+
+    allowed, detail, _candidate = orchestrator._validate_direct_api_write_request("gateway-v4/app/services/monitoring.py", ["x"])
+
+    assert allowed is False
+    assert "violates" in detail
+
+
+def test_contract_compliance_detects_missing_test_file_and_missing_must_contain(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    target_file = target_workspace / "docs" / "new-plan.md"
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    target_file.write_text("hello\n", encoding="utf-8")
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    orchestrator._selected_implementation_item = {
+        "id": "docs-task",
+        "title": "Docs task",
+        "priority": "P1",
+        "scope": "Docs only.",
+        "target_file": {"path": "docs/new-plan.md", "action": "modify", "purpose": "Add plan"},
+        "test_file": {"path": "tests/test_plan.py"},
+        "must_contain": ["MUST_INCLUDE"],
+        "forbidden": ["DO_NOT_ADD"],
+        "contract_completeness": True,
+    }
+
+    diagnostics = orchestrator._evaluate_selected_task_contract_compliance()
+
+    assert diagnostics["contract_completeness"] is True
+    assert diagnostics["contract_compliance"] is False
+    assert diagnostics["missing_test_file"] is True
+    assert diagnostics["missing_must_contain"] == ["MUST_INCLUDE"]
 
 
 def test_repo_map_after_detects_newly_created_allowed_file(tmp_path: Path) -> None:
