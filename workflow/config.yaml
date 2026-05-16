@@ -128,13 +128,13 @@ phases:
         timeout: 2400
         max_retries: 3
         provider: openrouter
-        model: openrouter/deepseek/deepseek-chat-v3
+        model: openrouter/deepseek/deepseek-chat-v4
         thinking: low
       - name: qa
         description: "Run checks and report regressions"
         timeout: 900
         provider: openrouter
-        model: openrouter/deepseek/deepseek-chat-v3
+        model: openrouter/deepseek/deepseek-chat-v4
         thinking: low
       - name: template-validator
         description: "Validate output against template"

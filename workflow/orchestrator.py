@@ -730,7 +730,8 @@ class WorkflowOrchestrator:
             for line in parsed_output.splitlines():
                 self.logger.agent_progress(agent_name, line)
 
-        failure_reason = self._detect_agent_failure(stdout, stderr, parsed_output)
+        require_translation = not (phase == "implementation" and agent_name == "developer")
+        failure_reason = self._detect_agent_failure(stdout, stderr, parsed_output, require_translation=require_translation)
         if failure_reason:
             details = (
                 f"elapsed_s={elapsed:.2f}"
@@ -780,11 +781,17 @@ class WorkflowOrchestrator:
             self.logger.error("РќРµ СѓРґР°Р»РѕСЃСЊ СЃРѕР·РґР°С‚СЊ РІРµС‚РєСѓ", f"Git repository not found under {self.target_workspace}")
             return False
         try:
-            self.logger.git_operation("create-branch", branch_name)
             if self.repo.is_dirty(untracked_files=True):
                 self.repo.git.add(A=True)
                 self.repo.index.commit(f"Auto-commit before {branch_name}")
-            self.repo.git.checkout("-b", branch_name)
+            existing_branch_names = {head.name for head in self.repo.heads}
+            if branch_name in existing_branch_names:
+                self.logger.git_operation("checkout-existing-branch", branch_name)
+                if self.repo.head.is_detached or self.repo.active_branch.name != branch_name:
+                    self.repo.git.checkout(branch_name)
+            else:
+                self.logger.git_operation("create-branch", branch_name)
+                self.repo.git.checkout("-b", branch_name)
             self.current_branch = branch_name
             return True
         except Exception as exc:  # pragma: no cover
@@ -1160,6 +1167,14 @@ class WorkflowOrchestrator:
             "of the full answer. Keep both sections aligned in meaning. "
             "Do not omit the Russian translation section. Do not end the answer before that section appears."
         )
+        if phase == "implementation" and agent_name == "developer":
+            translation_instruction = (
+                "Output format is mandatory. Do not write narrative text, explanations, plans, or translations. "
+                "During the edit loop, respond only with one JSON tool request and no surrounding prose. "
+                "If you complete at least one file edit, the final non-JSON response must be exactly "
+                "`status=implemented`. If you cannot safely edit within scope, the final non-JSON response must be "
+                "`status=no_changes: <reason>`."
+            )
         context_profile = "default"
         repository_context = ""
         handoff_sources: list[str] = []
@@ -2018,8 +2033,9 @@ class WorkflowOrchestrator:
                     "Before writing, inspect the target files first. "
                     "Make the smallest viable backend-only change. "
                     "Do not return narrative-only output when a safe edit is required. "
-                    "If you cannot safely edit within scope, return normal text with status=no_changes and a clear reason. "
-                    "When you have enough information, return the final answer normally instead of JSON."
+                    "Keep using JSON tool requests until you have either completed a real file edit or determined that no safe scoped edit is possible. "
+                    "If you complete at least one file edit, your final non-JSON response must be exactly status=implemented. "
+                    "If you cannot safely edit within scope, your final non-JSON response must be status=no_changes: <reason>."
                 )
             if agent_name == "qa":
                 return base + (
@@ -2458,7 +2474,8 @@ class WorkflowOrchestrator:
             for line in parsed_output.splitlines():
                 self.logger.agent_progress(agent_name, line)
 
-        failure_reason = self._detect_agent_failure(stdout, "", parsed_output)
+        require_translation = not (phase == "implementation" and agent_name == "developer")
+        failure_reason = self._detect_agent_failure(stdout, "", parsed_output, require_translation=require_translation)
         if failure_reason:
             failure_status = self._classify_failure_status(failure_reason)
             self.logger.error(
@@ -2468,6 +2485,23 @@ class WorkflowOrchestrator:
             save_agent_report(failure_status, failure_reason, elapsed, stdout, "", parsed_output, command, 0)
             self.logger.agent_end(agent_name, failure_status, failure_reason)
             return False
+
+        if phase == "implementation" and agent_name == "developer":
+            developer_extras = self._get_agent_report_extras("implementation", "developer")
+            write_tools_used = developer_extras.get("write_tools_used", [])
+            normalized_output = str(parsed_output or "").strip()
+            normalized_output_lower = normalized_output.lower()
+            if write_tools_used:
+                if not normalized_output_lower.startswith("status=implemented"):
+                    parsed_output = "status=implemented"
+                    stdout_payload["output_text"] = parsed_output
+                    stdout = json.dumps(stdout_payload, ensure_ascii=False)
+            elif not normalized_output_lower.startswith("status=no_changes"):
+                reason = "Developer must use write_file/apply_patch or return status=no_changes: <reason>."
+                self.logger.error(f"Agent returned invalid direct_api output: {agent_name}", reason)
+                save_agent_report("no_changes", reason, elapsed, stdout, "", "status=no_changes: protocol_violation", command, 0)
+                self.logger.agent_end(agent_name, "no_changes", reason)
+                return False
 
         save_agent_report("success", "completed", elapsed, stdout, "", parsed_output, command, 0)
         self.logger.agent_end(agent_name, "success", "completed")
@@ -5419,7 +5453,7 @@ class WorkflowOrchestrator:
         return normalized[-limit:]
 
     @staticmethod
-    def _detect_agent_failure(stdout: str, stderr: str, parsed_output: str) -> str:
+    def _detect_agent_failure(stdout: str, stderr: str, parsed_output: str, require_translation: bool = True) -> str:
         combined = "\n".join(part for part in (stdout or "", stderr or "", parsed_output or "") if part).lower()
         if not combined:
             return ""
@@ -5431,7 +5465,7 @@ class WorkflowOrchestrator:
             return "llm idle timeout"
         if "did not produce a response" in combined:
             return "llm produced no response"
-        if parsed_output and "russian translation" not in parsed_output.lower():
+        if require_translation and parsed_output and "russian translation" not in parsed_output.lower():
             return "missing russian translation section"
         return ""
 

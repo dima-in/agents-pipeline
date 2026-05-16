@@ -978,6 +978,9 @@ def test_developer_write_tools_are_enabled_for_scoped_implementation(tmp_path: P
     assert '"tool":"write_file"' in bundle["system_message"]
     assert '"tool":"apply_patch"' in bundle["system_message"]
     assert "Developer must produce real file edits via write_file/apply_patch" in bundle["system_message"]
+    assert "Do not write narrative text, explanations, plans, or translations." in bundle["system_message"]
+    assert "`status=implemented`" in bundle["system_message"]
+    assert "Russian translation" not in bundle["system_message"]
     assert "Do not implement marketplace." in bundle["system_message"]
     assert "Do not change Stripe or billing flows." in bundle["system_message"]
     assert "Do not make broad frontend changes." in bundle["system_message"]
@@ -1787,7 +1790,7 @@ def test_developer_write_file_changes_target_file(monkeypatch, tmp_path: Path) -
 
     responses = [
         {"choices": [{"message": {"content": '{"tool":"write_file","path":"gateway-v4/app/services/monitoring.py","content":"updated\\n"}'}}], "model": "anthropic/claude-sonnet-4.6"},
-        {"choices": [{"message": {"content": "Implemented change.\n\nRussian translation\nРР·РјРµРЅРµРЅРёРµ РІС‹РїРѕР»РЅРµРЅРѕ."}}], "model": "anthropic/claude-sonnet-4.6", "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}},
+        {"choices": [{"message": {"content": "status=implemented"}}], "model": "anthropic/claude-sonnet-4.6", "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}},
     ]
     calls: list[dict[str, object]] = []
 
@@ -1807,6 +1810,7 @@ def test_developer_write_file_changes_target_file(monkeypatch, tmp_path: Path) -
     assert target_file.read_text(encoding="utf-8") == "updated\n"
     payload = json.loads((orchestrator.logger.run_dir / "agents" / "implementation" / "developer.json").read_text(encoding="utf-8"))
     assert payload["write_tools_used"] == ["write_file"]
+    assert payload["parsed_output"] == "status=implemented"
 
 
 def test_developer_apply_patch_changes_target_file(monkeypatch, tmp_path: Path) -> None:
@@ -1848,7 +1852,7 @@ def test_developer_apply_patch_changes_target_file(monkeypatch, tmp_path: Path) 
 
     responses = [
         {"choices": [{"message": {"content": '{"tool":"apply_patch","path":"gateway-v4/app/services/proxy.py","search":"old_value","replace":"new_value"}'}}], "model": "anthropic/claude-sonnet-4.6"},
-        {"choices": [{"message": {"content": "Patched file.\n\nRussian translation\nР¤Р°Р№Р» РёР·РјРµРЅРµРЅ."}}], "model": "anthropic/claude-sonnet-4.6", "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}},
+        {"choices": [{"message": {"content": "status=implemented"}}], "model": "anthropic/claude-sonnet-4.6", "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}},
     ]
     calls: list[dict[str, object]] = []
 
@@ -1868,6 +1872,61 @@ def test_developer_apply_patch_changes_target_file(monkeypatch, tmp_path: Path) 
     assert "new_value" in target_file.read_text(encoding="utf-8")
     payload = json.loads((orchestrator.logger.run_dir / "agents" / "implementation" / "developer.json").read_text(encoding="utf-8"))
     assert payload["write_tools_used"] == ["apply_patch"]
+    assert payload["parsed_output"] == "status=implemented"
+
+
+def test_developer_prose_without_write_tools_becomes_no_changes(monkeypatch, tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir(parents=True)
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (target_workspace / "README.md").write_text("target readme", encoding="utf-8")
+    target_file = target_workspace / "gateway-v4" / "app" / "services" / "monitoring.py"
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    target_file.write_text("initial\n", encoding="utf-8")
+    _ensure_temp_agent_prompt(engine_root, "implementation", "developer")
+
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    _seed_research_run(
+        orchestrator.logger.log_dir,
+        "20260101_120010",
+        [{"agent_name": "product-manager", "handoff_summary": "agent: product-manager\nfindings:\n- implement monitoring\nrisks:\n- none\ndecisions:\n- backend only\nrecommended_next_tasks:\n- edit monitoring file"}],
+    )
+
+    response = {"choices": [{"message": {"content": "Implementation plan: inspect code, then update monitoring."}}], "model": "anthropic/claude-sonnet-4.6", "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.setattr(orchestrator_module.urllib_request, "urlopen", lambda request, timeout=0: _FakeHTTPResponse(response))
+
+    ok = orchestrator._run_agent(
+        {"name": "developer", "description": "Implement the task", "timeout": 5, "provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.6"},
+        "implementation",
+    )
+
+    assert ok is False
+    payload = json.loads((orchestrator.logger.run_dir / "agents" / "implementation" / "developer.json").read_text(encoding="utf-8"))
+    assert payload["status"] == "no_changes"
+    assert payload["result"] == "Developer must use write_file/apply_patch or return status=no_changes: <reason>."
+    assert payload["parsed_output"] == "status=no_changes: protocol_violation"
 
 
 def test_developer_write_cannot_escape_target_workspace(tmp_path: Path) -> None:

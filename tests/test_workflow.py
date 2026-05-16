@@ -372,6 +372,37 @@ def test_project_id_is_derived_from_git_remote(tmp_path: Path) -> None:
     assert orchestrator.project_id == "github.com-example-acme-app"
 
 
+def test_create_git_branch_reuses_existing_branch(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    repo = git.Repo.init(target_workspace)
+    with repo.config_writer() as writer:
+        writer.set_value("user", "name", "Test")
+        writer.set_value("user", "email", "test@example.com")
+    tracked_file = target_workspace / "README.md"
+    tracked_file.write_text("init\n", encoding="utf-8")
+    repo.index.add(["README.md"])
+    repo.index.commit("init")
+    repo.git.checkout("-b", "feature/task_1")
+    repo.git.checkout("master")
+
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    orchestrator.config["git"]["enabled"] = True
+
+    ok = orchestrator._create_git_branch(1)
+
+    assert ok is True
+    assert orchestrator.current_branch == "feature/task_1"
+    assert repo.active_branch.name == "feature/task_1"
+
+
 def test_project_id_falls_back_to_folder_name_without_git_remote(tmp_path: Path) -> None:
     engine_root = tmp_path / "engine"
     target_workspace = tmp_path / "Sample Repo"
