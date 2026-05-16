@@ -794,6 +794,9 @@ def test_default_implementation_scope_is_loaded_from_config(tmp_path: Path) -> N
     monitoring_file = target_workspace / "gateway-v4" / "app" / "services" / "monitoring.py"
     monitoring_file.parent.mkdir(parents=True, exist_ok=True)
     monitoring_file.write_text("pass\n", encoding="utf-8")
+    monitoring_test = target_workspace / "tests" / "test_monitoring.py"
+    monitoring_test.parent.mkdir(parents=True, exist_ok=True)
+    monitoring_test.write_text("def test_monitoring():\n    assert True\n", encoding="utf-8")
     orchestrator = WorkflowOrchestrator(
         str(engine_root / "workflow" / "config.yaml"),
         engine_root=str(engine_root),
@@ -862,6 +865,9 @@ def test_planner_can_translate_invalid_architect_path_into_valid_workflow_path(t
     workflow_file = target_workspace / "workflow" / "orchestrator.py"
     workflow_file.parent.mkdir(parents=True, exist_ok=True)
     workflow_file.write_text("pass\n", encoding="utf-8")
+    workflow_test = target_workspace / "tests" / "test_workflow.py"
+    workflow_test.parent.mkdir(parents=True, exist_ok=True)
+    workflow_test.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
     orchestrator = WorkflowOrchestrator(
         str(engine_root / "workflow" / "config.yaml"),
         engine_root=str(engine_root),
@@ -887,12 +893,22 @@ def test_planner_can_translate_invalid_architect_path_into_valid_workflow_path(t
                     "title": "Workflow reliability fix",
                     "priority": "P0",
                     "scope": "Improve orchestration validation in workflow/orchestrator.py.",
-                    "existing_paths": ["workflow/orchestrator.py"],
-                    "allowed_paths": ["workflow/orchestrator.py"],
+                    "existing_paths": ["workflow/orchestrator.py", "tests/test_workflow.py"],
+                    "allowed_paths": ["workflow/orchestrator.py", "tests/test_workflow.py"],
                     "forbidden_paths": [],
                     "required_test_paths": ["tests/test_workflow.py"],
+                    "depends_on": [],
                     "acceptance_criteria": ["Workflow validation improved."],
-                    "reason_each_path_is_needed": {"workflow/orchestrator.py": "Needed."},
+                    "reason_each_path_is_needed": {"workflow/orchestrator.py": "Needed.", "tests/test_workflow.py": "Needed."},
+                    "target_file": {"path": "workflow/orchestrator.py", "action": "update", "purpose": "Improve workflow validation."},
+                    "test_file": {"path": "tests/test_workflow.py", "action": "update"},
+                    "must_contain": ["def _validate_implementation_planner_output(", "return {"],
+                    "must_import": ["from pathlib import Path"],
+                    "integration": ["Planner validation must align with implementation flow."],
+                    "reference_files": ["workflow/orchestrator.py"],
+                    "reference_excerpts": {"workflow/orchestrator.py": "pass"},
+                    "must_test": ["test_planner_validation_accepts_valid_workflow_path: assert diagnostics are valid"],
+                    "forbidden": ["Do not edit frontend files."],
                     "risk_level": "low",
                     "estimated_effort": "S",
                 }
@@ -929,6 +945,9 @@ def test_developer_write_tools_are_enabled_for_scoped_implementation(tmp_path: P
     monitoring_file = target_workspace / "gateway-v4" / "app" / "services" / "monitoring.py"
     monitoring_file.parent.mkdir(parents=True, exist_ok=True)
     monitoring_file.write_text("pass\n", encoding="utf-8")
+    monitoring_test = target_workspace / "tests" / "test_monitoring.py"
+    monitoring_test.parent.mkdir(parents=True, exist_ok=True)
+    monitoring_test.write_text("def test_monitoring():\n    assert True\n", encoding="utf-8")
     orchestrator = WorkflowOrchestrator(
         str(engine_root / "workflow" / "config.yaml"),
         engine_root=str(engine_root),
@@ -949,11 +968,25 @@ def test_developer_write_tools_are_enabled_for_scoped_implementation(tmp_path: P
                     "title": "Implement monitoring service changes",
                     "priority": "P0",
                     "scope": "Edit monitoring service only.",
-                    "existing_paths": ["gateway-v4/app/services/monitoring.py"],
-                    "allowed_paths": ["gateway-v4/app/services/monitoring.py"],
+                    "existing_paths": ["gateway-v4/app/services/monitoring.py", "tests/test_monitoring.py"],
+                    "allowed_paths": ["gateway-v4/app/services/monitoring.py", "tests/test_monitoring.py"],
                     "forbidden_paths": ["frontend/*"],
                     "required_test_paths": ["tests/test_monitoring.py"],
+                    "depends_on": [],
                     "acceptance_criteria": ["Monitoring service is updated."],
+                    "reason_each_path_is_needed": {
+                        "gateway-v4/app/services/monitoring.py": "Monitoring implementation target.",
+                        "tests/test_monitoring.py": "Required regression test.",
+                    },
+                    "target_file": {"path": "gateway-v4/app/services/monitoring.py", "action": "update", "purpose": "Add monitoring behavior."},
+                    "test_file": {"path": "tests/test_monitoring.py", "action": "update"},
+                    "must_contain": ["def record_request(", "response_time_ms"],
+                    "must_import": ["from typing import Any"],
+                    "integration": ["Provider calls must record metrics."],
+                    "reference_files": ["gateway-v4/app/services/monitoring.py"],
+                    "reference_excerpts": {"gateway-v4/app/services/monitoring.py": "pass"},
+                    "must_test": ["test_record_request_writes_to_db: assert metrics row exists"],
+                    "forbidden": ["Do not modify frontend files."],
                     "risk_level": "low",
                     "estimated_effort": "S",
                 }
@@ -972,7 +1005,7 @@ def test_developer_write_tools_are_enabled_for_scoped_implementation(tmp_path: P
     assert bundle["selected_task_scope"] == "Edit monitoring service only."
     assert bundle["selected_task_scope"] in bundle["system_message"]
     assert bundle["selected_task_id"] == "planner-backend-safe-task"
-    assert bundle["selected_task_allowed_paths"] == ["gateway-v4/app/services/monitoring.py"]
+    assert bundle["selected_task_allowed_paths"] == ["gateway-v4/app/services/monitoring.py", "tests/test_monitoring.py"]
     assert bundle["backlog_task_count"] == 1
     assert bundle["implementation_planner_output_chars"] > 0
     assert '"tool":"write_file"' in bundle["system_message"]
@@ -985,6 +1018,113 @@ def test_developer_write_tools_are_enabled_for_scoped_implementation(tmp_path: P
     assert "Do not change Stripe or billing flows." in bundle["system_message"]
     assert "Do not make broad frontend changes." in bundle["system_message"]
     assert "[selected-task-contract]" in bundle["system_message"]
+    assert "target_file.path: gateway-v4/app/services/monitoring.py" in bundle["system_message"]
+    assert "test_file.path: tests/test_monitoring.py" in bundle["system_message"]
+    assert "depends_on:" in bundle["system_message"]
+    assert "must_contain:" in bundle["system_message"]
+    assert "must_test:" in bundle["system_message"]
+    assert "Selected task file excerpts" in bundle["system_message"]
+    assert "## gateway-v4/app/services/monitoring.py" in bundle["system_message"]
+    assert "## tests/test_monitoring.py" in bundle["system_message"]
+    assert "start with read_file/read_files for those exact paths instead of list_files" in bundle["system_message"]
+
+
+def test_developer_context_includes_reference_files_for_new_file_parent_directory(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir()
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (target_workspace / "README.md").write_text("target readme", encoding="utf-8")
+    main_file = target_workspace / "gateway-v4" / "app" / "main.py"
+    main_file.parent.mkdir(parents=True, exist_ok=True)
+    main_file.write_text("app = object()\n", encoding="utf-8")
+    versions_dir = target_workspace / "gateway-v4" / "alembic" / "versions"
+    versions_dir.mkdir(parents=True, exist_ok=True)
+    (versions_dir / "000_base.py").write_text("def upgrade():\n    pass\n", encoding="utf-8")
+    (versions_dir / "000_other.py").write_text("def downgrade():\n    pass\n", encoding="utf-8")
+    model_test = target_workspace / "gateway-v4" / "tests" / "test_provider_metrics_model.py"
+    model_test.parent.mkdir(parents=True, exist_ok=True)
+    model_test.write_text("def test_model():\n    assert True\n", encoding="utf-8")
+
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    _seed_research_run(
+        orchestrator.logger.log_dir,
+        "20260101_120099",
+        [{"agent_name": "product-manager", "handoff_summary": "agent: product-manager\nfindings:\n- add migration\nrisks:\n- none\ndecisions:\n- backend only\nrecommended_next_tasks:\n- add migration"}],
+    )
+    _seed_implementation_report(
+        orchestrator.logger.run_dir,
+        "implementation-planner",
+        parsed_output=json.dumps(
+            [
+                {
+                    "id": "task-migration",
+                    "title": "Add migration",
+                    "priority": "P0",
+                    "scope": "Add a migration file.",
+                    "existing_paths": ["gateway-v4/app/main.py", "gateway-v4/tests/test_provider_metrics_model.py"],
+                    "new_files": ["gateway-v4/alembic/versions/001_add_provider_metrics.py"],
+                    "allowed_paths": [
+                        "gateway-v4/app/main.py",
+                        "gateway-v4/alembic/versions/001_add_provider_metrics.py",
+                        "gateway-v4/tests/test_provider_metrics_model.py",
+                    ],
+                    "forbidden_paths": ["frontend/*"],
+                    "required_test_paths": ["gateway-v4/tests/test_provider_metrics_model.py"],
+                    "depends_on": [],
+                    "reason_each_path_is_needed": {
+                        "gateway-v4/app/main.py": "Reference app wiring.",
+                        "gateway-v4/alembic/versions/001_add_provider_metrics.py": "Migration target.",
+                        "gateway-v4/tests/test_provider_metrics_model.py": "Migration regression test.",
+                    },
+                    "target_file": {"path": "gateway-v4/alembic/versions/001_add_provider_metrics.py", "action": "create", "purpose": "Add provider metrics migration."},
+                    "test_file": {"path": "gateway-v4/tests/test_provider_metrics_model.py", "action": "update"},
+                    "must_contain": ["def upgrade()", "def downgrade()"],
+                    "must_import": ["alembic.op", "sqlalchemy as sa"],
+                    "integration": ["Migration must align with provider metrics data model."],
+                    "reference_files": ["gateway-v4/app/main.py"],
+                    "reference_excerpts": {"gateway-v4/app/main.py": "app = object()"},
+                    "must_test": ["test_provider_metrics_model_migration: assert migration metadata is valid"],
+                    "forbidden": ["Do not edit frontend files."],
+                    "acceptance_criteria": ["Migration added."],
+                    "risk_level": "low",
+                    "estimated_effort": "S",
+                }
+            ]
+        ),
+    )
+
+    bundle = orchestrator._build_agent_message_bundle(
+        "developer",
+        {"name": "developer", "description": "Implement the task"},
+        Path(".openclaw/agents/implementation/developer/prompt.md"),
+        "implementation",
+    )
+
+    assert "Selected task file excerpts" in bundle["system_message"]
+    assert "### sibling files in gateway-v4/alembic/versions" in bundle["system_message"]
+    assert "gateway-v4/alembic/versions/000_base.py" in bundle["system_message"]
+    assert "### reference file excerpts from gateway-v4/alembic/versions" in bundle["system_message"]
+    assert "## gateway-v4/alembic/versions/000_base.py" in bundle["system_message"]
 
 
 def test_backlog_is_generated_from_implementation_planner_output(tmp_path: Path) -> None:
@@ -1015,6 +1155,12 @@ def test_backlog_is_generated_from_implementation_planner_output(tmp_path: Path)
     monitoring_file = target_workspace / "gateway-v4" / "app" / "services" / "monitoring.py"
     monitoring_file.parent.mkdir(parents=True, exist_ok=True)
     monitoring_file.write_text("pass\n", encoding="utf-8")
+    monitoring_test = target_workspace / "tests" / "test_monitoring.py"
+    monitoring_test.parent.mkdir(parents=True, exist_ok=True)
+    monitoring_test.write_text("def test_monitoring():\n    assert True\n", encoding="utf-8")
+    monitoring_test = target_workspace / "tests" / "test_monitoring.py"
+    monitoring_test.parent.mkdir(parents=True, exist_ok=True)
+    monitoring_test.write_text("def test_monitoring():\n    assert True\n", encoding="utf-8")
     frontend_file = target_workspace / "frontend" / "src" / "App.jsx"
     frontend_file.parent.mkdir(parents=True, exist_ok=True)
     frontend_file.write_text("export default null;\n", encoding="utf-8")
@@ -1045,11 +1191,25 @@ def test_backlog_is_generated_from_implementation_planner_output(tmp_path: Path)
                     "title": "Backend first task",
                     "priority": "P0",
                     "scope": "Touch backend only.",
-                    "existing_paths": ["gateway-v4/app/services/monitoring.py"],
-                    "allowed_paths": ["gateway-v4/app/services/monitoring.py"],
+                    "existing_paths": ["gateway-v4/app/services/monitoring.py", "tests/test_monitoring.py"],
+                    "allowed_paths": ["gateway-v4/app/services/monitoring.py", "tests/test_monitoring.py"],
                     "forbidden_paths": [],
                     "required_test_paths": ["tests/test_monitoring.py"],
+                    "depends_on": [],
                     "acceptance_criteria": ["Backend updated."],
+                    "reason_each_path_is_needed": {
+                        "gateway-v4/app/services/monitoring.py": "Backend implementation target.",
+                        "tests/test_monitoring.py": "Required regression test.",
+                    },
+                    "target_file": {"path": "gateway-v4/app/services/monitoring.py", "action": "update", "purpose": "Backend update."},
+                    "test_file": {"path": "tests/test_monitoring.py", "action": "update"},
+                    "must_contain": ["def record_request(", "response_time_ms"],
+                    "must_import": ["from typing import Any"],
+                    "integration": ["Provider flow must call record_request."],
+                    "reference_files": ["gateway-v4/app/services/monitoring.py"],
+                    "reference_excerpts": {"gateway-v4/app/services/monitoring.py": "pass"},
+                    "must_test": ["test_record_request_updates_metrics: assert metrics update succeeds"],
+                    "forbidden": ["Do not edit frontend files."],
                     "risk_level": "low",
                     "estimated_effort": "S",
                 },
@@ -1089,6 +1249,9 @@ def test_developer_prompt_receives_only_selected_task_not_raw_architect_plan(tmp
     monitoring_file = target_workspace / "gateway-v4" / "app" / "services" / "monitoring.py"
     monitoring_file.parent.mkdir(parents=True, exist_ok=True)
     monitoring_file.write_text("pass\n", encoding="utf-8")
+    monitoring_test = target_workspace / "tests" / "test_monitoring.py"
+    monitoring_test.parent.mkdir(parents=True, exist_ok=True)
+    monitoring_test.write_text("def test_monitoring():\n    assert True\n", encoding="utf-8")
     monitoring_file = target_workspace / "gateway-v4" / "app" / "services" / "monitoring.py"
     monitoring_file.parent.mkdir(parents=True, exist_ok=True)
     monitoring_file.write_text("pass\n", encoding="utf-8")
@@ -1129,11 +1292,25 @@ def test_developer_prompt_receives_only_selected_task_not_raw_architect_plan(tmp
                     "title": "Safe backend task",
                     "priority": "P0",
                     "scope": "Touch gateway-v4/app/services/monitoring.py only.",
-                    "existing_paths": ["gateway-v4/app/services/monitoring.py"],
-                    "allowed_paths": ["gateway-v4/app/services/monitoring.py"],
+                    "existing_paths": ["gateway-v4/app/services/monitoring.py", "tests/test_monitoring.py"],
+                    "allowed_paths": ["gateway-v4/app/services/monitoring.py", "tests/test_monitoring.py"],
                     "forbidden_paths": ["frontend/*", "gateway-v4/app/services/marketplace.py"],
                     "required_test_paths": ["tests/test_monitoring.py"],
+                    "depends_on": [],
                     "acceptance_criteria": ["Monitoring file updated."],
+                    "reason_each_path_is_needed": {
+                        "gateway-v4/app/services/monitoring.py": "Backend implementation target.",
+                        "tests/test_monitoring.py": "Required regression test.",
+                    },
+                    "target_file": {"path": "gateway-v4/app/services/monitoring.py", "action": "update", "purpose": "Implement monitoring changes."},
+                    "test_file": {"path": "tests/test_monitoring.py", "action": "update"},
+                    "must_contain": ["def record_request(", "response_time_ms"],
+                    "must_import": ["from typing import Any"],
+                    "integration": ["Provider flow must call record_request after each request."],
+                    "reference_files": ["gateway-v4/app/services/monitoring.py"],
+                    "reference_excerpts": {"gateway-v4/app/services/monitoring.py": "pass"},
+                    "must_test": ["test_record_request_updates_metrics: assert metrics update succeeds"],
+                    "forbidden": ["Do not edit frontend files."],
                     "risk_level": "low",
                     "estimated_effort": "S",
                 }
@@ -1151,6 +1328,52 @@ def test_developer_prompt_receives_only_selected_task_not_raw_architect_plan(tmp
     assert "safe-backend-task" in bundle["system_message"]
     assert "gateway-v4/app/services/monitoring.py" in bundle["system_message"]
     assert "Broad architect plan:" not in bundle["system_message"]
+    assert "developer_contract:" in bundle["system_message"]
+
+
+def test_planner_task_normalization_populates_developer_contract() -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+
+    normalized, errors = orchestrator._normalize_planner_task(
+        {
+            "id": "TASK-001",
+            "title": "Add migration",
+            "priority": "P0",
+            "scope": "Create migration.",
+            "existing_paths": ["gateway-v4/app/main.py"],
+            "new_files": ["gateway-v4/alembic/versions/001_add_provider_metrics.py"],
+            "allowed_paths": ["gateway-v4/app/main.py", "gateway-v4/alembic/versions/001_add_provider_metrics.py"],
+            "required_test_paths": ["gateway-v4/tests/test_provider_metrics_model.py"],
+            "target_file": {
+                "path": "gateway-v4/alembic/versions/001_add_provider_metrics.py",
+                "action": "create",
+                "purpose": "Add alembic migration for provider metrics",
+            },
+            "must_contain": ["def upgrade()", "def downgrade()"],
+            "must_import": ["alembic.op", "sqlalchemy as sa"],
+            "integration": ["Migration must align with the provider metrics ORM model."],
+            "reference_files": ["gateway-v4/app/main.py"],
+            "reference_excerpts": {"gateway-v4/app/main.py": "from fastapi import FastAPI"},
+            "test_file": {"path": "gateway-v4/tests/test_provider_metrics_model.py"},
+            "must_test": ["Migration table columns match the model."],
+            "forbidden": ["modify billing code"],
+            "acceptance_criteria": ["Migration exists."],
+            "reason_each_path_is_needed": {
+                "gateway-v4/app/main.py": "Reference wiring.",
+                "gateway-v4/alembic/versions/001_add_provider_metrics.py": "Target migration file.",
+            },
+            "risk_level": "low",
+            "estimated_effort": "S",
+        },
+        item_index=1,
+    )
+
+    assert errors == []
+    assert normalized is not None
+    assert normalized["target_file"]["path"] == "gateway-v4/alembic/versions/001_add_provider_metrics.py"
+    assert normalized["test_file"]["path"] == "gateway-v4/tests/test_provider_metrics_model.py"
+    assert normalized["must_contain"] == ["def upgrade()", "def downgrade()"]
+    assert normalized["contract_completeness"] is True
 
 
 def test_implementation_planner_receives_architect_output_after_architect(tmp_path: Path) -> None:
@@ -1293,6 +1516,11 @@ def test_task_id_selects_planner_backlog_item_non_interactively(tmp_path: Path) 
     proxy_file = target_workspace / "gateway-v4" / "app" / "services" / "proxy.py"
     proxy_file.parent.mkdir(parents=True, exist_ok=True)
     proxy_file.write_text("pass\n", encoding="utf-8")
+    first_test = target_workspace / "tests" / "test_monitoring.py"
+    first_test.parent.mkdir(parents=True, exist_ok=True)
+    first_test.write_text("def test_monitoring():\n    assert True\n", encoding="utf-8")
+    second_test = target_workspace / "tests" / "test_proxy.py"
+    second_test.write_text("def test_proxy():\n    assert True\n", encoding="utf-8")
     _seed_research_run(
         orchestrator.logger.log_dir,
         "20260101_120014",
@@ -1304,31 +1532,59 @@ def test_task_id_selects_planner_backlog_item_non_interactively(tmp_path: Path) 
         parsed_output=json.dumps(
             [
                 {
-                    "id": "first-task",
-                    "title": "First task",
-                    "priority": "P0",
-                    "scope": "First scope",
-                    "existing_paths": ["gateway-v4/app/services/monitoring.py"],
-                    "allowed_paths": ["gateway-v4/app/services/monitoring.py"],
-                    "forbidden_paths": [],
-                    "required_test_paths": ["tests/test_monitoring.py"],
-                    "acceptance_criteria": ["First done"],
-                    "risk_level": "low",
-                    "estimated_effort": "S",
-                },
-                {
-                    "id": "second-task",
-                    "title": "Second task",
-                    "priority": "P1",
-                    "scope": "Second scope",
-                    "existing_paths": ["gateway-v4/app/services/proxy.py"],
-                    "allowed_paths": ["gateway-v4/app/services/proxy.py"],
-                    "forbidden_paths": [],
-                    "required_test_paths": ["tests/test_proxy.py"],
-                    "acceptance_criteria": ["Second done"],
-                    "risk_level": "low",
-                    "estimated_effort": "S",
-                },
+                        "id": "first-task",
+                        "title": "First task",
+                        "priority": "P0",
+                        "scope": "First scope",
+                        "existing_paths": ["gateway-v4/app/services/monitoring.py", "tests/test_monitoring.py"],
+                        "allowed_paths": ["gateway-v4/app/services/monitoring.py", "tests/test_monitoring.py"],
+                        "forbidden_paths": [],
+                        "required_test_paths": ["tests/test_monitoring.py"],
+                        "depends_on": [],
+                        "acceptance_criteria": ["First done"],
+                        "reason_each_path_is_needed": {
+                            "gateway-v4/app/services/monitoring.py": "First target.",
+                            "tests/test_monitoring.py": "First test.",
+                        },
+                        "target_file": {"path": "gateway-v4/app/services/monitoring.py", "action": "update", "purpose": "First backend update."},
+                        "test_file": {"path": "tests/test_monitoring.py", "action": "update"},
+                        "must_contain": ["def record_request(", "response_time_ms"],
+                        "must_import": ["from typing import Any"],
+                        "integration": ["Provider flow uses monitoring."],
+                        "reference_files": ["gateway-v4/app/services/monitoring.py"],
+                        "reference_excerpts": {"gateway-v4/app/services/monitoring.py": "pass"},
+                        "must_test": ["test_record_request_updates_metrics: assert metrics update succeeds"],
+                        "forbidden": ["Do not edit frontend files."],
+                        "risk_level": "low",
+                        "estimated_effort": "S",
+                    },
+                    {
+                        "id": "second-task",
+                        "title": "Second task",
+                        "priority": "P1",
+                        "scope": "Second scope",
+                        "existing_paths": ["gateway-v4/app/services/proxy.py", "tests/test_proxy.py"],
+                        "allowed_paths": ["gateway-v4/app/services/proxy.py", "tests/test_proxy.py"],
+                        "forbidden_paths": [],
+                        "required_test_paths": ["tests/test_proxy.py"],
+                        "depends_on": [],
+                        "acceptance_criteria": ["Second done"],
+                        "reason_each_path_is_needed": {
+                            "gateway-v4/app/services/proxy.py": "Second target.",
+                            "tests/test_proxy.py": "Second test.",
+                        },
+                        "target_file": {"path": "gateway-v4/app/services/proxy.py", "action": "update", "purpose": "Second backend update."},
+                        "test_file": {"path": "tests/test_proxy.py", "action": "update"},
+                        "must_contain": ["async def call_provider(", "time.monotonic()"],
+                        "must_import": ["import time"],
+                        "integration": ["Proxy flow must measure provider timing."],
+                        "reference_files": ["gateway-v4/app/services/proxy.py"],
+                        "reference_excerpts": {"gateway-v4/app/services/proxy.py": "pass"},
+                        "must_test": ["test_call_provider_records_metrics: assert metrics call happens"],
+                        "forbidden": ["Do not edit frontend files."],
+                        "risk_level": "low",
+                        "estimated_effort": "S",
+                    },
             ]
         ),
     )
@@ -1716,6 +1972,72 @@ def test_direct_api_retrieval_reads_local_file_and_requeries(monkeypatch, tmp_pa
     assert payload["project_id"] == orchestrator.project_id
 
 
+def test_direct_api_retrieval_parses_fenced_json_with_preface() -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+
+    payload = orchestrator._parse_direct_api_retrieval_request(
+        "I'll inspect the file first.\n\n```json\n{\"tool\":\"read_file\",\"path\":\"gateway-v4/app/main.py\"}\n```"
+    )
+
+    assert payload == {"tool": "read_file", "path": "gateway-v4/app/main.py"}
+
+
+def test_direct_api_retrieval_parses_multiple_xml_read_file_tags() -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+
+    payload = orchestrator._parse_direct_api_retrieval_request(
+        "I'll inspect both files first.\n\n"
+        "<read_file path=\"gateway-v4/tests/test_provider_metrics_model.py\"/>\n"
+        "<read_file path=\"gateway-v4/app/main.py\"/>"
+    )
+
+    assert payload == {
+        "tool": "read_files",
+        "paths": [
+            "gateway-v4/tests/test_provider_metrics_model.py",
+            "gateway-v4/app/main.py",
+        ],
+    }
+
+
+def test_direct_api_retrieval_parses_function_style_tool_calls() -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+
+    payload = orchestrator._parse_direct_api_retrieval_request(
+        "I'll inspect the reference files first.\n"
+        'read_file({"path": "gateway-v4/app/main.py"})\n'
+        'read_file({"path": "gateway-v4/tests/test_provider_metrics_model.py"})\n'
+        'list_files({"directory": "gateway-v4/alembic", "max_depth": 2})'
+    )
+
+    assert payload == {
+        "tool": "read_files",
+        "paths": [
+            "gateway-v4/app/main.py",
+            "gateway-v4/tests/test_provider_metrics_model.py",
+        ],
+    }
+
+
+def test_direct_api_retrieval_parses_tool_call_prefixed_calls() -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+
+    payload = orchestrator._parse_direct_api_retrieval_request(
+        'I will inspect first.\n'
+        '<tool_call>read_file(path="gateway-v4/app/main.py")\n'
+        '<tool_call>read_file(path="gateway-v4/tests/test_provider_metrics_model.py")\n'
+        '<tool_call>list_files(directory="gateway-v4/alembic", max_depth="3")'
+    )
+
+    assert payload == {
+        "tool": "read_files",
+        "paths": [
+            "gateway-v4/app/main.py",
+            "gateway-v4/tests/test_provider_metrics_model.py",
+        ],
+    }
+
+
 def test_direct_api_retrieval_cannot_escape_target_workspace(tmp_path: Path) -> None:
     engine_root = tmp_path / "engine"
     target_workspace = tmp_path / "target"
@@ -1749,6 +2071,86 @@ def test_direct_api_retrieval_cannot_escape_target_workspace(tmp_path: Path) -> 
     assert orchestrator._direct_api_read_files(["../secret.txt"], limit=2000) == ""
     assert orchestrator._direct_api_list_files("..", max_depth=2) == ""
     assert "inside.txt" in orchestrator._direct_api_list_files(".", max_depth=2)
+
+
+def test_developer_search_text_is_blocked_when_exact_task_context_exists(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir()
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    orchestrator._selected_implementation_item = {
+        "existing_paths": ["gateway-v4/app/main.py"],
+        "new_files": ["gateway-v4/alembic/versions/001_add_provider_metrics.py"],
+        "allowed_paths": ["gateway-v4/app/main.py", "gateway-v4/alembic/versions/001_add_provider_metrics.py"],
+    }
+
+    result = orchestrator._execute_direct_api_retrieval_request(
+        {"tool": "search_text", "pattern": "alembic"},
+        phase="implementation",
+        agent_name="developer",
+    )
+
+    assert "search_text is disabled for developer in implementation mode" in result
+
+
+def test_developer_list_files_is_blocked_in_implementation_mode(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir()
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    orchestrator._selected_implementation_item = {
+        "existing_paths": ["gateway-v4/app/main.py"],
+        "new_files": ["gateway-v4/alembic/versions/001_add_provider_metrics.py"],
+        "allowed_paths": ["gateway-v4/app/main.py", "gateway-v4/alembic/versions/001_add_provider_metrics.py"],
+    }
+
+    result = orchestrator._execute_direct_api_retrieval_request(
+        {"tool": "list_files", "directory": "gateway-v4/alembic", "max_depth": 2},
+        phase="implementation",
+        agent_name="developer",
+    )
+
+    assert "list_files is disabled for developer in implementation mode" in result
 
 
 def test_developer_write_file_changes_target_file(monkeypatch, tmp_path: Path) -> None:
