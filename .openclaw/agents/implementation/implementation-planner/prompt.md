@@ -2,7 +2,7 @@
 
 Convert the selected implementation scope, product-manager summary, architect technical plan, and target project context into a small prioritized implementation backlog.
 
-Return only structured YAML or JSON. Each task must contain:
+Return only structured YAML or JSON. This agent produces backlog outlines, not the final developer contract. Each task must contain:
 - `id`
 - `title`
 - `priority`
@@ -19,17 +19,8 @@ Return only structured YAML or JSON. Each task must contain:
   - `path`
   - `action` (`create` or `update`)
   - `purpose`
-- `must_contain`
-- `must_import`
-- `integration`
 - `reference_files`
-- `reference_excerpts`
-- `test_file` with:
-  - `path`
-  - `action` (`create` or `update`)
 - `depends_on` (empty array if no dependencies)
-- `must_test`
-- `forbidden`
 - `risk_level`
 - `estimated_effort`
 
@@ -67,35 +58,23 @@ Rules:
 - Every backend implementation task must include at least one test path unless the task is docs-only or config-only.
 - `forbidden_paths` must not block `required_test_paths`.
 - `reason_each_path_is_needed` must explain why each path is needed.
+- `target_file.path` must be one exact file from `new_files` or `existing_paths`.
+- `target_file.action` must be `create` or `update`.
+- `reference_files` must be exact existing reference files from `repo_map`.
+- `depends_on` should list earlier task ids only when the task needs artifacts created by earlier tasks.
 - Test package scaffolding rule:
   - if `required_test_paths` includes a file under a test directory that does not yet exist in `repo_map` such as `gateway-v4/tests/test_*.py`, you must:
     - add `gateway-v4/tests` to `new_directories`
     - add `gateway-v4/tests/__init__.py` to `new_files`
     - add `gateway-v4/tests/__init__.py` to `allowed_paths`
     - declare each new test file in both `new_files` and `required_test_paths`
-- Every task must include a full developer contract.
-- `target_file.path` must be one exact file from `new_files` or `existing_paths`.
-- `target_file.action` must be `create` or `update`.
-- `test_file.path` must be one exact file from `required_test_paths`.
-- `test_file.action` must be `create` or `update`.
-- `depends_on` must be present on every backend task, even when empty.
-- `reference_files` must be exact existing reference files from `repo_map`.
-- `reference_excerpts` must summarize concrete code snippets from the provided file excerpts context, not invented code.
-- `must_contain` must have 2-5 items and must describe concrete fields/functions/statements expected in `target_file.path`.
-- `must_import` must list the imports developer should use in `target_file.path` when relevant.
-- `integration` must explain how the target file connects to existing code.
-- `must_test` must have 1-3 items and each item must name a concrete test function or assertion target.
-- `forbidden` must list concrete things developer must not do in this task.
-- Do not use vague contract text such as `implement monitoring`, `add functionality`, `create system`, or `handle routing`.
 - Do not include commentary outside the YAML or JSON payload.
 
 CRITICAL RULES:
 - `target_file.path` MUST appear in `allowed_paths`.
-- `test_file.path` MUST appear in `required_test_paths`.
 - For files, `allowed_paths` declarations must resolve through `existing_paths` or `new_files`; `new_directories` is only valid for directory paths.
-- `must_contain` MUST contain exact code signatures, field declarations, or statements, not roadmap prose.
-- `must_test` MUST contain exact test function names plus what each test asserts.
 - If task B uses code created by task A, declare `depends_on: ["TASK-A"]`.
+- Leave detailed code signatures, imports, concrete test assertions, and forbidden implementation actions to the downstream `task-designer` agent. Do not try to generate the full developer contract here.
 
 Example valid task fragment for a new test package:
 
@@ -126,26 +105,8 @@ Example valid task fragment for a new test package:
     path: gateway-v4/app/services/router.py
     action: update
     purpose: Add the routing behavior required by this task.
-  must_contain:
-    - "def select_provider(...):"
-    - "metrics.get_provider_stats(...)"
-  must_import:
-    - "from typing import Any"
-    - "from app.services.monitoring import MetricsCollector"
-  integration:
-    - Connect the router changes to the existing provider selection flow.
   reference_files:
     - gateway-v4/app/services/router.py
-  reference_excerpts:
-    - Existing router service under update.
-  test_file:
-    path: gateway-v4/tests/test_router_smart.py
-    action: create
-  must_test:
-    - "test_select_provider_uses_metrics: mock metrics stats and assert the lowest-latency provider is selected"
-    - "test_select_provider_falls_back_without_metrics: assert round-robin fallback when stats are missing"
-  forbidden:
-    - Do not touch billing or frontend files.
   reason_each_path_is_needed:
     gateway-v4/app/services/router.py: "Existing router service being updated"
     gateway-v4/tests/__init__.py: "Package marker for the new test directory"
@@ -179,23 +140,8 @@ Example for migration files:
     path: gateway-v4/alembic/versions/20240801_add_provider_metrics.py
     action: create
     purpose: Create the migration for provider metrics storage.
-  must_contain:
-    - "def upgrade():"
-    - "op.create_table("
-  must_import:
-    - "from alembic import op"
-    - "import sqlalchemy as sa"
-  integration:
-    - Migration must match the ProviderMetrics ORM schema.
   reference_files:
     - gateway-v4/app/main.py
-  reference_excerpts:
-    - Existing app entrypoint referenced for current DB wiring context.
-  test_file:
-    path: gateway-v4/tests/test_migration_indexes.py
-    action: create
-  must_test:
-    - "test_provider_metrics_migration_upgrade: run upgrade and assert the table exists"
   reason_each_path_is_needed:
     gateway-v4/app/main.py: Existing app entrypoint referenced for current DB wiring context.
     gateway-v4/alembic/versions/20240801_add_provider_metrics.py: New migration file created by this task.
@@ -214,6 +160,5 @@ Self-check before output:
 - For every path in `new_files`, confirm its parent already exists in `repo_map` or is listed in `new_directories`.
 - For every missing parent directory, confirm it is listed in `new_directories`.
 - For every backend task, confirm `required_test_paths` is present and consistent with the declared test files.
-- For every backend task, confirm `target_file.path` is in `allowed_paths` and `test_file.path` is in `required_test_paths`.
-- For every backend task, confirm `must_contain` has 2-5 concrete code signatures and `must_test` has 1-3 concrete test assertions.
-- For every backend task, confirm `depends_on` is present even if it is an empty array.
+- For every backend task, confirm `target_file.path` is in `allowed_paths`.
+- For every task that uses artifacts from earlier tasks, confirm `depends_on` names those earlier task ids.

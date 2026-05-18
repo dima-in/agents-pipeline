@@ -123,12 +123,18 @@ phases:
         provider: openrouter
         model: openrouter/anthropic/claude-sonnet-4.5
         thinking: low
+      - name: task-designer
+        description: "Convert the selected backlog item into a machine-executable developer contract"
+        timeout: 900
+        provider: openrouter
+        model: openrouter/anthropic/claude-sonnet-4.5
+        thinking: low
       - name: developer
         description: "Implement the task"
         timeout: 2400
         max_retries: 3
         provider: openrouter
-        model: openrouter/deepseek/deepseek-chat-v4
+        model: openrouter/anthropic/claude-sonnet-4.5
         thinking: low
       - name: qa
         description: "Run checks and report regressions"

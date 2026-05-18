@@ -122,6 +122,10 @@ class WorkflowOrchestrator:
         self._architect_output_source = ""
         self._planner_retry_count = 0
         self._planner_retry_reason = ""
+        self._task_designer_validation_errors: list[str] = []
+        self._task_designer_feedback_file = ""
+        self._task_designer_feedback_source = ""
+        self._task_designer_rejection_reason = ""
         self._implementation_attempt = 0
         self._repo_map_cache: dict[str, Any] | None = None
         self._repo_map_before: dict[str, Any] | None = None
@@ -218,6 +222,10 @@ class WorkflowOrchestrator:
         self._architect_output_source = ""
         self._planner_retry_count = 0
         self._planner_retry_reason = ""
+        self._task_designer_validation_errors = []
+        self._task_designer_feedback_file = ""
+        self._task_designer_feedback_source = ""
+        self._task_designer_rejection_reason = ""
         self._implementation_attempt = 0
         self.logger.phase_start(phase["name"])
         research_reports, _run_dir = self._load_latest_project_research_reports()
@@ -241,6 +249,10 @@ class WorkflowOrchestrator:
             if not self._reuse_planner_output_for_current_run():
                 self.logger.phase_end(phase["name"], "failed")
                 return False
+        if self._should_reuse_task_designer_for_implementation():
+            if not self._reuse_task_designer_output_for_current_run():
+                self.logger.phase_end(phase["name"], "failed")
+                return False
         self.task_counter += 1
         task_id = self.task_counter
 
@@ -257,13 +269,17 @@ class WorkflowOrchestrator:
             self._implementation_attempt = attempt
             self.logger.info(f"Попытка реализации {attempt}/{max_retries}")
             ok = self._run_phase_agents(phase, "implementation")
-            if not ok and self._phase_failure_status in {"scope_violation", "no_changes", "planner_invalid"}:
+            if not ok and self._phase_failure_status in {"scope_violation", "no_changes", "planner_invalid", "task_designer_invalid"}:
                 if self.config["git"]["enabled"] and self.config["git"]["auto_rollback"]:
                     self._rollback_git(self._phase_failure_status.replace("_", " "))
                 self.logger.save_phase_summary("implementation", phase["name"])
                 self.logger.phase_end(phase["name"], self._phase_failure_status)
                 return False
             if ok:
+                if self._implementation_resume_stops_before_delivery():
+                    self.logger.save_phase_summary("implementation", phase["name"])
+                    self.logger.phase_end(phase["name"], "planner_ready")
+                    return True
                 self._mark_implementation_task_completed()
                 if self.config["git"]["enabled"] and not self._merge_git():
                     self.logger.save_phase_summary("implementation", phase["name"])
@@ -291,6 +307,9 @@ class WorkflowOrchestrator:
         self.logger.phase_end(phase["name"], self._phase_failure_status or "failed")
         return False
 
+    def _implementation_resume_stops_before_delivery(self) -> bool:
+        return self.retry_agent_name == "implementation-planner" or self.from_agent_name == "implementation-planner"
+
     def _run_phase_agents(self, phase: dict[str, Any], phase_key: str) -> bool:
         total = len(phase["agents"])
         fail_fast = bool(phase.get("fail_fast", False))
@@ -305,14 +324,26 @@ class WorkflowOrchestrator:
             if not self._wait_for_user(f"Запустить агента {agent['name']} ({index}/{total})?"):
                 self.logger.warning(f"Агент пропущен: {agent['name']}")
                 continue
-            if phase_key == "implementation" and agent["name"] in {"implementation-planner", "developer"}:
+            if phase_key == "implementation" and agent["name"] in {"implementation-planner", "task-designer", "developer"}:
                 if not self._ensure_repo_map_workspace_consistency(agent["name"]):
+                    had_failures = True
+                    return False
+            if phase_key == "implementation" and agent["name"] == "task-designer":
+                selection = self._prepare_implementation_backlog_selection(require_backlog=True)
+                if selection["error"]:
+                    self.logger.error(selection["error"])
                     had_failures = True
                     return False
             if phase_key == "implementation" and agent["name"] == "developer":
                 selection = self._prepare_implementation_backlog_selection(require_backlog=True)
                 if selection["error"]:
                     self.logger.error(selection["error"])
+                    had_failures = True
+                    return False
+                task_designer_required = any(str(candidate.get("name") or "") == "task-designer" for candidate in phase.get("agents", []))
+                if task_designer_required and str((self._selected_implementation_item or {}).get("contract_source") or "") != "task-designer":
+                    self.logger.error("Task designer output is missing. Run task-designer before developer.")
+                    self._phase_failure_status = "task_designer_invalid"
                     had_failures = True
                     return False
                 if not self._enforce_implementation_scope_plan():
@@ -324,6 +355,11 @@ class WorkflowOrchestrator:
                     return False
             if phase_key == "implementation" and agent["name"] == "implementation-planner":
                 if not self._validate_or_repair_implementation_planner(agent, phase_key, index=index, total=total):
+                    had_failures = True
+                    return False
+            if phase_key == "implementation" and agent["name"] == "task-designer":
+                task_designer_report = self._load_saved_agent_report("implementation", "task-designer") or {}
+                if not self._apply_task_designer_contract_from_report(task_designer_report):
                     had_failures = True
                     return False
             if phase_key == "implementation" and agent["name"] == "developer":
@@ -1187,6 +1223,11 @@ class WorkflowOrchestrator:
                 "If you complete at least one file edit, the final non-JSON response must be exactly "
                 "`status=implemented`. If you cannot safely edit within scope, the final non-JSON response must be "
                 "`status=no_changes: <reason>`."
+            )
+        elif phase == "implementation" and agent_name == "task-designer":
+            translation_instruction = (
+                "Output format is mandatory. Return only structured YAML or JSON for the selected task contract. "
+                "Do not add translations, explanations, markdown fences, or commentary."
             )
         context_profile = "default"
         repository_context = ""
@@ -3309,7 +3350,7 @@ class WorkflowOrchestrator:
             ("Target dependency and config files", self._build_target_dependency_context(limit=2200)),
             ("Target top-level tree up to depth 4", self._build_top_level_tree(root=self.target_workspace, depth=4)),
         ]
-        if agent_name in {"developer", "qa", "template-validator"}:
+        if agent_name in {"task-designer", "developer", "qa", "template-validator"}:
             scoped_excerpts = self._build_selected_task_file_excerpts(limit=4200)
             if scoped_excerpts:
                 sections.append(("Selected task file excerpts", scoped_excerpts))
@@ -3416,6 +3457,10 @@ class WorkflowOrchestrator:
             normalized = self._normalize_repo_relative_path(path)
             if normalized:
                 candidate_paths.append(normalized)
+        for path in item.get("reference_files") or []:
+            normalized = self._normalize_repo_relative_path(path)
+            if normalized:
+                candidate_paths.append(normalized)
         ordered_paths = list(dict.fromkeys(candidate_paths))
         if ordered_paths:
             file_excerpt = self._direct_api_read_files(ordered_paths, limit=max(1200, limit // 2))
@@ -3466,6 +3511,8 @@ class WorkflowOrchestrator:
         return bool(item.get("existing_paths") or item.get("required_test_paths") or item.get("new_files"))
 
     def _build_implementation_same_phase_context(self, agent_name: str, limit: int = 4000) -> str:
+        if agent_name == "task-designer":
+            return self._build_selected_task_outline_context(limit=limit)
         if agent_name in {"developer", "qa", "template-validator"}:
             return self._build_selected_task_contract_context(limit=limit)
         return self._build_previous_agent_context("implementation", agent_name, limit=limit)
@@ -3549,6 +3596,8 @@ class WorkflowOrchestrator:
             selected_names = ["product-manager", "project-analyst", "tech-analyst"]
         elif agent_name == "implementation-planner":
             selected_names = ["product-manager", "project-analyst", "tech-analyst"]
+        elif agent_name == "task-designer":
+            selected_names = []
         elif agent_name in {"developer", "qa", "template-validator"}:
             selected_names = []
         else:
@@ -4186,7 +4235,7 @@ class WorkflowOrchestrator:
                 detail = f"{item.get('id', 'task')}:required_test_paths_must_include_test_files"
                 invalid.append(detail)
                 missing_tests.append(detail)
-            invalid.extend(self._validate_backend_task_contract(item))
+        invalid.extend(self._validate_planner_task_outline(item, repo_map=repo_map, known_files=set(known_files or set())))
         for path in allowed_paths:
             if path not in existing_paths and path not in new_files and path not in new_directories:
                 invalid.append(f"{item.get('id', 'task')}:{path}:allowed_path_not_declared")
@@ -4598,7 +4647,7 @@ class WorkflowOrchestrator:
         if not test_file_action:
             test_file_action = "create" if test_file_path in new_files else "update"
         if not reference_files:
-            reference_files = list(dict.fromkeys(existing_paths + required_test_paths))
+            reference_files = list(dict.fromkeys(existing_paths))
         if not must_test:
             must_test = list(required_test_paths)
         if not integration:
@@ -4820,6 +4869,45 @@ class WorkflowOrchestrator:
             return False
         return True
 
+    def _validate_planner_task_outline(
+        self,
+        item: dict[str, Any],
+        *,
+        repo_map: dict[str, Any],
+        known_files: set[str] | None = None,
+    ) -> list[str]:
+        task_id = str(item.get("id") or "task")
+        allowed_paths = [self._normalize_repo_relative_path(path) for path in item.get("allowed_paths") or [] if self._normalize_repo_relative_path(path)]
+        existing_paths = [self._normalize_repo_relative_path(path) for path in item.get("existing_paths") or [] if self._normalize_repo_relative_path(path)]
+        new_files = [self._normalize_repo_relative_path(path) for path in item.get("new_files") or [] if self._normalize_repo_relative_path(path)]
+        required_test_paths = [self._normalize_repo_relative_path(path) for path in item.get("required_test_paths") or [] if self._normalize_repo_relative_path(path)]
+        target_file = item.get("target_file") or {}
+        target_file_path = self._normalize_repo_relative_path(target_file.get("path")) if isinstance(target_file, dict) else ""
+        target_file_action = str(target_file.get("action") or "").strip().lower() if isinstance(target_file, dict) else ""
+        reference_files = [self._normalize_repo_relative_path(path) for path in item.get("reference_files") or [] if self._normalize_repo_relative_path(path)]
+        repo_file_paths = {
+            str(repo_item.get("path") or "").strip()
+            for repo_item in (repo_map.get("files") or [])
+            if str(repo_item.get("path") or "").strip()
+        }
+        effective_known_files = set(known_files or set()) | repo_file_paths
+        errors: list[str] = []
+        if not target_file_path:
+            errors.append(f"{task_id}:missing_target_file_outline")
+        elif target_file_path not in allowed_paths:
+            errors.append(f"{task_id}:target_file_path_not_in_allowed_paths")
+        elif target_file_path not in existing_paths and target_file_path not in new_files:
+            errors.append(f"{task_id}:target_file_path_not_declared")
+        if target_file_action not in {"create", "update", "modify"}:
+            errors.append(f"{task_id}:invalid_target_file_action")
+        for test_path in required_test_paths:
+            if test_path not in existing_paths and test_path not in new_files:
+                errors.append(f"{task_id}:{test_path}:required_test_path_not_declared")
+        for ref_path in reference_files:
+            if ref_path not in effective_known_files:
+                errors.append(f"{task_id}:{ref_path}:reference_file_missing")
+        return errors
+
     def _validate_backend_task_contract(self, item: dict[str, Any]) -> list[str]:
         task_id = str(item.get("id") or "task")
         allowed_paths = [self._normalize_repo_relative_path(path) for path in item.get("allowed_paths") or [] if self._normalize_repo_relative_path(path)]
@@ -4879,6 +4967,130 @@ class WorkflowOrchestrator:
 
         return errors
 
+    def _parse_task_designer_output(self, text: str, base_item: dict[str, Any]) -> dict[str, Any]:
+        normalized_text = str(text or "").strip()
+        if not normalized_text:
+            return {"item": None, "errors": ["task-designer:empty_output"]}
+        candidates = self._planner_payload_candidates(normalized_text)
+        parse_errors: list[str] = []
+        repo_map = self._load_repo_map()
+        repo_file_paths = {
+            str(repo_item.get("path") or "").strip()
+            for repo_item in (repo_map.get("files") or [])
+            if str(repo_item.get("path") or "").strip()
+        }
+        for candidate in candidates:
+            if not candidate.strip():
+                continue
+            try:
+                payload = json.loads(candidate)
+            except json.JSONDecodeError:
+                try:
+                    payload = yaml.safe_load(candidate)
+                except yaml.YAMLError as exc:
+                    parse_errors.append(str(exc))
+                    continue
+            if not isinstance(payload, dict):
+                return {"item": None, "errors": ["task-designer:payload_must_be_object"]}
+            status = str(payload.get("status") or "").strip().lower()
+            if status == "contract_invalid":
+                reason = str(payload.get("reason") or "unspecified_contract_invalid").strip()
+                return {"item": None, "errors": [f"task-designer:contract_invalid:{reason}"]}
+            task_ref = str(payload.get("task_id") or payload.get("id") or "").strip()
+            expected_id = str(base_item.get("id") or "").strip()
+            if task_ref and expected_id and task_ref != expected_id:
+                return {"item": None, "errors": [f"task-designer:task_id_mismatch:{task_ref}:{expected_id}"]}
+
+            merged = dict(base_item)
+            merged.update(
+                {
+                    "id": expected_id or task_ref,
+                    "title": str(payload.get("title") or base_item.get("title") or "").strip(),
+                    "depends_on": payload.get("depends_on", base_item.get("depends_on") or []),
+                    "target_file": payload.get("target_file") or base_item.get("target_file") or {},
+                    "must_contain": payload.get("must_contain") or [],
+                    "must_import": payload.get("must_import") or [],
+                    "integration": payload.get("integration") or [],
+                    "reference_files": payload.get("reference_files") or base_item.get("reference_files") or [],
+                    "reference_excerpts": payload.get("reference_excerpts") or {},
+                    "test_file": payload.get("test_file") or {},
+                    "must_test": payload.get("must_test") or [],
+                    "forbidden": payload.get("forbidden") or [],
+                }
+            )
+            normalized, schema_errors = self._normalize_planner_task(merged, item_index=1)
+            if schema_errors or not normalized:
+                return {"item": None, "errors": [f"task-designer:{error}" for error in schema_errors]}
+            contract_errors = self._validate_backend_task_contract(normalized)
+            for ref_path in normalized.get("reference_files") or []:
+                if ref_path not in repo_file_paths:
+                    contract_errors.append(f"{normalized.get('id') or 'task'}:{ref_path}:reference_file_missing")
+            normalized["contract_source"] = "task-designer"
+            normalized["task_designer_notes"] = [str(value).strip() for value in (payload.get("notes") or []) if str(value).strip()]
+            return {"item": normalized, "errors": contract_errors}
+        return {"item": None, "errors": [f"task-designer:parse_error:{'; '.join(parse_errors[:3]) or 'unable_to_parse'}"]}
+
+    def _apply_task_designer_contract_from_report(self, report: dict[str, Any]) -> bool:
+        if not self._selected_implementation_item:
+            selection = self._prepare_implementation_backlog_selection(require_backlog=True)
+            if selection["error"]:
+                self.logger.error(selection["error"])
+                return False
+        planner_item = dict(self._selected_implementation_item or {})
+        saved_contract = report.get("selected_task_contract")
+        if isinstance(saved_contract, dict):
+            normalized, schema_errors = self._normalize_planner_task(saved_contract, item_index=1)
+            if normalized and not schema_errors:
+                errors = self._validate_backend_task_contract(normalized)
+                normalized["contract_source"] = "task-designer"
+                if not errors:
+                    self._selected_implementation_item = normalized
+                    self._task_designer_validation_errors = []
+                    return True
+        parsed_text = str(report.get("parsed_output") or report.get("stdout") or "").strip()
+        parsed = self._parse_task_designer_output(parsed_text, planner_item)
+        contract_item = parsed["item"]
+        errors = [str(error).strip() for error in (parsed.get("errors") or []) if str(error).strip()]
+        self._task_designer_validation_errors = errors
+        if not contract_item or errors:
+            feedback = "Task designer validation errors\n\n```text\n" + ("\n".join(errors) or "unknown_error") + "\n```"
+            feedback_file = self._save_feedback(self.task_counter or 0, "task-designer", feedback)
+            self._task_designer_feedback_file = str(feedback_file)
+            self._task_designer_feedback_source = str(feedback_file)
+            self._task_designer_rejection_reason = "\n".join(errors)
+            self.logger.error("Task designer output is invalid", self._task_designer_rejection_reason or "unknown_error")
+            self._phase_failure_status = "task_designer_invalid"
+            return False
+        self._selected_implementation_item = contract_item
+        self._set_agent_report_extras(
+            "implementation",
+            "task-designer",
+            {
+                "selected_task_id": str(contract_item.get("id") or ""),
+                "selected_task_scope": str(contract_item.get("scope") or ""),
+                "selected_task_allowed_paths": list(contract_item.get("allowed_paths") or []),
+                "contract_completeness": bool(contract_item.get("contract_completeness", False)),
+                "contract_source": "task-designer",
+                "task_designer_validation_errors": [],
+            },
+        )
+        task_designer_report = self._load_saved_agent_report("implementation", "task-designer") or report
+        self._overwrite_agent_report(
+            "implementation",
+            "task-designer",
+            {
+                **task_designer_report,
+                "selected_task_id": str(contract_item.get("id") or ""),
+                "selected_task_scope": str(contract_item.get("scope") or ""),
+                "selected_task_allowed_paths": list(contract_item.get("allowed_paths") or []),
+                "selected_task_contract": contract_item,
+                "contract_completeness": bool(contract_item.get("contract_completeness", False)),
+                "contract_source": "task-designer",
+                "task_designer_validation_errors": [],
+            },
+        )
+        return True
+
     def _is_agents_pipeline_self_analysis(self) -> bool:
         if self.context_mode != "engine_self_analysis":
             return False
@@ -4924,9 +5136,14 @@ class WorkflowOrchestrator:
             return True
         if self.from_agent_name == "implementation-planner":
             return True
-        return self.from_agent_name in {"developer", "qa", "template-validator"} or self.retry_agent_name in {"developer", "qa", "template-validator"}
+        return self.from_agent_name in {"task-designer", "developer", "qa", "template-validator"} or self.retry_agent_name in {"task-designer", "developer", "qa", "template-validator"}
 
     def _should_reuse_planner_for_implementation(self) -> bool:
+        if self.from_agent_name in {"task-designer", "developer", "qa", "template-validator"}:
+            return True
+        return self.retry_agent_name in {"task-designer", "developer", "qa", "template-validator"}
+
+    def _should_reuse_task_designer_for_implementation(self) -> bool:
         if self.from_agent_name in {"developer", "qa", "template-validator"}:
             return True
         return self.retry_agent_name in {"developer", "qa", "template-validator"}
@@ -4936,17 +5153,23 @@ class WorkflowOrchestrator:
             return True
         if self._should_reuse_planner_for_implementation() and agent_name == "implementation-planner":
             return True
-        if self.retry_agent_name == "implementation-planner" and agent_name in {"developer", "qa", "template-validator"}:
+        if self._should_reuse_task_designer_for_implementation() and agent_name == "task-designer":
             return True
-        if self.from_agent_name == "implementation-planner" and agent_name in {"developer", "qa", "template-validator"}:
+        if self.retry_agent_name == "implementation-planner" and agent_name in {"task-designer", "developer", "qa", "template-validator"}:
+            return True
+        if self.from_agent_name == "implementation-planner" and agent_name in {"task-designer", "developer", "qa", "template-validator"}:
+            return True
+        if self.retry_agent_name == "task-designer" and agent_name in {"developer", "qa", "template-validator"}:
+            return True
+        if self.from_agent_name == "task-designer" and agent_name in {"architect", "implementation-planner"}:
             return True
         if self.retry_agent_name == "developer" and agent_name in {"qa", "template-validator"}:
             return True
-        if self.from_agent_name == "developer" and agent_name in {"architect", "implementation-planner"}:
+        if self.from_agent_name == "developer" and agent_name in {"architect", "implementation-planner", "task-designer"}:
             return True
-        if self.from_agent_name == "qa" and agent_name in {"architect", "implementation-planner", "developer"}:
+        if self.from_agent_name == "qa" and agent_name in {"architect", "implementation-planner", "task-designer", "developer"}:
             return True
-        if self.from_agent_name == "template-validator" and agent_name in {"architect", "implementation-planner", "developer", "qa"}:
+        if self.from_agent_name == "template-validator" and agent_name in {"architect", "implementation-planner", "task-designer", "developer", "qa"}:
             return True
         return False
 
@@ -4961,7 +5184,7 @@ class WorkflowOrchestrator:
         return None, ""
 
     def _load_latest_implementation_report_with_selected_task(self) -> tuple[dict[str, Any] | None, str]:
-        candidate_agents = ("developer", "qa", "template-validator", "implementation-planner")
+        candidate_agents = ("developer", "qa", "template-validator", "task-designer", "implementation-planner")
         current_base = self.logger.run_dir / "agents" / "implementation"
         for agent_name in candidate_agents:
             report = self._load_saved_agent_report("implementation", agent_name)
@@ -5023,6 +5246,39 @@ class WorkflowOrchestrator:
             },
         )
         self.logger.info(f"Reusing implementation-planner output from {source_path}")
+        return True
+
+    def _reuse_task_designer_output_for_current_run(self) -> bool:
+        report, source_path = self._load_latest_successful_implementation_report("task-designer")
+        if not report:
+            if not self._selected_implementation_item:
+                selection = self._prepare_implementation_backlog_selection(require_backlog=True)
+                if selection["error"]:
+                    self.logger.error(selection["error"])
+                    return False
+            fallback_item = dict(self._selected_implementation_item or {})
+            if fallback_item and not self._validate_backend_task_contract(fallback_item):
+                fallback_item["contract_source"] = "task-designer"
+                self._selected_implementation_item = fallback_item
+                self.logger.info("No successful task-designer report found; reusing planner task contract as compatibility fallback.")
+                return True
+            self.logger.error("Unable to reuse task-designer output", "No successful task-designer report found.")
+            return False
+        if not self._selected_implementation_item:
+            selection = self._prepare_implementation_backlog_selection(require_backlog=True)
+            if selection["error"]:
+                self.logger.error(selection["error"])
+                return False
+        target_dir = self.logger.run_dir / "agents" / "implementation"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = target_dir / "task-designer.json"
+        target_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        selected_task_id = str(report.get("selected_task_id") or "").strip()
+        if selected_task_id and not self.selected_task_ref:
+            self.selected_task_ref = selected_task_id
+        if not self._apply_task_designer_contract_from_report(report):
+            return False
+        self.logger.info(f"Reusing task-designer output from {source_path}")
         return True
 
     def _validate_repo_map_target(self, repo_map: dict[str, Any]) -> bool:
@@ -5201,6 +5457,47 @@ class WorkflowOrchestrator:
         text = "\n".join(lines)
         return text[:limit]
 
+    def _build_selected_task_outline_context(self, limit: int = 2800) -> str:
+        if not self._selected_implementation_item:
+            return ""
+        item = self._selected_implementation_item
+        target_file = item.get("target_file") or {}
+        lines = [
+            "[selected-task-outline]",
+            f"id: {item.get('id', '')}",
+            f"title: {item.get('title', '')}",
+            f"priority: {item.get('priority', '')}",
+            f"scope: {item.get('scope', '')}",
+            "existing_paths:",
+        ]
+        lines.extend(f"- {path}" for path in (item.get("existing_paths") or []))
+        lines.append("new_directories:")
+        lines.extend(f"- {path}" for path in (item.get("new_directories") or []))
+        lines.append("new_files:")
+        lines.extend(f"- {path}" for path in (item.get("new_files") or []))
+        lines.append("allowed_paths:")
+        lines.extend(f"- {path}" for path in (item.get("allowed_paths") or []))
+        lines.append("forbidden_paths:")
+        lines.extend(f"- {path}" for path in (item.get("forbidden_paths") or []))
+        lines.append("required_test_paths:")
+        lines.extend(f"- {path}" for path in (item.get("required_test_paths") or []))
+        lines.append("acceptance_criteria:")
+        lines.extend(f"- {criterion}" for criterion in (item.get("acceptance_criteria") or []))
+        lines.append("reason_each_path_is_needed:")
+        for path, reason in (item.get("reason_each_path_is_needed") or {}).items():
+            lines.append(f"- {path}: {reason}")
+        lines.append("target_file:")
+        lines.append(f"  path: {target_file.get('path', '')}")
+        lines.append(f"  action: {target_file.get('action', '')}")
+        lines.append(f"  purpose: {target_file.get('purpose', '')}")
+        lines.append("reference_files:")
+        lines.extend(f"- {value}" for value in (item.get("reference_files") or []))
+        lines.append("depends_on:")
+        lines.extend(f"- {value}" for value in (item.get("depends_on") or []))
+        lines.append(f"risk_level: {item.get('risk_level', '')}")
+        lines.append(f"estimated_effort: {item.get('estimated_effort', '')}")
+        return "\n".join(lines)[:limit]
+
     def _refresh_repo_map(self, snapshot_path: Path | None = None) -> bool:
         try:
             repo_map = generate_repo_map(self.target_workspace, self.project_id, self.repo_map_path)
@@ -5327,7 +5624,7 @@ class WorkflowOrchestrator:
         files = repo_map.get("files") or []
         directories = [str(path) for path in (repo_map.get("directories") or []) if str(path).strip()]
         relevant_files = [str(path) for path in (repo_map.get("agent_relevant_files") or []) if str(path).strip()]
-        if agent_name in {"developer", "qa", "template-validator"} and self._selected_implementation_item:
+        if agent_name in {"task-designer", "developer", "qa", "template-validator"} and self._selected_implementation_item:
             relevant_files = [str(path) for path in (self._selected_implementation_item.get("allowed_paths") or []) if str(path).strip()]
         lines = [
             f"repo_map_path: {self.repo_map_path}",

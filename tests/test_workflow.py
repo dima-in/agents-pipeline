@@ -186,6 +186,7 @@ def test_agent_directories_exist() -> None:
     assert "competitor-analyst" in agents["research"]
     assert "architect" in agents["implementation"]
     assert "implementation-planner" in agents["implementation"]
+    assert "task-designer" in agents["implementation"]
 
 
 def test_agent_catalog_loads() -> None:
@@ -2642,6 +2643,8 @@ def test_retry_agent_implementation_planner_reuses_architect_output(tmp_path: Pa
     previous_run.mkdir(parents=True, exist_ok=True)
     (previous_run / "architect.json").write_text(json.dumps({"status": "success", "parsed_output": "Architect output", "result": "completed"}), encoding="utf-8")
     calls: list[str] = []
+    merges: list[str] = []
+    prompts: list[str] = []
 
     def fake_run_agent(agent_config, phase_key, index=None, total=None):
         calls.append(agent_config["name"])
@@ -2686,6 +2689,8 @@ def test_retry_agent_implementation_planner_reuses_architect_output(tmp_path: Pa
 
     monkeypatch.setattr(orchestrator, "_run_agent", fake_run_agent)
     monkeypatch.setattr(orchestrator, "_wait_for_user", lambda _prompt: True)
+    monkeypatch.setattr(orchestrator, "_merge_git", lambda: merges.append("merge") or True)
+    monkeypatch.setattr(orchestrator, "_prompt_post_implementation_action", lambda: prompts.append("prompt") or "stop")
 
     ok = orchestrator._run_implementation_phase()
 
@@ -2693,6 +2698,8 @@ def test_retry_agent_implementation_planner_reuses_architect_output(tmp_path: Pa
     assert calls == ["implementation-planner"]
     assert orchestrator._reused_architect_output is True
     assert orchestrator._architect_output_source.endswith("architect.json")
+    assert merges == []
+    assert prompts == []
 
 
 def test_from_agent_developer_reuses_planner_and_selected_task(tmp_path: Path, monkeypatch) -> None:
@@ -2802,6 +2809,92 @@ def test_from_agent_developer_reuses_planner_and_selected_task(tmp_path: Path, m
     assert ok is True
     assert calls == ["developer", "qa", "template-validator"]
     assert orchestrator.selected_task_ref == "planner-task"
+
+
+def test_from_agent_implementation_planner_does_not_merge_delivery_branch(tmp_path: Path, monkeypatch) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (target_workspace / "workflow").mkdir(parents=True, exist_ok=True)
+    (target_workspace / "workflow" / "orchestrator.py").write_text("pass\n", encoding="utf-8")
+    (target_workspace / "tests").mkdir(parents=True, exist_ok=True)
+    (target_workspace / "tests" / "test_workflow.py").write_text("def test_ok(): pass\n", encoding="utf-8")
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+        from_agent="implementation-planner",
+    )
+    orchestrator.config["phases"]["implementation"] = {
+        "name": "Implementation",
+        "max_retries": 1,
+        "agents": [
+            {"name": "architect"},
+            {"name": "implementation-planner"},
+            {"name": "task-designer"},
+            {"name": "developer"},
+            {"name": "qa"},
+            {"name": "template-validator"},
+        ],
+    }
+    _seed_research_run(
+        orchestrator.logger.log_dir,
+        "20260101_120250",
+        [{"agent_name": "product-manager", "handoff_summary": "agent: product-manager\nfindings:\n- summary\nrisks:\n- none\ndecisions:\n- none\nrecommended_next_tasks:\n- none"}],
+    )
+    previous_run = orchestrator.logger.log_dir / "run_20260101_120251" / "agents" / "implementation"
+    previous_run.mkdir(parents=True, exist_ok=True)
+    (previous_run / "architect.json").write_text(json.dumps({"status": "success", "parsed_output": "Architect output", "result": "completed"}), encoding="utf-8")
+    calls: list[str] = []
+    merges: list[str] = []
+    prompts: list[str] = []
+
+    def fake_run_agent(agent_config, phase_key, index=None, total=None):
+        calls.append(agent_config["name"])
+        if agent_config["name"] == "implementation-planner":
+            orchestrator.logger.save_agent_report(
+                "implementation",
+                "implementation-planner",
+                {
+                    "status": "success",
+                    "result": "completed",
+                    "parsed_output": json.dumps(
+                        [
+                            {
+                                "id": "planner-task",
+                                "title": "Planner task",
+                                "priority": "P0",
+                                "scope": "Improve backend validation.",
+                                "existing_paths": ["workflow/orchestrator.py", "tests/test_workflow.py"],
+                                "allowed_paths": ["workflow/orchestrator.py", "tests/test_workflow.py"],
+                                "forbidden_paths": [],
+                                "required_test_paths": ["tests/test_workflow.py"],
+                                "depends_on": [],
+                                "acceptance_criteria": ["done"],
+                                "reason_each_path_is_needed": {"workflow/orchestrator.py": "Needed.", "tests/test_workflow.py": "Needed."},
+                                "target_file": {"path": "workflow/orchestrator.py", "action": "update", "purpose": "Improve backend validation."},
+                                "reference_files": ["workflow/orchestrator.py"],
+                                "risk_level": "low",
+                                "estimated_effort": "S",
+                            }
+                        ]
+                    ),
+                },
+            )
+        return True
+
+    monkeypatch.setattr(orchestrator, "_run_agent", fake_run_agent)
+    monkeypatch.setattr(orchestrator, "_wait_for_user", lambda _prompt: True)
+    monkeypatch.setattr(orchestrator, "_merge_git", lambda: merges.append("merge") or True)
+    monkeypatch.setattr(orchestrator, "_prompt_post_implementation_action", lambda: prompts.append("prompt") or "stop")
+
+    ok = orchestrator._run_implementation_phase()
+
+    assert ok is True
+    assert calls == ["implementation-planner"]
+    assert merges == []
+    assert prompts == []
 
 
 def test_retry_prompt_includes_previous_rejection_reason(tmp_path: Path, monkeypatch) -> None:
@@ -3513,53 +3606,52 @@ def test_validator_rejects_vague_backend_contract(tmp_path: Path) -> None:
         engine_root=str(engine_root),
         launch_cwd=str(target_workspace),
     )
-    orchestrator.logger.save_agent_report(
-        "implementation",
-        "implementation-planner",
-        {
-            "status": "success",
-            "result": "completed",
-            "parsed_output": json.dumps(
-                [
-                    {
-                        "id": "TASK-002",
-                        "title": "Implement monitoring vaguely",
-                        "priority": "P0",
-                        "scope": "backend-only",
-                        "existing_paths": ["gateway-v4/app/services/monitoring.py", "gateway-v4/tests/test_monitoring.py"],
-                        "new_directories": [],
-                        "new_files": [],
-                        "allowed_paths": ["gateway-v4/app/services/monitoring.py", "gateway-v4/tests/test_monitoring.py"],
-                        "forbidden_paths": [],
-                        "required_test_paths": ["gateway-v4/tests/test_monitoring.py"],
-                        "depends_on": [],
-                        "acceptance_criteria": ["Monitoring works."],
-                        "reason_each_path_is_needed": {
-                            "gateway-v4/app/services/monitoring.py": "Implementation target.",
-                            "gateway-v4/tests/test_monitoring.py": "Required regression test.",
-                        },
-                        "target_file": {"path": "gateway-v4/app/services/monitoring.py", "action": "update", "purpose": "Add monitoring behavior."},
-                        "test_file": {"path": "gateway-v4/tests/test_monitoring.py", "action": "update"},
-                        "must_contain": ["Implement monitoring functionality", "Handle provider calls"],
-                        "must_import": ["from typing import Any"],
-                        "integration": ["Connect monitoring into provider flow."],
-                        "reference_files": ["gateway-v4/app/services/monitoring.py"],
-                        "reference_excerpts": {"gateway-v4/app/services/monitoring.py": "pass"},
-                        "must_test": ["Test that monitoring works"],
-                        "forbidden": ["Do not edit frontend files."],
-                        "risk_level": "low",
-                        "estimated_effort": "S",
-                    }
-                ]
-            ),
+    planner_item = {
+        "id": "TASK-002",
+        "title": "Implement monitoring vaguely",
+        "priority": "P0",
+        "scope": "backend-only",
+        "existing_paths": ["gateway-v4/app/services/monitoring.py", "gateway-v4/tests/test_monitoring.py"],
+        "new_directories": [],
+        "new_files": [],
+        "allowed_paths": ["gateway-v4/app/services/monitoring.py", "gateway-v4/tests/test_monitoring.py"],
+        "forbidden_paths": [],
+        "required_test_paths": ["gateway-v4/tests/test_monitoring.py"],
+        "depends_on": [],
+        "acceptance_criteria": ["Monitoring works."],
+        "reason_each_path_is_needed": {
+            "gateway-v4/app/services/monitoring.py": "Implementation target.",
+            "gateway-v4/tests/test_monitoring.py": "Required regression test.",
         },
+        "target_file": {"path": "gateway-v4/app/services/monitoring.py", "action": "update", "purpose": "Add monitoring behavior."},
+        "reference_files": ["gateway-v4/app/services/monitoring.py"],
+        "risk_level": "low",
+        "estimated_effort": "S",
+    }
+
+    parsed = orchestrator._parse_task_designer_output(
+        json.dumps(
+            {
+                "task_id": "TASK-002",
+                "title": "Implement monitoring vaguely",
+                "target_file": {"path": "gateway-v4/app/services/monitoring.py", "action": "update", "purpose": "Add monitoring behavior."},
+                "test_file": {"path": "gateway-v4/tests/test_monitoring.py", "action": "update"},
+                "depends_on": [],
+                "must_contain": ["Implement monitoring functionality", "Handle provider calls"],
+                "must_import": ["from typing import Any"],
+                "integration": ["Connect monitoring into provider flow."],
+                "reference_files": ["gateway-v4/app/services/monitoring.py"],
+                "reference_excerpts": {"gateway-v4/app/services/monitoring.py": "pass"},
+                "must_test": ["Test that monitoring works"],
+                "forbidden": ["Do not edit frontend files."],
+            }
+        ),
+        planner_item,
     )
 
-    diagnostics = orchestrator._validate_implementation_planner_output()
-
-    assert diagnostics["valid"] is False
-    assert any("vague_must_contain" in item for item in diagnostics["invalid_paths"])
-    assert any("vague_must_test" in item for item in diagnostics["invalid_paths"])
+    assert parsed["item"] is not None
+    assert any("vague_must_contain" in item for item in parsed["errors"])
+    assert any("vague_must_test" in item for item in parsed["errors"])
 
 
 def test_repo_map_after_detects_newly_created_allowed_file(tmp_path: Path) -> None:
@@ -3595,3 +3687,127 @@ def test_repo_map_after_detects_newly_created_allowed_file(tmp_path: Path) -> No
 
     assert orchestrator.repo_map_after_path.exists()
     assert orchestrator._repo_map_delta["new_files_created"] == ["docs/new-plan.md"]
+
+
+def test_implementation_phase_includes_task_designer_between_planner_and_developer() -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+    agent_names = [agent["name"] for agent in orchestrator.config["phases"]["implementation"]["agents"]]
+    assert agent_names.index("implementation-planner") < agent_names.index("task-designer") < agent_names.index("developer")
+
+
+def test_planner_validation_accepts_backlog_outline_without_full_contract(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    target_file = target_workspace / "gateway-v4" / "app" / "services" / "monitoring.py"
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    target_file.write_text("pass\n", encoding="utf-8")
+    test_file = target_workspace / "gateway-v4" / "tests" / "test_monitoring.py"
+    test_file.parent.mkdir(parents=True, exist_ok=True)
+    test_file.write_text("def test_monitoring():\n    assert True\n", encoding="utf-8")
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    orchestrator.logger.save_agent_report(
+        "implementation",
+        "implementation-planner",
+        {
+            "status": "success",
+            "result": "completed",
+            "parsed_output": json.dumps(
+                [
+                    {
+                        "id": "TASK-001",
+                        "title": "Update monitoring service",
+                        "priority": "P0",
+                        "scope": "backend-only",
+                        "existing_paths": ["gateway-v4/app/services/monitoring.py", "gateway-v4/tests/test_monitoring.py"],
+                        "new_directories": [],
+                        "new_files": [],
+                        "allowed_paths": ["gateway-v4/app/services/monitoring.py", "gateway-v4/tests/test_monitoring.py"],
+                        "forbidden_paths": [],
+                        "required_test_paths": ["gateway-v4/tests/test_monitoring.py"],
+                        "acceptance_criteria": ["Monitoring path updated."],
+                        "reason_each_path_is_needed": {
+                            "gateway-v4/app/services/monitoring.py": "Implementation target.",
+                            "gateway-v4/tests/test_monitoring.py": "Required regression test.",
+                        },
+                        "target_file": {"path": "gateway-v4/app/services/monitoring.py", "action": "update", "purpose": "Update monitoring behavior."},
+                        "reference_files": ["gateway-v4/app/services/monitoring.py"],
+                        "depends_on": [],
+                        "risk_level": "low",
+                        "estimated_effort": "S",
+                    }
+                ]
+            ),
+        },
+    )
+
+    diagnostics = orchestrator._validate_implementation_planner_output()
+
+    assert diagnostics["valid"] is True
+
+
+def test_task_designer_contract_is_applied_to_selected_item(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    target_file = target_workspace / "gateway-v4" / "app" / "services" / "monitoring.py"
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    target_file.write_text("def record_request():\n    pass\n", encoding="utf-8")
+    test_file = target_workspace / "gateway-v4" / "tests" / "test_monitoring.py"
+    test_file.parent.mkdir(parents=True, exist_ok=True)
+    test_file.write_text("def test_monitoring():\n    assert True\n", encoding="utf-8")
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    orchestrator._selected_implementation_item = {
+        "id": "TASK-001",
+        "title": "Update monitoring service",
+        "priority": "P0",
+        "scope": "backend-only",
+        "existing_paths": ["gateway-v4/app/services/monitoring.py", "gateway-v4/tests/test_monitoring.py"],
+        "new_directories": [],
+        "new_files": [],
+        "allowed_paths": ["gateway-v4/app/services/monitoring.py", "gateway-v4/tests/test_monitoring.py"],
+        "forbidden_paths": [],
+        "required_test_paths": ["gateway-v4/tests/test_monitoring.py"],
+        "acceptance_criteria": ["Monitoring path updated."],
+        "reason_each_path_is_needed": {
+            "gateway-v4/app/services/monitoring.py": "Implementation target.",
+            "gateway-v4/tests/test_monitoring.py": "Required regression test.",
+        },
+        "target_file": {"path": "gateway-v4/app/services/monitoring.py", "action": "update", "purpose": "Update monitoring behavior."},
+        "reference_files": ["gateway-v4/app/services/monitoring.py"],
+        "depends_on": [],
+        "risk_level": "low",
+        "estimated_effort": "S",
+    }
+    report = {
+        "status": "success",
+        "result": "completed",
+        "parsed_output": json.dumps(
+            {
+                "task_id": "TASK-001",
+                "title": "Update monitoring service",
+                "target_file": {"path": "gateway-v4/app/services/monitoring.py", "action": "update", "purpose": "Update monitoring behavior."},
+                "test_file": {"path": "gateway-v4/tests/test_monitoring.py", "action": "update"},
+                "depends_on": [],
+                "must_contain": ["def record_request(", "response_time_ms = response_time_ms"],
+                "must_import": ["from typing import Any"],
+                "integration": ["Connect monitoring updates to the existing provider flow."],
+                "reference_files": ["gateway-v4/app/services/monitoring.py"],
+                "reference_excerpts": {"gateway-v4/app/services/monitoring.py": "def record_request():\n    pass"},
+                "must_test": ["test_record_request_updates_metrics: call record_request and assert the metric state changes"],
+                "forbidden": ["Do not edit frontend files."],
+            }
+        ),
+    }
+
+    ok = orchestrator._apply_task_designer_contract_from_report(report)
+
+    assert ok is True
+    assert orchestrator._selected_implementation_item is not None
+    assert orchestrator._selected_implementation_item["contract_source"] == "task-designer"
+    assert orchestrator._selected_implementation_item["target_file"]["path"] == "gateway-v4/app/services/monitoring.py"
+    assert orchestrator._selected_implementation_item["test_file"]["path"] == "gateway-v4/tests/test_monitoring.py"
