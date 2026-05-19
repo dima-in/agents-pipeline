@@ -21,9 +21,11 @@ if "%~1"=="python" (
   exit /b %errorlevel%
 )
 
-where openclaw.CMD >nul 2>nul
-if %errorlevel%==0 (
-  call openclaw.CMD gateway start >nul 2>nul
+if /I "%AGENTS_PIPELINE_ENABLE_OPENCLAW_GATEWAY%"=="1" (
+  where openclaw.CMD >nul 2>nul
+  if %errorlevel%==0 (
+    call openclaw.CMD gateway start >nul 2>nul
+  )
 )
 
 python run_launcher.py %*

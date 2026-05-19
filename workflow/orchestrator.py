@@ -5,6 +5,7 @@ import json
 import os
 import re
 import subprocess
+import textwrap
 import time
 import traceback
 from datetime import datetime
@@ -37,6 +38,7 @@ class WorkflowOrchestrator:
         no_memory: bool = False,
         fresh_run: bool = False,
         task_scope: str | None = None,
+        user_goal: str | None = None,
         selected_task_ref: str | None = None,
         next_task: bool = False,
         research_run: str | None = None,
@@ -76,6 +78,7 @@ class WorkflowOrchestrator:
         self.no_memory = no_memory
         self.fresh_run = fresh_run
         self.task_scope_override = str(task_scope or "").strip()
+        self.user_goal_override = str(user_goal or "").strip()
         self.selected_task_ref = str(selected_task_ref or "").strip()
         self.next_task_requested = next_task
         self.research_run_id = str(research_run or "").strip()
@@ -135,11 +138,17 @@ class WorkflowOrchestrator:
             "files_modified": [],
             "removed_files": [],
         }
+        self.saved_user_goal = str(self.project_settings.get("user_goal") or "").strip()
+        self.user_goal = ""
+        if self.user_goal_override:
+            self._set_user_goal(self.user_goal_override)
         self._log_startup_diagnostics()
 
     def run_full_cycle(self) -> bool:
         self.logger.info("Запуск полного цикла agents-pipeline")
         try:
+            if not self._ensure_user_goal("research"):
+                return False
             for phase_key in self._get_phase_order():
                 if not self._preflight_runtime(phase_key):
                     return False
@@ -151,11 +160,15 @@ class WorkflowOrchestrator:
             self.logger.info(f"Сводка сохранена: {summary}")
 
     def run_research_phase(self) -> bool:
+        if not self._ensure_user_goal("research"):
+            return False
         if not self._preflight_runtime("research"):
             return False
         return self.run_phase("research")
 
     def run_implementation_phase(self) -> bool:
+        if not self._ensure_user_goal("implementation"):
+            return False
         if not self._preflight_runtime("implementation"):
             return False
         return self.run_phase("implementation")
@@ -334,10 +347,22 @@ class WorkflowOrchestrator:
                     self.logger.error(selection["error"])
                     had_failures = True
                     return False
+                dependency_error = self._selected_task_dependency_error()
+                if dependency_error:
+                    self.logger.error(dependency_error)
+                    self._phase_failure_status = "task_dependencies_incomplete"
+                    had_failures = True
+                    return False
             if phase_key == "implementation" and agent["name"] == "developer":
                 selection = self._prepare_implementation_backlog_selection(require_backlog=True)
                 if selection["error"]:
                     self.logger.error(selection["error"])
+                    had_failures = True
+                    return False
+                dependency_error = self._selected_task_dependency_error()
+                if dependency_error:
+                    self.logger.error(dependency_error)
+                    self._phase_failure_status = "task_dependencies_incomplete"
                     had_failures = True
                     return False
                 task_designer_required = any(str(candidate.get("name") or "") == "task-designer" for candidate in phase.get("agents", []))
@@ -774,7 +799,10 @@ class WorkflowOrchestrator:
             for line in parsed_output.splitlines():
                 self.logger.agent_progress(agent_name, line)
 
-        require_translation = not (phase == "implementation" and agent_name == "developer")
+        require_translation = not (
+            phase == "implementation"
+            and agent_name in {"implementation-planner", "task-designer", "developer"}
+        )
         failure_reason = self._detect_agent_failure(stdout, stderr, parsed_output, require_translation=require_translation)
         if failure_reason:
             details = (
@@ -1224,6 +1252,11 @@ class WorkflowOrchestrator:
                 "`status=implemented`. If you cannot safely edit within scope, the final non-JSON response must be "
                 "`status=no_changes: <reason>`."
             )
+        elif phase == "implementation" and agent_name == "implementation-planner":
+            translation_instruction = (
+                "Output format is mandatory. Return only structured YAML or JSON for the backlog outline. "
+                "Do not add translations, explanations, markdown fences, or commentary."
+            )
         elif phase == "implementation" and agent_name == "task-designer":
             translation_instruction = (
                 "Output format is mandatory. Return only structured YAML or JSON for the selected task contract. "
@@ -1327,10 +1360,13 @@ class WorkflowOrchestrator:
             previous_context = self._build_previous_agent_context(phase, agent_name)
             implementation_context_chars = 0
 
+        user_goal_summary = self._build_user_goal_summary()
         combined_parts: list[str] = []
         if task:
             combined_parts.append(f"Task: {task}")
         combined_parts.append(prompt_text)
+        if phase == "research" and user_goal_summary:
+            combined_parts.append(f"User goal:\n{user_goal_summary}")
         if repository_context:
             combined_parts.append(f"Repository context collected locally:\n{repository_context}")
         if previous_context:
@@ -1341,6 +1377,8 @@ class WorkflowOrchestrator:
         combined_message = "\n\n".join(combined_parts)
 
         system_parts = [prompt_text]
+        if phase == "research" and user_goal_summary:
+            system_parts.append(f"User goal:\n{user_goal_summary}")
         if repository_context:
             system_parts.append(f"Repository context collected locally:\n{repository_context}")
         if retrieval_enabled:
@@ -1506,8 +1544,10 @@ class WorkflowOrchestrator:
 
     def _build_engine_self_repository_context(self, agent_name: str = "project-analyst", limit: int = 12000) -> str:
         profile = self._get_research_context_profile(agent_name)
+        user_goal_summary = self._build_user_goal_summary()
         if profile == "repo_overview_full":
             sections = [
+                ("User goal", user_goal_summary),
                 ("Git status --short", self._run_local_capture(["git", "status", "--short"], cwd=self.target_workspace)),
                 ("Git log --oneline -5", self._run_local_capture(["git", "log", "--oneline", "-5"], cwd=self.target_workspace)),
                 ("README.md", self._read_file_excerpt(self.target_workspace / "README.md", 2000)),
@@ -1520,6 +1560,7 @@ class WorkflowOrchestrator:
             ]
         elif profile == "external_comparison":
             sections = [
+                ("User goal", user_goal_summary),
                 ("Compressed project-analyst summary", self._build_fallback_project_summary()),
                 ("README.md", self._read_file_excerpt(self.target_workspace / "README.md", 1400)),
                 ("Compact architecture summary", self._build_compact_architecture_summary()),
@@ -1528,12 +1569,14 @@ class WorkflowOrchestrator:
             ]
         elif profile == "market_positioning":
             sections = [
+                ("User goal", user_goal_summary),
                 ("Positioning", self._build_positioning_summary()),
                 ("Workflow goals", self._build_workflow_goals_summary()),
                 ("Target users and use cases", self._build_target_users_summary()),
             ]
         elif profile == "technical_architecture":
             sections = [
+                ("User goal", user_goal_summary),
                 ("Execution architecture", self._build_execution_architecture_summary()),
                 (
                     "direct_api implementation",
@@ -1564,6 +1607,7 @@ class WorkflowOrchestrator:
             ]
         elif profile == "external_innovation":
             sections = [
+                ("User goal", user_goal_summary),
                 ("Compressed project summary", self._build_fallback_project_summary()),
                 ("Compact architecture summary", self._build_compact_architecture_summary()),
                 ("Known constraints and problems", self._build_known_constraints_summary()),
@@ -1574,7 +1618,10 @@ class WorkflowOrchestrator:
         elif profile == "research_synthesis":
             sections = []
         else:
-            sections = [("README.md", self._read_file_excerpt(self.target_workspace / "README.md", 1500))]
+            sections = [
+                ("User goal", user_goal_summary),
+                ("README.md", self._read_file_excerpt(self.target_workspace / "README.md", 1500)),
+            ]
 
         chunks: list[str] = []
         total = 0
@@ -1599,8 +1646,10 @@ class WorkflowOrchestrator:
 
     def _build_external_project_repository_context(self, agent_name: str = "project-analyst", limit: int = 12000) -> str:
         profile = self._get_research_context_profile(agent_name)
+        user_goal_summary = self._build_user_goal_summary()
         if profile == "repo_overview_full":
             sections = [
+                ("User goal", user_goal_summary),
                 ("Target workspace", str(self.target_workspace)),
                 ("Target git remote", self.git_remote or "unavailable"),
                 ("Git status --short", self._run_local_capture(["git", "status", "--short"], cwd=self.target_workspace)),
@@ -1611,6 +1660,7 @@ class WorkflowOrchestrator:
             ]
         elif profile == "external_comparison":
             sections = [
+                ("User goal", user_goal_summary),
                 ("Compressed target project summary", self._build_fallback_project_summary()),
                 ("Target README excerpt", self._read_target_repo_file("README.md", 1600)),
                 ("Target product and architecture summary", self._build_target_product_architecture_summary()),
@@ -1619,6 +1669,7 @@ class WorkflowOrchestrator:
             ]
         elif profile == "market_positioning":
             sections = [
+                ("User goal", user_goal_summary),
                 ("Target project summary", self._build_fallback_project_summary()),
                 ("Target product positioning", self._build_target_positioning_summary()),
                 ("Target workflow and business goals", self._build_target_goals_summary()),
@@ -1626,6 +1677,7 @@ class WorkflowOrchestrator:
             ]
         elif profile == "technical_architecture":
             sections = [
+                ("User goal", user_goal_summary),
                 ("Target backend/frontend structure", self._build_target_backend_frontend_summary()),
                 ("Target dependency and config files", self._build_target_dependency_context(limit=4200)),
                 ("Target docker and deployment files", self._build_target_deployment_context(limit=2400)),
@@ -1634,6 +1686,7 @@ class WorkflowOrchestrator:
             ]
         elif profile == "external_innovation":
             sections = [
+                ("User goal", user_goal_summary),
                 ("Target project summary", self._build_fallback_project_summary()),
                 ("Target constraints and problems", self._build_target_constraints_summary()),
                 ("External inspiration focus", "Look for product, UX, workflow, and automation ideas relevant to this target repository."),
@@ -1641,11 +1694,15 @@ class WorkflowOrchestrator:
             ]
         elif profile == "research_synthesis":
             sections = [
+                ("User goal", user_goal_summary),
                 ("Target docs excerpts", self._build_target_docs_excerpts(limit=2200)),
                 ("Target dependency and config files", self._build_target_dependency_context(limit=2200)),
             ]
         else:
-            sections = [("Target README excerpt", self._read_target_repo_file("README.md", 1500))]
+            sections = [
+                ("User goal", user_goal_summary),
+                ("Target README excerpt", self._read_target_repo_file("README.md", 1500)),
+            ]
 
         chunks: list[str] = []
         total = 0
@@ -1715,6 +1772,16 @@ class WorkflowOrchestrator:
                 "Feed implementation with structured summaries instead of ad hoc chat context.",
                 "Keep startup and model execution robust when OpenClaw is unreliable.",
             ]
+        )
+
+    def _build_user_goal_summary(self) -> str:
+        goal = str(self.user_goal or "").strip()
+        if not goal:
+            return ""
+        return (
+            "Primary user goal for this run. Treat it as the main objective for research, planning, and implementation. "
+            "Do not broaden scope unless the user explicitly asks.\n"
+            f"{goal}"
         )
 
     @staticmethod
@@ -1865,6 +1932,9 @@ class WorkflowOrchestrator:
         )
 
     def _build_target_goals_summary(self) -> str:
+        user_goal_summary = self._build_user_goal_summary()
+        if user_goal_summary:
+            return user_goal_summary[:800]
         readme = self._read_target_repo_file("README.md", 800)
         if readme:
             return readme[:800]
@@ -2177,6 +2247,25 @@ class WorkflowOrchestrator:
             tool = payload.get("tool")
             if isinstance(tool, str):
                 return payload
+        json_sequence = WorkflowOrchestrator._extract_json_tool_sequence(stripped)
+        if json_sequence:
+            if all(payload.get("tool") == "read_file" and payload.get("path") for payload in json_sequence):
+                return {
+                    "tool": "read_files",
+                    "paths": [str(payload["path"]) for payload in json_sequence],
+                }
+            leading_read_files: list[str] = []
+            for payload in json_sequence:
+                if payload.get("tool") == "read_file" and payload.get("path"):
+                    leading_read_files.append(str(payload["path"]))
+                    continue
+                break
+            if len(leading_read_files) >= 2 and len(leading_read_files) == len(json_sequence):
+                return {
+                    "tool": "read_files",
+                    "paths": leading_read_files,
+                }
+            return {"tool": "tool_batch", "requests": json_sequence}
         if stripped:
             tag_matches = list(
                 re.finditer(
@@ -2352,8 +2441,40 @@ class WorkflowOrchestrator:
                     return payload
         return None
 
+    @staticmethod
+    def _extract_json_tool_sequence(text: str) -> list[dict[str, Any]]:
+        decoder = json.JSONDecoder()
+        normalized = str(text or "")
+        payloads: list[dict[str, Any]] = []
+        index = 0
+        length = len(normalized)
+        while index < length:
+            brace_index = normalized.find("{", index)
+            if brace_index < 0:
+                break
+            try:
+                payload, end_index = decoder.raw_decode(normalized, brace_index)
+            except json.JSONDecodeError:
+                index = brace_index + 1
+                continue
+            if isinstance(payload, dict) and isinstance(payload.get("tool"), str):
+                payloads.append(payload)
+            index = max(end_index, brace_index + 1)
+        return payloads
+
     def _execute_direct_api_retrieval_request(self, payload: dict[str, Any], phase: str = "research", agent_name: str = "") -> str:
         tool = str(payload.get("tool") or "").strip()
+        if tool == "tool_batch":
+            requests = payload.get("requests")
+            if not isinstance(requests, list):
+                return "Invalid tool_batch request."
+            outputs: list[str] = []
+            for request in requests:
+                if not isinstance(request, dict):
+                    continue
+                result = self._execute_direct_api_retrieval_request(request, phase=phase, agent_name=agent_name)
+                outputs.append(result)
+            return "\n\n".join(part for part in outputs if part)
         if tool == "read_file":
             path = str(payload.get("path") or "").strip()
             if not path:
@@ -2679,11 +2800,14 @@ class WorkflowOrchestrator:
             )
         try:
             for turn in range(1, max_turns + 1):
+                max_tokens = self._direct_api_max_tokens(phase, agent_name)
                 request_payload = {
                     "model": normalized_model,
                     "messages": messages,
                     "temperature": 0.2,
                 }
+                if max_tokens is not None:
+                    request_payload["max_tokens"] = max_tokens
                 _status_code, raw_body = self._perform_direct_api_request(request_payload, api_key, timeout)
                 last_raw_body = raw_body
                 response_payload = json.loads(raw_body)
@@ -2807,7 +2931,10 @@ class WorkflowOrchestrator:
             for line in parsed_output.splitlines():
                 self.logger.agent_progress(agent_name, line)
 
-        require_translation = not (phase == "implementation" and agent_name == "developer")
+        require_translation = not (
+            phase == "implementation"
+            and agent_name in {"implementation-planner", "task-designer", "developer"}
+        )
         failure_reason = self._detect_agent_failure(stdout, "", parsed_output, require_translation=require_translation)
         if failure_reason:
             failure_status = self._classify_failure_status(failure_reason)
@@ -2967,6 +3094,9 @@ class WorkflowOrchestrator:
 
     def _build_implementation_scope_instruction(self, selected_scope: str) -> str:
         lines = [
+            "User goal:",
+            str(self.user_goal or "not specified"),
+            "",
             "Selected implementation scope:",
             selected_scope,
             "",
@@ -3338,18 +3468,30 @@ class WorkflowOrchestrator:
         selected_item = selection["selected_item"] or {}
         selected_scope = self._select_implementation_scope(research_reports)
         same_phase_context = self._build_implementation_same_phase_context(agent_name=agent_name, limit=4000)
-        research_context = self._build_implementation_research_context(research_reports, agent_name, limit=5000)
+        research_context_limit = 2500 if agent_name == "implementation-planner" else 5000
+        research_context = self._build_implementation_research_context(research_reports, agent_name, limit=research_context_limit)
         previous_parts = [part for part in [research_context, same_phase_context] if part.strip()]
         previous_context = "\n\n".join(previous_parts)
         repo_map = self._load_repo_map()
 
-        sections = [
-            ("Selected implementation scope", selected_scope),
-            ("Repo map summary", self._build_repo_map_summary(repo_map=repo_map, agent_name=agent_name, limit=2600)),
-            ("Target README and docs", self._build_target_docs_excerpts(limit=2000)),
-            ("Target dependency and config files", self._build_target_dependency_context(limit=2200)),
-            ("Target top-level tree up to depth 4", self._build_top_level_tree(root=self.target_workspace, depth=4)),
-        ]
+        if agent_name == "implementation-planner":
+            sections = [
+                ("User goal", self._build_user_goal_summary()),
+                ("Selected implementation scope", selected_scope),
+                ("Repo map summary", self._build_repo_map_summary(repo_map=repo_map, agent_name=agent_name, limit=1600)),
+                ("Target README and docs", self._build_target_docs_excerpts(limit=900)),
+                ("Target dependency and config files", self._build_target_dependency_context(limit=1200)),
+                ("Target top-level tree up to depth 3", self._build_top_level_tree(root=self.target_workspace, depth=3)),
+            ]
+        else:
+            sections = [
+                ("User goal", self._build_user_goal_summary()),
+                ("Selected implementation scope", selected_scope),
+                ("Repo map summary", self._build_repo_map_summary(repo_map=repo_map, agent_name=agent_name, limit=2600)),
+                ("Target README and docs", self._build_target_docs_excerpts(limit=2000)),
+                ("Target dependency and config files", self._build_target_dependency_context(limit=2200)),
+                ("Target top-level tree up to depth 4", self._build_top_level_tree(root=self.target_workspace, depth=4)),
+            ]
         if agent_name in {"task-designer", "developer", "qa", "template-validator"}:
             scoped_excerpts = self._build_selected_task_file_excerpts(limit=4200)
             if scoped_excerpts:
@@ -3357,9 +3499,9 @@ class WorkflowOrchestrator:
         if agent_name == "implementation-planner":
             sections.extend(
                 [
-                    ("Existing file list", self._build_target_existing_file_list(limit=3000)),
-                    ("Relevant implementation files", self._build_relevant_implementation_file_list(limit=2500)),
-                    ("Relevant implementation file excerpts", self._build_relevant_implementation_file_excerpts(limit=2600)),
+                    ("Existing file list", self._build_target_existing_file_list(limit=1800)),
+                    ("Relevant implementation files", self._build_relevant_implementation_file_list(limit=1500)),
+                    ("Relevant implementation file excerpts", self._build_relevant_implementation_file_excerpts(limit=1200)),
                 ]
             )
         if agent_name in {"architect", "qa", "template-validator"}:
@@ -3382,6 +3524,7 @@ class WorkflowOrchestrator:
             "previous_context": previous_context,
             "research_handoff_sources": sources,
             "selected_task_scope": selected_scope,
+            "user_goal": str(self.user_goal or ""),
             "selected_task_id": str(selected_item.get("id") or ""),
             "selected_task_allowed_paths": list(selected_item.get("allowed_paths") or []),
             "backlog_task_count": len(selection["backlog"]),
@@ -3629,6 +3772,8 @@ class WorkflowOrchestrator:
             return self.task_scope_override
         if self._selected_implementation_item:
             return str(self._selected_implementation_item.get("scope") or "").strip()
+        if self.user_goal:
+            return self.user_goal
         if self._is_agents_pipeline_self_analysis():
             return (
                 "Implement one small backend-only improvement to agents-pipeline orchestration reliability. "
@@ -3867,6 +4012,8 @@ class WorkflowOrchestrator:
                 "- Every backend task must include required_test_paths.",
                 "- Every allowed_path must be explicitly declared in existing_paths, new_files, or new_directories.",
                 "- Do not place a file in allowed_paths unless that same file is also present in existing_paths or new_files.",
+                "- If a later task uses a file created by an earlier task, declare depends_on and place that reused file in existing_paths for the later task.",
+                "- This also applies to package markers like gateway-v4/tests/__init__.py: if reused in a later task, put it in existing_paths for that later task and declare depends_on.",
                 "- If a required test file lives under a new directory such as gateway-v4/tests, declare that directory in new_directories.",
                 "- If adding gateway-v4/tests/__init__.py and it does not already exist, declare it in new_files and include it in allowed_paths.",
                 "- Return only corrected YAML/JSON.",
@@ -3891,7 +4038,7 @@ class WorkflowOrchestrator:
             + ", ".join(self._planner_dependency_validation_errors[:20] or ["none"])
             + ". Available directories: "
             + available_directories
-            + ". Repair rules: every path in allowed_paths must also appear in existing_paths or new_files; existing_paths must contain exact existing files only, never directories; never guess an existing filename from a directory name or naming pattern; if an exact migration or test file is not present in repo_map, do not place it in existing_paths and treat it as new_files or omit it; if a new file lives under a directory missing from repo_map, declare that parent in new_directories; if required_test_paths uses a new test package directory, include that directory in new_directories, add the package __init__.py to new_files, and include that __init__.py in allowed_paths."
+            + ". Repair rules: every path in allowed_paths must also appear in existing_paths or new_files; existing_paths must contain exact existing files only, never directories; never guess an existing filename from a directory name or naming pattern; if an exact migration or test file is not present in repo_map, do not place it in existing_paths and treat it as new_files or omit it; if a later task reuses a file created by an earlier task, declare depends_on and list that reused file in existing_paths for the later task; this includes package markers such as gateway-v4/tests/__init__.py and gateway-v4/tests/integration/__init__.py; if a new file lives under a directory missing from repo_map, declare that parent in new_directories; if required_test_paths uses a new test package directory, include that directory in new_directories, add the package __init__.py to new_files, and include that __init__.py in allowed_paths."
             + ". Return corrected YAML/JSON using only paths from repo_map unless declaring a new file under an existing directory."
         ).strip()
 
@@ -4507,6 +4654,25 @@ class WorkflowOrchestrator:
                 try:
                     payload = yaml.safe_load(candidate)
                 except yaml.YAMLError as exc:
+                    partial_items = self._parse_partial_planner_yaml_items(candidate)
+                    if partial_items:
+                        extracted_payload_excerpt = str(candidate).strip()[:400]
+                        items: list[dict[str, Any]] = []
+                        schema_errors: list[str] = []
+                        for index, raw_item in enumerate(partial_items, start=1):
+                            normalized, item_errors = self._normalize_planner_task(raw_item, item_index=index)
+                            if item_errors:
+                                schema_errors.extend(item_errors)
+                            elif normalized:
+                                items.append(normalized)
+                        if items:
+                            return {
+                                "items": items,
+                                "parse_error": "",
+                                "schema_errors": schema_errors,
+                                "raw_output_excerpt": normalized_text[:400],
+                                "extracted_payload_excerpt": extracted_payload_excerpt,
+                            }
                     parse_errors.append(str(exc))
                     continue
             extracted_payload_excerpt = str(candidate).strip()[:400]
@@ -4545,6 +4711,39 @@ class WorkflowOrchestrator:
             "raw_output_excerpt": normalized_text[:400],
             "extracted_payload_excerpt": "",
         }
+
+    @staticmethod
+    def _parse_partial_planner_yaml_items(text: str) -> list[dict[str, Any]]:
+        normalized = str(text or "").replace("\r\n", "\n").strip()
+        if not normalized:
+            return []
+        normalized = re.sub(r"^\s*```(?:yaml|yml|json)?\s*\n?", "", normalized, flags=re.IGNORECASE)
+        normalized = re.sub(r"\n```+\s*$", "", normalized).strip()
+        lines = normalized.splitlines()
+        blocks: list[str] = []
+        current: list[str] = []
+        for line in lines:
+            if re.match(r"^\s*-\s+id\s*:", line):
+                if current:
+                    blocks.append("\n".join(current))
+                current = [line]
+                continue
+            if current:
+                current.append(line)
+        if current:
+            blocks.append("\n".join(current))
+
+        parsed_items: list[dict[str, Any]] = []
+        for block in blocks:
+            try:
+                payload = yaml.safe_load(textwrap.dedent(block).strip())
+            except yaml.YAMLError:
+                continue
+            if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+                parsed_items.append(payload[0])
+            elif isinstance(payload, dict):
+                parsed_items.append(payload)
+        return parsed_items
 
     def _normalize_planner_task(self, raw_item: Any, *, item_index: int) -> tuple[dict[str, Any] | None, list[str]]:
         if not isinstance(raw_item, dict):
@@ -4988,6 +5187,25 @@ class WorkflowOrchestrator:
                 try:
                     payload = yaml.safe_load(candidate)
                 except yaml.YAMLError as exc:
+                    partial_items = self._parse_partial_planner_yaml_items(candidate)
+                    if partial_items:
+                        extracted_payload_excerpt = str(candidate).strip()[:400]
+                        items: list[dict[str, Any]] = []
+                        schema_errors: list[str] = []
+                        for index, raw_item in enumerate(partial_items, start=1):
+                            normalized, item_errors = self._normalize_planner_task(raw_item, item_index=index)
+                            if item_errors:
+                                schema_errors.extend(item_errors)
+                            elif normalized:
+                                items.append(normalized)
+                        if items:
+                            return {
+                                "items": items,
+                                "parse_error": "",
+                                "schema_errors": schema_errors,
+                                "raw_output_excerpt": normalized_text[:400],
+                                "extracted_payload_excerpt": extracted_payload_excerpt,
+                            }
                     parse_errors.append(str(exc))
                     continue
             if not isinstance(payload, dict):
@@ -5676,6 +5894,50 @@ class WorkflowOrchestrator:
             return []
         return [str(item).strip() for item in completed if str(item).strip()]
 
+    def _selected_task_dependency_error(self) -> str:
+        item = self._selected_implementation_item or {}
+        task_id = str(item.get("id") or "").strip() or "selected task"
+        declared_dependencies = [str(value).strip() for value in (item.get("depends_on") or []) if str(value).strip()]
+        if not declared_dependencies:
+            return ""
+        backlog = self._implementation_backlog_cache or []
+        backlog_by_id = {
+            str(candidate.get("id") or "").strip(): candidate
+            for candidate in backlog
+            if str(candidate.get("id") or "").strip()
+        }
+        completed = set(self._completed_implementation_task_ids())
+        repo_map = self._load_repo_map()
+        repo_files = {
+            str(repo_item.get("path") or "").strip()
+            for repo_item in (repo_map.get("files") or [])
+            if str(repo_item.get("path") or "").strip()
+        }
+        repo_directories = {str(path).strip() for path in (repo_map.get("directories") or []) if str(path).strip()}
+        unresolved: list[str] = []
+        for dependency_id in declared_dependencies:
+            if dependency_id not in completed:
+                unresolved.append(f"{dependency_id}:not_completed")
+                continue
+            dependency_item = backlog_by_id.get(dependency_id) or {}
+            missing_artifacts: list[str] = []
+            for path in dependency_item.get("new_files") or []:
+                normalized = self._normalize_repo_relative_path(path)
+                if normalized and normalized not in repo_files:
+                    missing_artifacts.append(normalized)
+            for path in dependency_item.get("new_directories") or []:
+                normalized = self._normalize_repo_relative_path(path)
+                if normalized and normalized not in repo_directories:
+                    missing_artifacts.append(normalized)
+            if missing_artifacts:
+                unresolved.append(f"{dependency_id}:missing_artifacts:{', '.join(missing_artifacts[:4])}")
+        if not unresolved:
+            return ""
+        return (
+            f"Selected task {task_id} has incomplete dependencies. "
+            f"Resolve depends_on first: {'; '.join(unresolved)}"
+        )
+
     def _mark_implementation_task_completed(self) -> None:
         if not self._selected_implementation_item:
             return
@@ -5829,6 +6091,48 @@ class WorkflowOrchestrator:
 
     def _save_project_settings(self) -> None:
         self.project_settings_path.write_text(yaml.safe_dump(self.project_settings, sort_keys=False), encoding="utf-8")
+
+    def _set_user_goal(self, goal: str) -> None:
+        normalized = str(goal or "").strip()
+        self.user_goal = normalized
+        if normalized:
+            self.saved_user_goal = normalized
+            self.project_settings["user_goal"] = normalized
+        else:
+            self.saved_user_goal = ""
+            self.project_settings.pop("user_goal", None)
+        self._save_project_settings()
+
+    def _should_prompt_for_user_goal(self, phase_key: str) -> bool:
+        if self.config["workflow"]["mode"] == "auto":
+            return False
+        if self.user_goal_override:
+            return False
+        if phase_key == "research":
+            return True
+        if phase_key != "implementation":
+            return False
+        if self.from_agent_name in {"developer", "qa", "template-validator"}:
+            return False
+        return True
+
+    def _ensure_user_goal(self, phase_key: str) -> bool:
+        if self.user_goal_override:
+            return True
+        if not self._should_prompt_for_user_goal(phase_key):
+            return True
+        current_goal = str(self.saved_user_goal or "").strip()
+        if current_goal:
+            self.logger.info(f"Saved user goal: {current_goal}")
+            prompt = "Укажите цель этого прогона (Enter = оставить текущую): "
+        else:
+            prompt = "Укажите цель этого прогона (Enter = использовать стандартный scope): "
+        answer = input(prompt).strip()
+        if answer:
+            self._set_user_goal(answer)
+        elif current_goal:
+            self.user_goal = current_goal
+        return True
 
     def _log_startup_diagnostics(self) -> None:
         self.logger.info(f"Startup diagnostic: engine_root={self.engine_root}")
@@ -6297,12 +6601,55 @@ class WorkflowOrchestrator:
 
     def _estimate_cost_usd(self, model: str, input_tokens: int | None, output_tokens: int | None) -> float | None:
         pricing = self.pricing.get(model)
+        if not pricing:
+            pricing = self.pricing.get(self._normalize_model_for_pricing(model))
         if not pricing or input_tokens is None or output_tokens is None:
             return None
         input_rate = float(pricing.get("input_per_1m_usd") or 0.0)
         output_rate = float(pricing.get("output_per_1m_usd") or 0.0)
         cost = (input_tokens / 1_000_000) * input_rate + (output_tokens / 1_000_000) * output_rate
         return round(cost, 6)
+
+    @staticmethod
+    def _normalize_model_for_pricing(model: str) -> str:
+        normalized = str(model or "").strip()
+        if not normalized:
+            return normalized
+        claude_sonnet_match = re.match(r"^(?P<prefix>(?:openrouter/)?anthropic/)?claude-(?P<version>\d+(?:\.\d+)?)-sonnet(?:-(?P<date>\d{8}))?$", normalized)
+        if claude_sonnet_match:
+            prefix = claude_sonnet_match.group("prefix") or ""
+            version = claude_sonnet_match.group("version")
+            reordered = f"{prefix}claude-sonnet-{version}"
+            return reordered
+        candidates = [normalized]
+        if normalized.startswith("openrouter/"):
+            candidates.append(normalized[len("openrouter/"):])
+        if normalized.startswith("anthropic/"):
+            suffix = normalized[len("anthropic/"):]
+            candidates.append(suffix)
+        if normalized.startswith("deepseek/"):
+            suffix = normalized[len("deepseek/"):]
+            candidates.append(suffix)
+        stripped_date = re.sub(r"([:/-])\d{8}$", "", normalized)
+        if stripped_date != normalized:
+            candidates.append(stripped_date)
+        stripped_version = re.sub(r"[-:]20\d{6,}$", "", normalized)
+        if stripped_version != normalized:
+            candidates.append(stripped_version)
+        for candidate in list(candidates):
+            if candidate.startswith("openrouter/"):
+                candidates.append(candidate[len("openrouter/"):])
+        for candidate in candidates:
+            if candidate.startswith("anthropic/"):
+                candidates.append(candidate[len("anthropic/"):])
+            if candidate.startswith("deepseek/"):
+                candidates.append(candidate[len("deepseek/"):])
+        for candidate in candidates:
+            cleaned = re.sub(r"-20\d{6,}$", "", candidate)
+            cleaned = re.sub(r":20\d{6,}$", "", cleaned)
+            if cleaned:
+                return cleaned
+        return normalized
 
     @staticmethod
     def _coerce_int(value: Any) -> int | None:
@@ -6349,6 +6696,31 @@ class WorkflowOrchestrator:
         if value is None:
             return "unavailable"
         return f"${float(value):.6f}"
+
+    @staticmethod
+    def _direct_api_max_tokens(phase: str, agent_name: str) -> int | None:
+        if phase == "research":
+            if agent_name == "product-manager":
+                return 2200
+            if agent_name in {"project-analyst", "market-analyst", "tech-analyst"}:
+                return 1800
+            return 1400
+        if phase == "implementation":
+            if agent_name == "architect":
+                return 2200
+            if agent_name == "implementation-planner":
+                return None
+            if agent_name == "task-designer":
+                return 1600
+            if agent_name == "developer":
+                return 2200
+            if agent_name == "qa":
+                return 1600
+            if agent_name == "template-validator":
+                return 1000
+        if phase == "deployment":
+            return 1600
+        return 1600
 
     def _start_stream_reader(
         self,

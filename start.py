@@ -61,6 +61,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicit implementation task scope override",
     )
     parser.add_argument(
+        "--goal",
+        default=None,
+        help="Explicit user goal for this run; used as the primary research and implementation objective",
+    )
+    parser.add_argument(
         "--task-id",
         default=None,
         help="Implementation backlog item id or 1-based number",
@@ -139,6 +144,7 @@ def main(argv: list[str] | None = None) -> int:
         no_memory=args.no_memory,
         fresh_run=args.fresh_run,
         task_scope=args.task_scope,
+        user_goal=args.goal,
         selected_task_ref=args.task_id,
         next_task=args.next_task,
         research_run=args.research_run,

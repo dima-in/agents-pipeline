@@ -199,6 +199,101 @@ def test_openrouter_request_includes_authorization_bearer_header(monkeypatch, tm
     assert captured["referer"] == "http://localhost/agents-pipeline"
     assert captured["title"] == "agents-pipeline"
     assert captured["body"]["model"] == "deepseek/deepseek-chat-v3"
+    assert captured["body"]["max_tokens"] == 1800
+
+
+def test_implementation_planner_direct_api_does_not_require_russian_translation(
+    monkeypatch, tmp_path: Path
+) -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+    orchestrator.logger = WorkflowLogger(log_dir=str(tmp_path / "logs"))
+
+    def fake_urlopen(_request, timeout=0):
+        return _FakeHTTPResponse(
+            {
+                "model": "anthropic/claude-4.5-sonnet-20250929",
+                "choices": [
+                    {
+                        "message": {
+                            "content": "tasks:\n  - id: TASK-001\n    title: Example\n    priority: P1\n    scope: backend-only\n    existing_paths:\n      - gateway-v4/app/main.py\n    new_directories: []\n    new_files:\n      - gateway-v4/tests/test_example.py\n    allowed_paths:\n      - gateway-v4/app/main.py\n      - gateway-v4/tests/test_example.py\n    forbidden_paths: []\n    required_test_paths:\n      - gateway-v4/tests/test_example.py\n    acceptance_criteria:\n      - test exists\n    reason_each_path_is_needed:\n      gateway-v4/app/main.py: reference\n      gateway-v4/tests/test_example.py: test\n    target_file:\n      path: gateway-v4/tests/test_example.py\n      action: create\n      purpose: Create test\n    reference_files:\n      - gateway-v4/app/main.py\n    depends_on: []\n    risk_level: low\n    estimated_effort: S"
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20},
+            }
+        )
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.setattr(orchestrator_module.urllib_request, "urlopen", fake_urlopen)
+
+    ok = orchestrator._run_agent(
+        {
+            "name": "implementation-planner",
+            "description": "Convert plan to backlog",
+            "timeout": 5,
+            "provider": "openrouter",
+            "model": "openrouter/anthropic/claude-sonnet-4.5",
+        },
+        "implementation",
+    )
+
+    assert ok is True
+
+
+def test_implementation_planner_direct_api_omits_max_tokens(monkeypatch, tmp_path: Path) -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+    orchestrator.logger = WorkflowLogger(log_dir=str(tmp_path / "logs"))
+    captured: dict[str, object] = {}
+
+    def fake_urlopen(request, timeout=0):
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return _FakeHTTPResponse(
+            {
+                "model": "anthropic/claude-4.5-sonnet-20250929",
+                "choices": [
+                    {
+                        "message": {
+                            "content": "tasks:\n  - id: TASK-001\n    title: Example\n    priority: P1\n    scope: backend-only\n    existing_paths:\n      - gateway-v4/app/main.py\n    new_directories: []\n    new_files:\n      - gateway-v4/tests/test_example.py\n    allowed_paths:\n      - gateway-v4/app/main.py\n      - gateway-v4/tests/test_example.py\n    forbidden_paths: []\n    required_test_paths:\n      - gateway-v4/tests/test_example.py\n    acceptance_criteria:\n      - test exists\n    reason_each_path_is_needed:\n      gateway-v4/app/main.py: reference\n      gateway-v4/tests/test_example.py: test\n    target_file:\n      path: gateway-v4/tests/test_example.py\n      action: create\n      purpose: Create test\n    reference_files:\n      - gateway-v4/app/main.py\n    depends_on: []\n    risk_level: low\n    estimated_effort: S"
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20},
+            }
+        )
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.setattr(orchestrator_module.urllib_request, "urlopen", fake_urlopen)
+
+    ok = orchestrator._run_agent(
+        {
+            "name": "implementation-planner",
+            "description": "Convert plan to backlog",
+            "timeout": 5,
+            "provider": "openrouter",
+            "model": "openrouter/anthropic/claude-sonnet-4.5",
+        },
+        "implementation",
+    )
+
+    assert ok is True
+    assert "max_tokens" not in captured["body"]
+
+
+def test_parse_direct_api_retrieval_request_supports_multiple_json_tool_calls() -> None:
+    payload = WorkflowOrchestrator._parse_direct_api_retrieval_request(
+        """I'll inspect and update files.
+
+{"tool":"read_file","path":"gateway-v4/app/models.py"}
+
+{"tool":"read_file","path":"gateway-v4/app/database.py"}
+
+{"tool":"write_file","path":"gateway-v4/tests/test_provider_metrics_model.py","content":"ok"}
+"""
+    )
+
+    assert payload is not None
+    assert payload["tool"] == "tool_batch"
+    assert [request["tool"] for request in payload["requests"]] == ["read_file", "read_file", "write_file"]
 
 
 def test_openrouter_model_normalization_works() -> None:
@@ -839,6 +934,19 @@ def test_architect_prompt_includes_no_generic_root_warning_for_self_analysis() -
     )
 
     assert "Do not propose src/, api/, services/, models/, or config/ root directories unless they already exist." in bundle["system_message"]
+
+
+def test_implementation_planner_does_not_require_russian_translation() -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+    bundle = orchestrator._build_agent_message_bundle(
+        "implementation-planner",
+        {"name": "implementation-planner", "description": "Convert the architect plan into a prioritized implementation backlog"},
+        Path(".openclaw/agents/implementation/implementation-planner/prompt.md"),
+        "implementation",
+    )
+
+    assert "Return only structured YAML or JSON for the backlog outline." in bundle["system_message"]
+    assert "Russian translation" not in bundle["system_message"]
 
 
 def test_planner_can_translate_invalid_architect_path_into_valid_workflow_path(tmp_path: Path) -> None:
@@ -2956,6 +3064,112 @@ def test_usage_status_is_unavailable_when_token_data_is_missing(monkeypatch, tmp
     )
     assert payload["usage"]["usage_status"] == "unavailable"
     assert payload["usage"]["estimated_cost_usd"] is None
+
+
+def test_extract_usage_estimates_cost_for_dated_model_alias() -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+
+    stdout = json.dumps(
+        {
+            "output_text": "English summary.\n\nRussian translation\nПеревод.",
+            "model": "deepseek/deepseek-v4-pro-20260423",
+            "provider": "openrouter",
+            "usage": {"prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500},
+        },
+        ensure_ascii=False,
+    )
+
+    usage = orchestrator._extract_usage(
+        stdout,
+        {"provider": "openrouter", "model": "openrouter/deepseek/deepseek-v4-pro", "thinking": "low"},
+    )
+
+    assert usage["input_tokens"] == 1000
+    assert usage["output_tokens"] == 500
+    assert usage["total_tokens"] == 1500
+    assert usage["estimated_cost_usd"] == 0.00087
+    assert usage["usage_status"] == "captured"
+
+
+def test_extract_usage_estimates_cost_for_dated_claude_45_alias() -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+
+    stdout = json.dumps(
+        {
+            "output_text": "outline",
+            "model": "anthropic/claude-4.5-sonnet-20250929",
+            "provider": "openrouter",
+            "usage": {"prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500},
+        },
+        ensure_ascii=False,
+    )
+
+    usage = orchestrator._extract_usage(
+        stdout,
+        {"provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.5", "thinking": "low"},
+    )
+
+    assert usage["input_tokens"] == 1000
+    assert usage["output_tokens"] == 500
+    assert usage["total_tokens"] == 1500
+    assert usage["estimated_cost_usd"] == 0.0105
+    assert usage["usage_status"] == "captured"
+
+
+def test_parse_implementation_planner_output_salvages_complete_tasks_from_truncated_fenced_yaml() -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+
+    text = """```yaml
+tasks:
+  - id: TASK-001
+    title: Example one
+    priority: P0
+    scope: backend-only
+    existing_paths:
+      - gateway-v4/app/main.py
+    new_directories:
+      - gateway-v4/tests
+    new_files:
+      - gateway-v4/tests/__init__.py
+      - gateway-v4/tests/test_one.py
+    allowed_paths:
+      - gateway-v4/app/main.py
+      - gateway-v4/tests/__init__.py
+      - gateway-v4/tests/test_one.py
+    forbidden_paths: []
+    required_test_paths:
+      - gateway-v4/tests/test_one.py
+    acceptance_criteria:
+      - test exists
+    reason_each_path_is_needed:
+      gateway-v4/app/main.py: reference
+      gateway-v4/tests/__init__.py: marker
+      gateway-v4/tests/test_one.py: test
+    target_file:
+      path: gateway-v4/tests/test_one.py
+      action: create
+      purpose: Create test
+    reference_files:
+      - gateway-v4/app/main.py
+    depends_on: []
+    risk_level: low
+    estimated_effort: S
+  - id: TASK-002
+    title: Broken
+    priority: P1
+    scope: backend-only
+    existing_paths:
+      - gateway-v4/app/main.py
+    new_files:
+      - gateway-v4/tests/test_two.py
+    allowed_paths:
+      - gateway-v4/app/main.py
+      - gateway-v4/tests/test_two"""
+
+    parsed = orchestrator._parse_implementation_planner_output(text)
+
+    assert parsed["parse_error"] == ""
+    assert [item["id"] for item in parsed["items"]][:1] == ["TASK-001"]
 
 
 def test_run_summary_totals_are_calculated_correctly(tmp_path: Path) -> None:

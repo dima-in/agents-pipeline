@@ -2,6 +2,22 @@ anthropic/claude-sonnet-4-6:
   input_per_1m_usd: 3.0
   output_per_1m_usd: 15.0
 
+anthropic/claude-sonnet-4.5:
+  input_per_1m_usd: 3.0
+  output_per_1m_usd: 15.0
+
+anthropic/claude-4.5-sonnet:
+  input_per_1m_usd: 3.0
+  output_per_1m_usd: 15.0
+
+anthropic/claude-4.5-sonnet-20250929:
+  input_per_1m_usd: 3.0
+  output_per_1m_usd: 15.0
+
+openrouter/anthropic/claude-sonnet-4.5:
+  input_per_1m_usd: 3.0
+  output_per_1m_usd: 15.0
+
 claude-sonnet-4-5-20250929:
   input_per_1m_usd: 3.0
   output_per_1m_usd: 15.0
@@ -9,6 +25,14 @@ claude-sonnet-4-5-20250929:
 openrouter/anthropic/claude-sonnet-4.6:
   input_per_1m_usd: 3.0
   output_per_1m_usd: 15.0
+
+deepseek/deepseek-v4-pro:
+  input_per_1m_usd: 0.435
+  output_per_1m_usd: 0.87
+
+openrouter/deepseek/deepseek-v4-pro:
+  input_per_1m_usd: 0.435
+  output_per_1m_usd: 0.87
 
 perplexity/sonar:
   input_per_1m_usd: 1.0

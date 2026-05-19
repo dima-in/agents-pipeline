@@ -25,8 +25,12 @@ Return only structured YAML or JSON. This agent produces backlog outlines, not t
 - `estimated_effort`
 
 Rules:
+- Return at most 5 tasks unless the selected user goal explicitly requires a larger backlog.
 - Break broad plans into safe developer-sized tasks.
 - Keep tasks concrete and file-scoped.
+- Keep strings compact. Do not write long prose in `acceptance_criteria`, `reason_each_path_is_needed`, or `purpose`.
+- Prefer 2-3 short acceptance criteria per task.
+- Keep each `reason_each_path_is_needed` value short and specific.
 - Sort output so P0 comes before P1 before P2, low risk before high risk, and backend-only before frontend/billing/marketplace.
 - Prefer backend-only work when possible.
 - Preserve constraints from the selected scope and project policy.
@@ -61,7 +65,17 @@ Rules:
 - `target_file.path` must be one exact file from `new_files` or `existing_paths`.
 - `target_file.action` must be `create` or `update`.
 - `reference_files` must be exact existing reference files from `repo_map`.
-- `depends_on` should list earlier task ids only when the task needs artifacts created by earlier tasks.
+- `depends_on` should list earlier task ids when the task needs artifacts created by earlier tasks.
+- If task B reads, updates, or tests a file created by task A, then in task B:
+  - declare `depends_on: ["TASK-A"]`
+  - place that reused file in `existing_paths`
+  - include that same file in `allowed_paths` only because it is now declared in `existing_paths`
+  - do not leave an earlier-task artifact only in `allowed_paths`
+- This rule also applies to package markers such as `gateway-v4/tests/__init__.py` and `gateway-v4/tests/integration/__init__.py`.
+- If `gateway-v4/tests/__init__.py` was created by an earlier task and a later task still needs it in `allowed_paths`, the later task must:
+  - declare `depends_on` on the earlier task
+  - place `gateway-v4/tests/__init__.py` in `existing_paths`
+  - keep `gateway-v4/tests/__init__.py` in `allowed_paths` only because it is declared in `existing_paths`
 - Test package scaffolding rule:
   - if `required_test_paths` includes a file under a test directory that does not yet exist in `repo_map` such as `gateway-v4/tests/test_*.py`, you must:
     - add `gateway-v4/tests` to `new_directories`
@@ -74,6 +88,8 @@ CRITICAL RULES:
 - `target_file.path` MUST appear in `allowed_paths`.
 - For files, `allowed_paths` declarations must resolve through `existing_paths` or `new_files`; `new_directories` is only valid for directory paths.
 - If task B uses code created by task A, declare `depends_on: ["TASK-A"]`.
+- If task B uses a file created by task A, that file must appear in `existing_paths` for task B. Do not keep it only in `allowed_paths`.
+- If task B reuses a package marker from task A such as `tests/__init__.py`, that package marker must appear in `existing_paths` for task B. Do not keep it only in `allowed_paths`.
 - Leave detailed code signatures, imports, concrete test assertions, and forbidden implementation actions to the downstream `task-designer` agent. Do not try to generate the full developer contract here.
 
 Example valid task fragment for a new test package:
@@ -113,6 +129,86 @@ Example valid task fragment for a new test package:
     gateway-v4/tests/test_router_smart.py: "Tests for smart routing behavior"
   risk_level: medium
   estimated_effort: "3-4 hours"
+```
+
+Example for a later task reusing an earlier task artifact:
+
+```yaml
+- id: TASK-LATER
+  title: "Add integration test for smart routing"
+  priority: P1
+  scope: "backend-only"
+  existing_paths:
+    - gateway-v4/app/main.py
+    - gateway-v4/app/services/smart_router.py
+  new_directories:
+    - gateway-v4/tests/integration
+  new_files:
+    - gateway-v4/tests/integration/__init__.py
+    - gateway-v4/tests/integration/test_smart_routing_flow.py
+  allowed_paths:
+    - gateway-v4/app/main.py
+    - gateway-v4/app/services/smart_router.py
+    - gateway-v4/tests/integration/__init__.py
+    - gateway-v4/tests/integration/test_smart_routing_flow.py
+  forbidden_paths: []
+  required_test_paths:
+    - gateway-v4/tests/integration/test_smart_routing_flow.py
+  acceptance_criteria:
+    - "integration test covers the routing flow"
+  depends_on:
+    - TASK-EARLIER
+  target_file:
+    path: gateway-v4/tests/integration/test_smart_routing_flow.py
+    action: create
+    purpose: Add the integration test for the smart routing flow.
+  reference_files:
+    - gateway-v4/app/main.py
+  reason_each_path_is_needed:
+    gateway-v4/app/main.py: "Existing app entrypoint referenced by the test setup"
+    gateway-v4/app/services/smart_router.py: "File created earlier and reused here, so it is declared in existing_paths"
+    gateway-v4/tests/integration/__init__.py: "Package marker for the new integration test directory"
+    gateway-v4/tests/integration/test_smart_routing_flow.py: "New integration test file"
+  risk_level: low
+  estimated_effort: "3-4 hours"
+```
+
+Example for reusing an earlier test package marker:
+
+```yaml
+- id: TASK-TEST-REUSE
+  title: "Add API test after the base test package already exists"
+  priority: P1
+  scope: "backend-only"
+  existing_paths:
+    - gateway-v4/app/main.py
+    - gateway-v4/tests/__init__.py
+  new_directories: []
+  new_files:
+    - gateway-v4/tests/test_provider_performance_api.py
+  allowed_paths:
+    - gateway-v4/app/main.py
+    - gateway-v4/tests/__init__.py
+    - gateway-v4/tests/test_provider_performance_api.py
+  forbidden_paths: []
+  required_test_paths:
+    - gateway-v4/tests/test_provider_performance_api.py
+  acceptance_criteria:
+    - "API test covers the provider performance endpoint"
+  depends_on:
+    - TASK-001
+  target_file:
+    path: gateway-v4/tests/test_provider_performance_api.py
+    action: create
+    purpose: Add the API test file.
+  reference_files:
+    - gateway-v4/app/main.py
+  reason_each_path_is_needed:
+    gateway-v4/app/main.py: "Existing app entrypoint used by the API test"
+    gateway-v4/tests/__init__.py: "Package marker created by TASK-001 and reused here, so it is declared in existing_paths"
+    gateway-v4/tests/test_provider_performance_api.py: "New API test file"
+  risk_level: low
+  estimated_effort: "2-3 hours"
 ```
 
 Example for migration files:
@@ -155,6 +251,8 @@ Wrong:
 
 Self-check before output:
 - For every path in `allowed_paths`, confirm it also appears in `existing_paths` or `new_files`.
+- For every reused file created by an earlier task, confirm it appears in `existing_paths` of the current task and that `depends_on` names the earlier task.
+- For every reused package marker such as `tests/__init__.py`, confirm it appears in `existing_paths` of the current task and that `depends_on` names the earlier task that created it.
 - For every path in `existing_paths`, confirm it is an exact existing file from `repo_map`.
 - For every migration or test file, confirm the exact filename exists in `repo_map` before placing it in `existing_paths`; otherwise place it in `new_files` or remove it.
 - For every path in `new_files`, confirm its parent already exists in `repo_map` or is listed in `new_directories`.

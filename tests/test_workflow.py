@@ -151,6 +151,19 @@ def test_start_parser_accepts_from_agent_developer() -> None:
     assert args.from_agent == "developer"
 
 
+def test_start_parser_accepts_goal() -> None:
+    args = build_parser().parse_args(
+        [
+            "--phase",
+            "research",
+            "--goal",
+            "Implement only repo-map validation improvements",
+        ]
+    )
+
+    assert args.goal == "Implement only repo-map validation improvements"
+
+
 def test_create_git_branch_reuses_existing_branch_on_rerun(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -187,6 +200,74 @@ def test_agent_directories_exist() -> None:
     assert "architect" in agents["implementation"]
     assert "implementation-planner" in agents["implementation"]
     assert "task-designer" in agents["implementation"]
+
+
+def test_user_goal_becomes_default_implementation_scope(tmp_path: Path) -> None:
+    config_path = tmp_path / "workflow.yaml"
+    _write_minimal_workflow_config(config_path)
+
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        user_goal="Implement only a status command for the pipeline",
+    )
+
+    assert orchestrator._select_implementation_scope([]) == "Implement only a status command for the pipeline"
+
+
+def test_user_goal_is_included_in_implementation_phase_context(tmp_path: Path) -> None:
+    config_path = tmp_path / "workflow.yaml"
+    _write_minimal_workflow_config(config_path)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "README.md").write_text("demo\n", encoding="utf-8")
+
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        workspace=str(workspace),
+        user_goal="Fix planner validation only",
+    )
+    orchestrator._repo_map_cache = {
+        "target_workspace": str(workspace),
+        "project_id": "workspace",
+        "top_level_tree": ["README.md"],
+        "directories": [],
+        "files": [{"path": "README.md"}],
+        "entrypoints": [],
+        "dependency_files": [],
+        "config_files": [],
+        "test_files": [],
+        "docker_files": [],
+        "agent_relevant_files": [],
+    }
+
+    context = orchestrator._build_implementation_phase_context("architect")
+
+    assert "User goal" in context["repository_context"]
+    assert "Fix planner validation only" in context["repository_context"]
+    assert context["selected_task_scope"] == "Fix planner validation only"
+    assert context["user_goal"] == "Fix planner validation only"
+
+
+def test_research_phase_prompts_for_user_goal_in_interactive_mode(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "workflow.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path))
+    orchestrator.config["workflow"]["mode"] = "interactive"
+
+    prompts: list[str] = []
+
+    def fake_input(prompt: str) -> str:
+        prompts.append(prompt)
+        return "Improve repo-map diagnostics"
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    monkeypatch.setattr(orchestrator, "_preflight_runtime", lambda _phase: True)
+    monkeypatch.setattr(orchestrator, "run_phase", lambda _phase: True)
+
+    assert orchestrator.run_research_phase() is True
+    assert prompts
+    assert orchestrator.user_goal == "Improve repo-map diagnostics"
 
 
 def test_agent_catalog_loads() -> None:
@@ -2144,6 +2225,175 @@ def test_repo_map_target_mismatch_blocks_developer_before_run(tmp_path: Path) ->
     assert orchestrator._phase_failure_status == "repo_map_target_workspace_mismatch"
 
 
+def test_task_designer_blocked_when_selected_task_dependencies_incomplete(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (target_workspace / "gateway-v4" / "app").mkdir(parents=True, exist_ok=True)
+    (target_workspace / "gateway-v4" / "app" / "models.py").write_text("pass\n", encoding="utf-8")
+    (target_workspace / "gateway-v4" / "app" / "database.py").write_text("pass\n", encoding="utf-8")
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    orchestrator._wait_for_user = lambda _prompt: True
+    orchestrator._implementation_backlog_cache = [
+        {
+            "id": "TASK-001",
+            "title": "Create tests package",
+            "priority": "P0",
+            "scope": "backend-only",
+            "existing_paths": [],
+            "new_directories": ["gateway-v4/tests"],
+            "new_files": ["gateway-v4/tests/__init__.py"],
+            "allowed_paths": ["gateway-v4/tests/__init__.py"],
+            "forbidden_paths": [],
+            "required_test_paths": ["gateway-v4/tests/__init__.py"],
+            "depends_on": [],
+            "target_file": {"path": "gateway-v4/tests/__init__.py", "action": "create", "purpose": "Create test package marker."},
+            "reference_files": [],
+            "acceptance_criteria": ["done"],
+            "reason_each_path_is_needed": {"gateway-v4/tests/__init__.py": "Package marker."},
+            "risk_level": "low",
+            "estimated_effort": "S",
+        },
+        {
+            "id": "TASK-002",
+            "title": "Add provider metrics model",
+            "priority": "P0",
+            "scope": "backend-only",
+            "existing_paths": ["gateway-v4/app/models.py", "gateway-v4/app/database.py", "gateway-v4/tests/__init__.py"],
+            "new_directories": [],
+            "new_files": ["gateway-v4/tests/test_provider_metrics_model.py"],
+            "allowed_paths": [
+                "gateway-v4/app/models.py",
+                "gateway-v4/app/database.py",
+                "gateway-v4/tests/__init__.py",
+                "gateway-v4/tests/test_provider_metrics_model.py",
+            ],
+            "forbidden_paths": [],
+            "required_test_paths": ["gateway-v4/tests/test_provider_metrics_model.py"],
+            "depends_on": ["TASK-001"],
+            "target_file": {"path": "gateway-v4/app/models.py", "action": "update", "purpose": "Add model."},
+            "reference_files": ["gateway-v4/app/models.py", "gateway-v4/app/database.py"],
+            "acceptance_criteria": ["done"],
+            "reason_each_path_is_needed": {
+                "gateway-v4/app/models.py": "Update model file.",
+                "gateway-v4/app/database.py": "Reference base.",
+                "gateway-v4/tests/__init__.py": "Dependency artifact.",
+                "gateway-v4/tests/test_provider_metrics_model.py": "Test file.",
+            },
+            "risk_level": "low",
+            "estimated_effort": "S",
+        },
+    ]
+    orchestrator._implementation_backlog_source = "implementation-planner"
+    orchestrator._selected_implementation_item = orchestrator._implementation_backlog_cache[1]
+    repo_map = {
+        "target_workspace": str(target_workspace),
+        "top_level_tree": ["gateway-v4/"],
+        "directories": ["", "gateway-v4", "gateway-v4/app"],
+        "files": [
+            {"path": "gateway-v4/app/models.py"},
+            {"path": "gateway-v4/app/database.py"},
+        ],
+    }
+    orchestrator.repo_map_path.parent.mkdir(parents=True, exist_ok=True)
+    orchestrator.repo_map_path.write_text(json.dumps(repo_map), encoding="utf-8")
+    orchestrator._repo_map_cache = repo_map
+    calls: list[str] = []
+    orchestrator._run_agent = lambda agent, phase, index=None, total=None: calls.append(agent["name"]) or True
+
+    ok = orchestrator._run_phase_agents({"agents": [{"name": "task-designer"}]}, "implementation")
+
+    assert ok is False
+    assert calls == []
+    assert orchestrator._phase_failure_status == "task_dependencies_incomplete"
+
+
+def test_developer_blocked_when_selected_task_dependencies_incomplete(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (target_workspace / "gateway-v4" / "app").mkdir(parents=True, exist_ok=True)
+    (target_workspace / "gateway-v4" / "app" / "models.py").write_text("pass\n", encoding="utf-8")
+    (target_workspace / "gateway-v4" / "app" / "database.py").write_text("pass\n", encoding="utf-8")
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    orchestrator._wait_for_user = lambda _prompt: True
+    orchestrator._implementation_backlog_cache = [
+        {
+            "id": "TASK-001",
+            "title": "Create tests package",
+            "priority": "P0",
+            "scope": "backend-only",
+            "existing_paths": [],
+            "new_directories": ["gateway-v4/tests"],
+            "new_files": ["gateway-v4/tests/__init__.py"],
+            "allowed_paths": ["gateway-v4/tests/__init__.py"],
+            "forbidden_paths": [],
+            "required_test_paths": ["gateway-v4/tests/__init__.py"],
+            "depends_on": [],
+            "target_file": {"path": "gateway-v4/tests/__init__.py", "action": "create", "purpose": "Create test package marker."},
+            "reference_files": [],
+            "acceptance_criteria": ["done"],
+            "reason_each_path_is_needed": {"gateway-v4/tests/__init__.py": "Package marker."},
+            "risk_level": "low",
+            "estimated_effort": "S",
+        },
+        {
+            "id": "TASK-002",
+            "title": "Add provider metrics model",
+            "priority": "P0",
+            "scope": "backend-only",
+            "existing_paths": ["gateway-v4/app/models.py", "gateway-v4/app/database.py", "gateway-v4/tests/__init__.py"],
+            "new_directories": [],
+            "new_files": ["gateway-v4/tests/test_provider_metrics_model.py"],
+            "allowed_paths": [
+                "gateway-v4/app/models.py",
+                "gateway-v4/app/database.py",
+                "gateway-v4/tests/__init__.py",
+                "gateway-v4/tests/test_provider_metrics_model.py",
+            ],
+            "forbidden_paths": [],
+            "required_test_paths": ["gateway-v4/tests/test_provider_metrics_model.py"],
+            "depends_on": ["TASK-001"],
+            "target_file": {"path": "gateway-v4/app/models.py", "action": "update", "purpose": "Add model."},
+            "reference_files": ["gateway-v4/app/models.py", "gateway-v4/app/database.py"],
+            "acceptance_criteria": ["done"],
+            "reason_each_path_is_needed": {
+                "gateway-v4/app/models.py": "Update model file.",
+                "gateway-v4/app/database.py": "Reference base.",
+                "gateway-v4/tests/__init__.py": "Dependency artifact.",
+                "gateway-v4/tests/test_provider_metrics_model.py": "Test file.",
+            },
+            "risk_level": "low",
+            "estimated_effort": "S",
+            "contract_source": "task-designer",
+        },
+    ]
+    orchestrator._implementation_backlog_source = "implementation-planner"
+    orchestrator._selected_implementation_item = orchestrator._implementation_backlog_cache[1]
+    repo_map = {
+        "target_workspace": str(target_workspace),
+        "top_level_tree": ["gateway-v4/"],
+        "directories": ["", "gateway-v4", "gateway-v4/app"],
+        "files": [
+            {"path": "gateway-v4/app/models.py"},
+            {"path": "gateway-v4/app/database.py"},
+        ],
+    }
+    orchestrator.repo_map_path.parent.mkdir(parents=True, exist_ok=True)
+    orchestrator.repo_map_path.write_text(json.dumps(repo_map), encoding="utf-8")
+    orchestrator._repo_map_cache = repo_map
+    calls: list[str] = []
+    orchestrator._run_agent = lambda agent, phase, index=None, total=None: calls.append(agent["name"]) or True
+
+    ok = orchestrator._run_phase_agents({"agents": [{"name": "developer"}]}, "implementation")
+
+    assert ok is False
+    assert calls == []
+    assert orchestrator._phase_failure_status == "task_dependencies_incomplete"
+
+
 def test_later_task_may_use_file_created_earlier(tmp_path: Path) -> None:
     engine_root = tmp_path / "engine"
     target_workspace = tmp_path / "target"
@@ -3117,6 +3367,7 @@ def test_retry_prompt_includes_previous_feedback_block(tmp_path: Path) -> None:
     assert "Do not repeat invalid allowed_paths." in prompt
     assert "Every backend task must include required_test_paths." in prompt
     assert "Every allowed_path must be explicitly declared in existing_paths, new_files, or new_directories." in prompt
+    assert "If a later task uses a file created by an earlier task, declare depends_on and place that reused file in existing_paths for the later task." in prompt
     assert "If adding gateway-v4/tests/__init__.py and it does not already exist, declare it in new_files and include it in allowed_paths." in prompt
     assert "Return only corrected YAML/JSON." in prompt
     assert orchestrator._planner_feedback_source.endswith("implementation-planner.md")
