@@ -29,6 +29,8 @@ PROJECT_CODEX_TEMPLATE = (
     "# Codex Project Context\n\n"
     "Add durable project notes here. This file is auto-loaded on every run across machines.\n"
 )
+PROJECT_CODEX_AUTO_START = "<!-- AUTO-GENERATED:RUN-CONTEXT START -->"
+PROJECT_CODEX_AUTO_END = "<!-- AUTO-GENERATED:RUN-CONTEXT END -->"
 
 
 class WorkflowOrchestrator:
@@ -173,19 +175,25 @@ class WorkflowOrchestrator:
             return False
         if not self._preflight_runtime("research"):
             return False
-        return self.run_phase("research")
+        ok = self.run_phase("research")
+        self._persist_project_codex_context()
+        return ok
 
     def run_implementation_phase(self) -> bool:
         if not self._ensure_user_goal("implementation"):
             return False
         if not self._preflight_runtime("implementation"):
             return False
-        return self.run_phase("implementation")
+        ok = self.run_phase("implementation")
+        self._persist_project_codex_context()
+        return ok
 
     def run_deployment_phase(self) -> bool:
         if not self._preflight_runtime("deployment"):
             return False
-        return self.run_phase("deployment")
+        ok = self.run_phase("deployment")
+        self._persist_project_codex_context()
+        return ok
 
     def run_phase(self, phase_key: str) -> bool:
         if phase_key == "implementation":
@@ -6328,6 +6336,85 @@ class WorkflowOrchestrator:
         if len(summary) <= limit:
             return summary
         return summary[:limit].rstrip()
+
+    def _persist_project_codex_context(self) -> None:
+        try:
+            auto_block = self._build_project_codex_auto_block()
+            existing = (
+                self.project_codex_context_path.read_text(encoding="utf-8")
+                if self.project_codex_context_path.exists()
+                else PROJECT_CODEX_TEMPLATE
+            )
+            start = existing.find(PROJECT_CODEX_AUTO_START)
+            end = existing.find(PROJECT_CODEX_AUTO_END)
+            if start != -1 and end != -1 and end > start:
+                updated = (
+                    existing[:start].rstrip()
+                    + "\n\n"
+                    + auto_block
+                    + "\n"
+                    + existing[end + len(PROJECT_CODEX_AUTO_END):].lstrip()
+                ).rstrip() + "\n"
+            else:
+                updated = existing.rstrip() + "\n\n" + auto_block + "\n"
+            self.project_codex_context_path.write_text(updated, encoding="utf-8")
+            self.project_codex_context = self._load_project_codex_context()
+        except Exception as exc:
+            self.logger.warning(f"Unable to persist project Codex context automatically: {exc}")
+
+    def _build_project_codex_auto_block(self) -> str:
+        reports = self.logger._load_agent_reports()
+        run_summary_path = self.logger.save_run_summary()
+        run_summary = json.loads(run_summary_path.read_text(encoding="utf-8")) if run_summary_path.exists() else {}
+        phase_names = sorted({str(report.get("phase") or "").strip() for report in reports if str(report.get("phase") or "").strip()})
+        lines = [
+            PROJECT_CODEX_AUTO_START,
+            "## Auto-updated Run Context",
+            "",
+            f"- updated_at: {datetime.now().isoformat(timespec='seconds')}",
+            f"- last_run_id: {self.logger.run_dir.name}",
+            f"- phases_touched: {', '.join(phase_names) if phase_names else 'none'}",
+            f"- completed_agents: {run_summary.get('completed_agents', 0)}",
+            f"- failed_agents: {run_summary.get('failed_agents', 0)}",
+            f"- total_tokens: {run_summary.get('total_tokens', 0)}",
+            f"- estimated_cost_usd: {run_summary.get('estimated_cost_usd', 0.0)}",
+        ]
+        if self.saved_user_goal:
+            lines.extend(["", "### Saved User Goal", "", self.saved_user_goal])
+        completed_tasks = self._completed_implementation_task_ids()
+        if completed_tasks:
+            lines.extend(["", "### Completed Implementation Tasks", ""])
+            lines.extend(f"- {task_id}" for task_id in completed_tasks[:20])
+        research_summaries = self._load_research_handoff_summaries()
+        if research_summaries:
+            lines.extend(["", "### Latest Research Handoffs", ""])
+            for summary in research_summaries[:4]:
+                handoff_text = str(summary.get("handoff_summary") or "").strip()
+                sections = self._extract_handoff_sections(handoff_text)
+                finding = next(
+                    (
+                        item
+                        for item in (sections.get("findings") or [])
+                        if not str(item).strip().lower().startswith("agent:")
+                    ),
+                    "",
+                )
+                recommendation = next(iter(sections.get("recommended_next_tasks") or []), "")
+                compact = finding or recommendation or (handoff_text.splitlines()[0] if handoff_text else "")
+                compact = " ".join(str(compact).split())
+                if compact:
+                    lines.append(f"- {summary.get('agent_name')}: {compact[:240]}")
+        if self._selected_implementation_item:
+            selected_id = str(self._selected_implementation_item.get("id") or "").strip()
+            selected_scope = str(self._selected_implementation_item.get("scope") or "").strip()
+            if selected_id or selected_scope:
+                lines.extend(["", "### Current Selected Implementation Task", ""])
+                if selected_id:
+                    lines.append(f"- id: {selected_id}")
+                if selected_scope:
+                    lines.append(f"- scope: {' '.join(selected_scope.split())[:300]}")
+        lines.append(PROJECT_CODEX_AUTO_END)
+        return "\n".join(lines)
 
     def _set_user_goal(self, goal: str) -> None:
         normalized = str(goal or "").strip()

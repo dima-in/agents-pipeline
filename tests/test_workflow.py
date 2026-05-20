@@ -640,6 +640,71 @@ def test_project_codex_context_is_loaded_into_agent_context(tmp_path: Path) -> N
     assert "Current rollout owner: Dima." in context
 
 
+def test_persist_project_codex_context_preserves_manual_notes(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+        user_goal="Stabilize routing",
+    )
+    orchestrator.project_codex_context_path.write_text(
+        "# Codex Project Context\n\nManual note stays.\n",
+        encoding="utf-8",
+    )
+    orchestrator.project_codex_context = orchestrator._load_project_codex_context()
+    orchestrator.logger.save_agent_report(
+        "research",
+        "project-analyst",
+        {
+            "status": "success",
+            "result": "completed",
+            "elapsed_s": 1.0,
+            "parsed_output": "summary",
+            "handoff_summary": "agent: project-analyst\nfindings:\n- repo stable\nrisks:\n- none\ndecisions:\n- none\nrecommended_next_tasks:\n- inspect routing",
+            "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15, "estimated_cost_usd": 0.001},
+        },
+    )
+
+    orchestrator._persist_project_codex_context()
+    content = orchestrator.project_codex_context_path.read_text(encoding="utf-8")
+
+    assert "Manual note stays." in content
+    assert "<!-- AUTO-GENERATED:RUN-CONTEXT START -->" in content
+    assert "### Saved User Goal" in content
+    assert "Stabilize routing" in content
+    assert "project-analyst: repo stable" in content
+
+
+def test_run_research_phase_auto_updates_project_codex_context(tmp_path: Path, monkeypatch) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+        user_goal="Document current state",
+    )
+    monkeypatch.setattr(orchestrator, "_run_standard_phase", lambda _phase: True)
+
+    ok = orchestrator.run_research_phase()
+    content = orchestrator.project_codex_context_path.read_text(encoding="utf-8")
+
+    assert ok is True
+    assert "## Auto-updated Run Context" in content
+    assert "Document current state" in content
+    assert orchestrator.logger.run_dir.name in content
+
+
 def test_engine_config_still_loads_from_engine_root(tmp_path: Path) -> None:
     engine_root = tmp_path / "engine"
     target_workspace = tmp_path / "target"
