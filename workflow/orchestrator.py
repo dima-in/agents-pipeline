@@ -25,6 +25,11 @@ from tools.repo_map import compare_repo_maps, generate_repo_map, validate_agent_
 from workflow.logger import WorkflowLogger
 from workflow.runtime import has_provider_credentials, load_runtime_config, required_key_env, resolve_runner_path
 
+PROJECT_CODEX_TEMPLATE = (
+    "# Codex Project Context\n\n"
+    "Add durable project notes here. This file is auto-loaded on every run across machines.\n"
+)
+
 
 class WorkflowOrchestrator:
     def __init__(
@@ -58,7 +63,11 @@ class WorkflowOrchestrator:
         self.project_id = self._resolve_project_id(project_id)
         self.project_state_dir = self._ensure_project_state_dirs()
         self.project_settings_path = self.project_state_dir / "settings.yaml"
+        self.project_local_settings_path = self.project_state_dir / "local.yaml"
+        self.project_codex_context_path = self.project_state_dir / "codex.md"
         self.project_settings = self._load_project_settings()
+        self.project_local_settings = self._load_project_local_settings()
+        self.project_codex_context = self._load_project_codex_context()
         self.repo_map_path = self.project_state_dir / "context" / "repo_map.json"
         self.repository_context_root = self.engine_root if self.context_mode == "engine_self_analysis" else self.target_workspace
         self.retrieval_root = self.target_workspace
@@ -1578,6 +1587,7 @@ class WorkflowOrchestrator:
         if profile == "repo_overview_full":
             sections = [
                 ("User goal", user_goal_summary),
+                ("Shared Codex project context", self._build_project_codex_context_summary(limit=1600)),
                 ("Git status --short", self._run_local_capture(["git", "status", "--short"], cwd=self.target_workspace)),
                 ("Git log --oneline -5", self._run_local_capture(["git", "log", "--oneline", "-5"], cwd=self.target_workspace)),
                 ("README.md", self._read_file_excerpt(self.target_workspace / "README.md", 2000)),
@@ -1591,6 +1601,7 @@ class WorkflowOrchestrator:
         elif profile == "external_comparison":
             sections = [
                 ("User goal", user_goal_summary),
+                ("Shared Codex project context", self._build_project_codex_context_summary(limit=1200)),
                 ("Compressed project-analyst summary", self._build_fallback_project_summary()),
                 ("README.md", self._read_file_excerpt(self.target_workspace / "README.md", 1400)),
                 ("Compact architecture summary", self._build_compact_architecture_summary()),
@@ -1600,6 +1611,7 @@ class WorkflowOrchestrator:
         elif profile == "market_positioning":
             sections = [
                 ("User goal", user_goal_summary),
+                ("Shared Codex project context", self._build_project_codex_context_summary(limit=1000)),
                 ("Positioning", self._build_positioning_summary()),
                 ("Workflow goals", self._build_workflow_goals_summary()),
                 ("Target users and use cases", self._build_target_users_summary()),
@@ -1607,6 +1619,7 @@ class WorkflowOrchestrator:
         elif profile == "technical_architecture":
             sections = [
                 ("User goal", user_goal_summary),
+                ("Shared Codex project context", self._build_project_codex_context_summary(limit=1200)),
                 ("Execution architecture", self._build_execution_architecture_summary()),
                 (
                     "direct_api implementation",
@@ -1638,6 +1651,7 @@ class WorkflowOrchestrator:
         elif profile == "external_innovation":
             sections = [
                 ("User goal", user_goal_summary),
+                ("Shared Codex project context", self._build_project_codex_context_summary(limit=1000)),
                 ("Compressed project summary", self._build_fallback_project_summary()),
                 ("Compact architecture summary", self._build_compact_architecture_summary()),
                 ("Known constraints and problems", self._build_known_constraints_summary()),
@@ -1650,6 +1664,7 @@ class WorkflowOrchestrator:
         else:
             sections = [
                 ("User goal", user_goal_summary),
+                ("Shared Codex project context", self._build_project_codex_context_summary(limit=1000)),
                 ("README.md", self._read_file_excerpt(self.target_workspace / "README.md", 1500)),
             ]
 
@@ -1680,6 +1695,7 @@ class WorkflowOrchestrator:
         if profile == "repo_overview_full":
             sections = [
                 ("User goal", user_goal_summary),
+                ("Shared Codex project context", self._build_project_codex_context_summary(limit=1600)),
                 ("Target workspace", str(self.target_workspace)),
                 ("Target git remote", self.git_remote or "unavailable"),
                 ("Git status --short", self._run_local_capture(["git", "status", "--short"], cwd=self.target_workspace)),
@@ -1691,6 +1707,7 @@ class WorkflowOrchestrator:
         elif profile == "external_comparison":
             sections = [
                 ("User goal", user_goal_summary),
+                ("Shared Codex project context", self._build_project_codex_context_summary(limit=1200)),
                 ("Compressed target project summary", self._build_fallback_project_summary()),
                 ("Target README excerpt", self._read_target_repo_file("README.md", 1600)),
                 ("Target product and architecture summary", self._build_target_product_architecture_summary()),
@@ -1700,6 +1717,7 @@ class WorkflowOrchestrator:
         elif profile == "market_positioning":
             sections = [
                 ("User goal", user_goal_summary),
+                ("Shared Codex project context", self._build_project_codex_context_summary(limit=1000)),
                 ("Target project summary", self._build_fallback_project_summary()),
                 ("Target product positioning", self._build_target_positioning_summary()),
                 ("Target workflow and business goals", self._build_target_goals_summary()),
@@ -1708,6 +1726,7 @@ class WorkflowOrchestrator:
         elif profile == "technical_architecture":
             sections = [
                 ("User goal", user_goal_summary),
+                ("Shared Codex project context", self._build_project_codex_context_summary(limit=1200)),
                 ("Target backend/frontend structure", self._build_target_backend_frontend_summary()),
                 ("Target dependency and config files", self._build_target_dependency_context(limit=4200)),
                 ("Target docker and deployment files", self._build_target_deployment_context(limit=2400)),
@@ -1717,6 +1736,7 @@ class WorkflowOrchestrator:
         elif profile == "external_innovation":
             sections = [
                 ("User goal", user_goal_summary),
+                ("Shared Codex project context", self._build_project_codex_context_summary(limit=1000)),
                 ("Target project summary", self._build_fallback_project_summary()),
                 ("Target constraints and problems", self._build_target_constraints_summary()),
                 ("External inspiration focus", "Look for product, UX, workflow, and automation ideas relevant to this target repository."),
@@ -1725,12 +1745,14 @@ class WorkflowOrchestrator:
         elif profile == "research_synthesis":
             sections = [
                 ("User goal", user_goal_summary),
+                ("Shared Codex project context", self._build_project_codex_context_summary(limit=1200)),
                 ("Target docs excerpts", self._build_target_docs_excerpts(limit=2200)),
                 ("Target dependency and config files", self._build_target_dependency_context(limit=2200)),
             ]
         else:
             sections = [
                 ("User goal", user_goal_summary),
+                ("Shared Codex project context", self._build_project_codex_context_summary(limit=1000)),
                 ("Target README excerpt", self._read_target_repo_file("README.md", 1500)),
             ]
 
@@ -3621,6 +3643,7 @@ class WorkflowOrchestrator:
         if agent_name == "implementation-planner":
             sections = [
                 ("User goal", self._build_user_goal_summary()),
+                ("Shared Codex project context", self._build_project_codex_context_summary(limit=1200)),
                 ("Selected implementation scope", selected_scope),
                 ("Repo map summary", self._build_repo_map_summary(repo_map=repo_map, agent_name=agent_name, limit=1600)),
                 ("Target README and docs", self._build_target_docs_excerpts(limit=900)),
@@ -3630,6 +3653,7 @@ class WorkflowOrchestrator:
         else:
             sections = [
                 ("User goal", self._build_user_goal_summary()),
+                ("Shared Codex project context", self._build_project_codex_context_summary(limit=1600)),
                 ("Selected implementation scope", selected_scope),
                 ("Repo map summary", self._build_repo_map_summary(repo_map=repo_map, agent_name=agent_name, limit=2600)),
                 ("Target README and docs", self._build_target_docs_excerpts(limit=2000)),
@@ -6239,19 +6263,36 @@ class WorkflowOrchestrator:
         for name in ("context", "memory", "logs", "summaries"):
             (base / name).mkdir(parents=True, exist_ok=True)
         settings_path = base / "settings.yaml"
+        local_settings_path = base / "local.yaml"
+        codex_context_path = base / "codex.md"
         settings_payload: dict[str, Any] = {}
+        local_settings_payload: dict[str, Any] = {}
         if settings_path.exists():
             settings_payload = yaml.safe_load(settings_path.read_text(encoding="utf-8")) or {}
-        settings_payload.update(
+        if local_settings_path.exists():
+            local_settings_payload = yaml.safe_load(local_settings_path.read_text(encoding="utf-8")) or {}
+        settings_payload.pop("target_workspace", None)
+        settings_payload.pop("engine_root", None)
+        shared_payload = dict(settings_payload)
+        shared_payload.update(
             {
                 "project_id": self.project_id,
                 "git_remote": self.git_remote,
-                "target_workspace": str(self.target_workspace),
-                "engine_root": str(self.engine_root),
-                "completed_implementation_tasks": settings_payload.get("completed_implementation_tasks", []),
+                "completed_implementation_tasks": shared_payload.get("completed_implementation_tasks", []),
             }
         )
-        settings_path.write_text(yaml.safe_dump(settings_payload, sort_keys=False), encoding="utf-8")
+        local_payload = dict(local_settings_payload)
+        local_payload.update(
+            {
+                "project_id": self.project_id,
+                "target_workspace": str(self.target_workspace),
+                "engine_root": str(self.engine_root),
+            }
+        )
+        settings_path.write_text(yaml.safe_dump(shared_payload, sort_keys=False), encoding="utf-8")
+        local_settings_path.write_text(yaml.safe_dump(local_payload, sort_keys=False), encoding="utf-8")
+        if not codex_context_path.exists():
+            codex_context_path.write_text(PROJECT_CODEX_TEMPLATE, encoding="utf-8")
         return base
 
     def _load_project_settings(self) -> dict[str, Any]:
@@ -6259,8 +6300,34 @@ class WorkflowOrchestrator:
             return {}
         return yaml.safe_load(self.project_settings_path.read_text(encoding="utf-8")) or {}
 
+    def _load_project_local_settings(self) -> dict[str, Any]:
+        if not self.project_local_settings_path.exists():
+            return {}
+        return yaml.safe_load(self.project_local_settings_path.read_text(encoding="utf-8")) or {}
+
+    def _load_project_codex_context(self) -> str:
+        if not self.project_codex_context_path.exists():
+            return ""
+        content = self.project_codex_context_path.read_text(encoding="utf-8").strip()
+        if not content or content == PROJECT_CODEX_TEMPLATE.strip():
+            return ""
+        return content
+
     def _save_project_settings(self) -> None:
         self.project_settings_path.write_text(yaml.safe_dump(self.project_settings, sort_keys=False), encoding="utf-8")
+
+    def _build_project_codex_context_summary(self, limit: int = 2400) -> str:
+        context = str(self.project_codex_context or "").strip()
+        if not context:
+            return ""
+        summary = (
+            "Shared Codex project context synced via git. "
+            "Treat it as durable project memory that applies across machines.\n"
+            f"{context}"
+        )
+        if len(summary) <= limit:
+            return summary
+        return summary[:limit].rstrip()
 
     def _set_user_goal(self, goal: str) -> None:
         normalized = str(goal or "").strip()
@@ -6310,6 +6377,9 @@ class WorkflowOrchestrator:
         self.logger.info(f"Startup diagnostic: target_workspace={self.target_workspace}")
         self.logger.info(f"Startup diagnostic: project_id={self.project_id}")
         self.logger.info(f"Startup diagnostic: git_remote={self.git_remote or 'unavailable'}")
+        self.logger.info(f"Startup diagnostic: project_settings_path={self.project_settings_path}")
+        self.logger.info(f"Startup diagnostic: project_local_settings_path={self.project_local_settings_path}")
+        self.logger.info(f"Startup diagnostic: project_codex_context_path={self.project_codex_context_path}")
         self.logger.info(f"Startup diagnostic: context_mode={self.context_mode}")
         self.logger.info(f"Startup diagnostic: repository_context_root={self.repository_context_root}")
         self.logger.info(f"Startup diagnostic: retrieval_root={self.retrieval_root}")

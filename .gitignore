@@ -14,3 +14,8 @@ Thumbs.db
 .openclaw/logs/
 .openclaw/feedback/
 .agents-pipeline/projects/*/context/*.json
+.agents-pipeline/projects/*/local.yaml
+.agents-pipeline/projects/*/logs/
+.agents-pipeline/projects/*/memory/
+.agents-pipeline/projects/*/summaries/
+.agents-pipeline/projects/workspace/

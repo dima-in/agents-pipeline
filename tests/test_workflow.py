@@ -562,6 +562,82 @@ def test_project_state_dirs_are_created_under_engine_root(tmp_path: Path) -> Non
     assert (base / "logs").exists()
     assert (base / "summaries").exists()
     assert (base / "settings.yaml").exists()
+    assert (base / "local.yaml").exists()
+    assert (base / "codex.md").exists()
+
+    shared_settings = yaml.safe_load((base / "settings.yaml").read_text(encoding="utf-8")) or {}
+    local_settings = yaml.safe_load((base / "local.yaml").read_text(encoding="utf-8")) or {}
+    assert shared_settings["project_id"] == orchestrator.project_id
+    assert shared_settings["git_remote"] == ""
+    assert "target_workspace" not in shared_settings
+    assert "engine_root" not in shared_settings
+    assert local_settings["target_workspace"] == str(target_workspace.resolve())
+    assert local_settings["engine_root"] == str(engine_root.resolve())
+
+
+def test_legacy_project_settings_migrate_machine_paths_to_local_yaml(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    project_dir = engine_root / ".agents-pipeline" / "projects" / "target"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    (project_dir / "settings.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "project_id": "target",
+                "git_remote": "",
+                "target_workspace": "D:\\OldTarget",
+                "engine_root": "D:\\OldEngine",
+                "user_goal": "Keep the saved goal",
+                "completed_implementation_tasks": ["TASK-1"],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+
+    shared_settings = yaml.safe_load(orchestrator.project_settings_path.read_text(encoding="utf-8")) or {}
+    local_settings = yaml.safe_load(orchestrator.project_local_settings_path.read_text(encoding="utf-8")) or {}
+    assert shared_settings["user_goal"] == "Keep the saved goal"
+    assert shared_settings["completed_implementation_tasks"] == ["TASK-1"]
+    assert "target_workspace" not in shared_settings
+    assert "engine_root" not in shared_settings
+    assert local_settings["target_workspace"] == str(target_workspace.resolve())
+    assert local_settings["engine_root"] == str(engine_root.resolve())
+
+
+def test_project_codex_context_is_loaded_into_agent_context(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    (target_workspace / "README.md").write_text("target readme", encoding="utf-8")
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    orchestrator.project_codex_context_path.write_text(
+        "# Codex Project Context\n\nUse feature flags before touching billing.\nCurrent rollout owner: Dima.\n",
+        encoding="utf-8",
+    )
+    orchestrator.project_codex_context = orchestrator._load_project_codex_context()
+
+    context = orchestrator._build_external_project_repository_context("project-analyst", limit=4000)
+
+    assert "Shared Codex project context" in context
+    assert "Use feature flags before touching billing." in context
+    assert "Current rollout owner: Dima." in context
 
 
 def test_engine_config_still_loads_from_engine_root(tmp_path: Path) -> None:
