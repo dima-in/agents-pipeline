@@ -1056,6 +1056,45 @@ def test_scope_watchdog_allows_monitoring_and_routing_backend_files(tmp_path: Pa
     assert sorted(diagnostics["allowed_paths_matched"]) == sorted(paths)
 
 
+def test_scope_watchdog_uses_untracked_files_not_parent_directory(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    repo = git.Repo.init(target_workspace)
+    with repo.config_writer() as writer:
+        writer.set_value("user", "name", "Test")
+        writer.set_value("user", "email", "test@example.com")
+    tracked = "gateway-v4/app/models.py"
+    tracked_path = target_workspace / tracked
+    tracked_path.parent.mkdir(parents=True, exist_ok=True)
+    tracked_path.write_text("pass\n", encoding="utf-8")
+    repo.index.add([tracked])
+    repo.index.commit("init")
+    untracked_test = "gateway-v4/tests/test_provider_metrics_migration.py"
+    untracked_path = target_workspace / untracked_test
+    untracked_path.parent.mkdir(parents=True, exist_ok=True)
+    untracked_path.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    orchestrator._selected_implementation_item = {
+        "allowed_paths": [tracked, untracked_test],
+        "forbidden_paths": [],
+    }
+
+    diagnostics = orchestrator._collect_scope_watchdog_diff_diagnostics()
+
+    assert diagnostics["allowed"] is True
+    assert "gateway-v4/tests" not in diagnostics["changed_files"]
+    assert untracked_test in diagnostics["changed_files"]
+    assert untracked_test in diagnostics["allowed_paths_matched"]
+
+
 def test_allow_scope_expansion_bypasses_watchdog_with_warning(tmp_path: Path, monkeypatch) -> None:
     engine_root = tmp_path / "engine"
     target_workspace = tmp_path / "target"
@@ -3061,6 +3100,163 @@ def test_from_agent_developer_reuses_planner_and_selected_task(tmp_path: Path, m
     assert orchestrator.selected_task_ref == "planner-task"
 
 
+def test_from_agent_developer_reselects_task_when_reused_selection_has_incomplete_dependencies(
+    tmp_path: Path, monkeypatch
+) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (target_workspace / "gateway-v4" / "app").mkdir(parents=True, exist_ok=True)
+    (target_workspace / "gateway-v4" / "app" / "models.py").write_text("pass\n", encoding="utf-8")
+    (target_workspace / "gateway-v4" / "app" / "database.py").write_text("pass\n", encoding="utf-8")
+    (target_workspace / "gateway-v4" / "tests").mkdir(parents=True, exist_ok=True)
+    (target_workspace / "gateway-v4" / "tests" / "__init__.py").write_text("", encoding="utf-8")
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+        from_agent="developer",
+    )
+    orchestrator.config["workflow"]["mode"] = "interactive"
+    orchestrator.config["phases"]["implementation"] = {
+        "name": "Implementation",
+        "max_retries": 1,
+        "agents": [
+            {"name": "architect"},
+            {"name": "implementation-planner"},
+            {"name": "task-designer"},
+            {"name": "developer"},
+        ],
+    }
+    _seed_research_run(
+        orchestrator.logger.log_dir,
+        "20260101_130000",
+        [{"agent_name": "product-manager", "handoff_summary": "agent: product-manager\nfindings:\n- summary\nrisks:\n- none\ndecisions:\n- none\nrecommended_next_tasks:\n- none"}],
+    )
+    previous_run = orchestrator.logger.log_dir / "run_20260101_130100" / "agents" / "implementation"
+    previous_run.mkdir(parents=True, exist_ok=True)
+    (previous_run / "architect.json").write_text(json.dumps({"status": "success", "parsed_output": "Architect output", "result": "completed"}), encoding="utf-8")
+    planner_backlog = [
+        {
+            "id": "TASK-001",
+            "title": "Create tests package",
+            "priority": "P0",
+            "scope": "backend-only",
+            "existing_paths": [],
+            "new_directories": ["gateway-v4/tests"],
+            "new_files": ["gateway-v4/tests/__init__.py"],
+            "allowed_paths": ["gateway-v4/tests/__init__.py"],
+            "forbidden_paths": [],
+            "required_test_paths": ["gateway-v4/tests/__init__.py"],
+            "depends_on": [],
+            "acceptance_criteria": ["done"],
+            "reason_each_path_is_needed": {"gateway-v4/tests/__init__.py": "Package marker."},
+            "target_file": {"path": "gateway-v4/tests/__init__.py", "action": "create", "purpose": "Create test package marker."},
+            "reference_files": [],
+            "risk_level": "low",
+            "estimated_effort": "S",
+        },
+        {
+            "id": "TASK-002",
+            "title": "Add provider metrics model",
+            "priority": "P0",
+            "scope": "backend-only",
+            "existing_paths": ["gateway-v4/app/models.py", "gateway-v4/app/database.py", "gateway-v4/tests/__init__.py"],
+            "new_directories": [],
+            "new_files": ["gateway-v4/tests/test_provider_metrics_model.py"],
+            "allowed_paths": [
+                "gateway-v4/app/models.py",
+                "gateway-v4/app/database.py",
+                "gateway-v4/tests/__init__.py",
+                "gateway-v4/tests/test_provider_metrics_model.py",
+            ],
+            "forbidden_paths": [],
+            "required_test_paths": ["gateway-v4/tests/test_provider_metrics_model.py"],
+            "depends_on": ["TASK-001"],
+            "acceptance_criteria": ["done"],
+            "reason_each_path_is_needed": {
+                "gateway-v4/app/models.py": "Update model file.",
+                "gateway-v4/app/database.py": "Reference base.",
+                "gateway-v4/tests/__init__.py": "Dependency artifact.",
+                "gateway-v4/tests/test_provider_metrics_model.py": "Test file.",
+            },
+            "target_file": {"path": "gateway-v4/app/models.py", "action": "update", "purpose": "Add model."},
+            "reference_files": ["gateway-v4/app/models.py", "gateway-v4/app/database.py"],
+            "risk_level": "low",
+            "estimated_effort": "S",
+        },
+    ]
+    (previous_run / "implementation-planner.json").write_text(
+        json.dumps({"status": "success", "parsed_output": json.dumps(planner_backlog), "result": "completed"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    selected_contract = dict(planner_backlog[1])
+    selected_contract["contract_source"] = "task-designer"
+    selected_contract["test_file"] = {"path": "gateway-v4/tests/test_provider_metrics_model.py", "action": "create"}
+    selected_contract["must_contain"] = ["class ProviderMetrics(Base):", "response_time = Column(Float, nullable=False)"]
+    selected_contract["must_import"] = ["from sqlalchemy import Column, Float", "from app.database import Base"]
+    selected_contract["integration"] = ["ProviderMetrics uses Base from app.database."]
+    selected_contract["reference_excerpts"] = {"gateway-v4/app/models.py": "pass", "gateway-v4/app/database.py": "pass"}
+    selected_contract["must_test"] = ["test_provider_metrics_creation: assert model instance is created"]
+    selected_contract["forbidden"] = ["Do not edit billing files."]
+    (previous_run / "task-designer.json").write_text(
+        json.dumps(
+            {
+                "status": "success",
+                "parsed_output": json.dumps(selected_contract),
+                "result": "completed",
+                "selected_task_id": "TASK-002",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    repo_map = {
+        "target_workspace": str(target_workspace),
+        "top_level_tree": ["gateway-v4/"],
+        "directories": ["", "gateway-v4", "gateway-v4/app", "gateway-v4/tests"],
+        "files": [
+            {"path": "gateway-v4/app/models.py"},
+            {"path": "gateway-v4/app/database.py"},
+            {"path": "gateway-v4/tests/__init__.py"},
+        ],
+    }
+    orchestrator.repo_map_path.parent.mkdir(parents=True, exist_ok=True)
+    orchestrator.repo_map_path.write_text(json.dumps(repo_map), encoding="utf-8")
+    orchestrator._repo_map_cache = repo_map
+    answers = iter(["2"])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
+    monkeypatch.setattr(orchestrator, "_wait_for_user", lambda _prompt: True)
+    monkeypatch.setattr(orchestrator, "_capture_repo_map_after_developer", lambda: None)
+    monkeypatch.setattr(orchestrator, "_enforce_implementation_scope_diff", lambda: True)
+    assert orchestrator._reuse_planner_output_for_current_run() is True
+    assert orchestrator._reuse_task_designer_output_for_current_run() is True
+    calls: list[str] = []
+    helper_calls: list[str] = []
+
+    def fake_run_agent(agent_config, phase_key, index=None, total=None):
+        calls.append(agent_config["name"])
+        return True
+
+    monkeypatch.setattr(orchestrator, "_run_agent", fake_run_agent)
+
+    def fake_run_task_designer_before_developer(phase, *, total):
+        helper_calls.append("task-designer")
+        selected_item = dict(orchestrator._selected_implementation_item or {})
+        selected_item["contract_source"] = "task-designer"
+        orchestrator._selected_implementation_item = selected_item
+        return True
+
+    monkeypatch.setattr(orchestrator, "_run_task_designer_before_developer", fake_run_task_designer_before_developer)
+    ok = orchestrator._run_phase_agents(orchestrator.config["phases"]["implementation"], "implementation")
+
+    assert ok is True
+    assert orchestrator._selected_implementation_item["id"] == "TASK-001"
+    assert helper_calls == ["task-designer"]
+    assert calls == ["developer"]
+
+
 def test_from_agent_implementation_planner_does_not_merge_delivery_branch(tmp_path: Path, monkeypatch) -> None:
     engine_root = tmp_path / "engine"
     target_workspace = tmp_path / "target"
@@ -4062,3 +4258,111 @@ def test_task_designer_contract_is_applied_to_selected_item(tmp_path: Path) -> N
     assert orchestrator._selected_implementation_item["contract_source"] == "task-designer"
     assert orchestrator._selected_implementation_item["target_file"]["path"] == "gateway-v4/app/services/monitoring.py"
     assert orchestrator._selected_implementation_item["test_file"]["path"] == "gateway-v4/tests/test_monitoring.py"
+
+
+def test_task_designer_contract_preserves_overlong_must_contain(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (target_workspace / "gateway-v4" / "app").mkdir(parents=True, exist_ok=True)
+    (target_workspace / "gateway-v4" / "app" / "database.py").write_text("pass\n", encoding="utf-8")
+    (target_workspace / "gateway-v4" / "app" / "models.py").write_text("pass\n", encoding="utf-8")
+    (target_workspace / "gateway-v4" / "alembic" / "versions").mkdir(parents=True, exist_ok=True)
+    (target_workspace / "gateway-v4" / "tests").mkdir(parents=True, exist_ok=True)
+    (target_workspace / "gateway-v4" / "tests" / "__init__.py").write_text("", encoding="utf-8")
+    (target_workspace / "gateway-v4" / "tests" / "test_provider_metrics_migration.py").write_text("pass\n", encoding="utf-8")
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    orchestrator._selected_implementation_item = {
+        "id": "TASK-001",
+        "title": "Add database migration for provider performance metrics",
+        "scope": "backend-only",
+        "existing_paths": ["gateway-v4/app/database.py", "gateway-v4/app/models.py"],
+        "new_directories": ["gateway-v4/tests"],
+        "new_files": [
+            "gateway-v4/alembic/versions/20240801_add_provider_metrics.py",
+            "gateway-v4/tests/__init__.py",
+            "gateway-v4/tests/test_provider_metrics_migration.py",
+        ],
+        "allowed_paths": [
+            "gateway-v4/app/database.py",
+            "gateway-v4/app/models.py",
+            "gateway-v4/alembic/versions/20240801_add_provider_metrics.py",
+            "gateway-v4/tests/__init__.py",
+            "gateway-v4/tests/test_provider_metrics_migration.py",
+        ],
+        "forbidden_paths": [],
+        "required_test_paths": ["gateway-v4/tests/test_provider_metrics_migration.py"],
+        "depends_on": [],
+        "acceptance_criteria": ["done"],
+        "reason_each_path_is_needed": {
+            "gateway-v4/app/database.py": "DB config",
+            "gateway-v4/app/models.py": "Model reference",
+            "gateway-v4/alembic/versions/20240801_add_provider_metrics.py": "Migration file",
+            "gateway-v4/tests/__init__.py": "Package marker",
+            "gateway-v4/tests/test_provider_metrics_migration.py": "Migration tests",
+        },
+        "_target_file_declared": True,
+        "_test_file_declared": True,
+        "_must_contain_declared": True,
+        "_must_test_declared": True,
+        "_depends_on_declared": True,
+        "target_file": {"path": "gateway-v4/alembic/versions/20240801_add_provider_metrics.py", "action": "create", "purpose": "Create migration."},
+        "must_contain": [],
+        "must_import": [],
+        "integration": [],
+        "reference_files": ["gateway-v4/app/database.py", "gateway-v4/app/models.py"],
+        "reference_excerpts": {},
+        "test_file": {"path": "gateway-v4/tests/test_provider_metrics_migration.py", "action": "create"},
+        "must_test": [],
+        "forbidden": [],
+        "contract_completeness": False,
+        "risk_level": "low",
+        "estimated_effort": "S",
+    }
+    repo_map = {
+        "target_workspace": str(target_workspace),
+        "top_level_tree": ["gateway-v4/"],
+        "directories": ["", "gateway-v4", "gateway-v4/app", "gateway-v4/alembic", "gateway-v4/alembic/versions", "gateway-v4/tests"],
+        "files": [
+            {"path": "gateway-v4/app/database.py"},
+            {"path": "gateway-v4/app/models.py"},
+            {"path": "gateway-v4/tests/__init__.py"},
+            {"path": "gateway-v4/tests/test_provider_metrics_migration.py"},
+        ],
+    }
+    orchestrator.repo_map_path.parent.mkdir(parents=True, exist_ok=True)
+    orchestrator.repo_map_path.write_text(json.dumps(repo_map), encoding="utf-8")
+    orchestrator._repo_map_cache = repo_map
+    report = {
+        "selected_task_contract": {
+            **orchestrator._selected_implementation_item,
+            "contract_source": "task-designer",
+            "must_contain": [
+                "def upgrade():",
+                "op.create_table(",
+                "sa.Column(",
+                "op.create_index(",
+                "def downgrade():",
+                "op.drop_table(",
+            ],
+            "must_import": ["from alembic import op", "import sqlalchemy as sa"],
+            "integration": ["Migration follows Alembic conventions."],
+            "must_test": [
+                "test_upgrade_creates_provider_metrics_table: assert table exists",
+                "test_downgrade_removes_provider_metrics_table: assert table removed",
+                "test_provider_metrics_indexes: assert indexes exist",
+            ],
+            "forbidden": ["Do not modify billing routes."],
+        }
+    }
+
+    ok = orchestrator._apply_task_designer_contract_from_report(report)
+
+    assert ok is True
+    assert orchestrator._selected_implementation_item["contract_source"] == "task-designer"
+    assert len(orchestrator._selected_implementation_item["must_contain"]) == 6

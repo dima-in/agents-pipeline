@@ -945,7 +945,7 @@ def test_implementation_planner_does_not_require_russian_translation() -> None:
         "implementation",
     )
 
-    assert "Return only structured YAML or JSON for the backlog outline." in bundle["system_message"]
+    assert "Верни только структурированный YAML или JSON для backlog outline." in bundle["system_message"]
     assert "Russian translation" not in bundle["system_message"]
 
 
@@ -1119,7 +1119,7 @@ def test_developer_write_tools_are_enabled_for_scoped_implementation(tmp_path: P
     assert '"tool":"write_file"' in bundle["system_message"]
     assert '"tool":"apply_patch"' in bundle["system_message"]
     assert "Developer must produce real file edits via write_file/apply_patch" in bundle["system_message"]
-    assert "Do not write narrative text, explanations, plans, or translations." in bundle["system_message"]
+    assert "Не пиши повествовательный текст, объяснения, планы или переводы." in bundle["system_message"]
     assert "`status=implemented`" in bundle["system_message"]
     assert "Russian translation" not in bundle["system_message"]
     assert "Do not implement marketplace." in bundle["system_message"]
@@ -1134,7 +1134,22 @@ def test_developer_write_tools_are_enabled_for_scoped_implementation(tmp_path: P
     assert "Selected task file excerpts" in bundle["system_message"]
     assert "## gateway-v4/app/services/monitoring.py" in bundle["system_message"]
     assert "## tests/test_monitoring.py" in bundle["system_message"]
-    assert "start with read_file/read_files for those exact paths instead of list_files" in bundle["system_message"]
+    assert 'Supported requests are: {"tool":"read_file","path":"relative/path.py"}, {"tool":"read_files","paths":["relative/path.py"]}.' in bundle["system_message"]
+    assert "Do not use search_text or list_files in developer implementation mode." in bundle["system_message"]
+
+
+def test_qa_bundle_blocks_search_and_list_retrieval() -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+    bundle = orchestrator._build_agent_message_bundle(
+        "qa",
+        {"name": "qa", "description": "Run checks and report regressions"},
+        Path(".openclaw/agents/implementation/qa/prompt.md"),
+        "implementation",
+    )
+
+    assert "Формат ответа обязателен. Пиши ответ полностью на русском языке." in bundle["system_message"]
+    assert "Do not use search_text or list_files in QA mode." in bundle["system_message"]
+    assert "Вердикт QA:" in bundle["system_message"]
 
 
 def test_developer_context_includes_reference_files_for_new_file_parent_directory(tmp_path: Path) -> None:
@@ -2108,6 +2123,29 @@ def test_direct_api_retrieval_parses_multiple_xml_read_file_tags() -> None:
     }
 
 
+def test_direct_api_retrieval_parses_xml_read_files_block() -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+
+    payload = orchestrator._parse_direct_api_retrieval_request(
+        "<read_files>\n"
+        "<paths>\n"
+        "<path>gateway-v4/alembic/versions/20240801_add_provider_metrics.py</path>\n"
+        "<path>gateway-v4/tests/__init__.py</path>\n"
+        "<path>gateway-v4/tests/test_provider_metrics_migration.py</path>\n"
+        "</paths>\n"
+        "</read_files>"
+    )
+
+    assert payload == {
+        "tool": "read_files",
+        "paths": [
+            "gateway-v4/alembic/versions/20240801_add_provider_metrics.py",
+            "gateway-v4/tests/__init__.py",
+            "gateway-v4/tests/test_provider_metrics_migration.py",
+        ],
+    }
+
+
 def test_direct_api_retrieval_parses_function_style_tool_calls() -> None:
     orchestrator = WorkflowOrchestrator("workflow/config.yaml")
 
@@ -2437,6 +2475,69 @@ def test_developer_prose_without_write_tools_becomes_no_changes(monkeypatch, tmp
     assert payload["status"] == "no_changes"
     assert payload["result"] == "Developer must use write_file/apply_patch or return status=no_changes: <reason>."
     assert payload["parsed_output"] == "status=no_changes: protocol_violation"
+
+
+def test_developer_status_implemented_without_write_triggers_repair(monkeypatch, tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir(parents=True)
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    target_file = target_workspace / "gateway-v4" / "app" / "services" / "monitoring.py"
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    target_file.write_text("initial\n", encoding="utf-8")
+    (target_workspace / "README.md").write_text("target readme", encoding="utf-8")
+    _ensure_temp_agent_prompt(engine_root, "implementation", "developer")
+
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    _seed_research_run(
+        orchestrator.logger.log_dir,
+        "20260101_120012",
+        [{"agent_name": "product-manager", "handoff_summary": "agent: product-manager\nfindings:\n- implement monitoring\nrisks:\n- none\ndecisions:\n- backend only\nrecommended_next_tasks:\n- edit monitoring file"}],
+    )
+
+    responses = [
+        {"choices": [{"message": {"content": "status=implemented"}}], "model": "anthropic/claude-sonnet-4.6", "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}},
+        {"choices": [{"message": {"content": '{"tool":"write_file","path":"gateway-v4/app/services/monitoring.py","content":"updated\\n"}'}}], "model": "anthropic/claude-sonnet-4.6", "usage": {"prompt_tokens": 12, "completion_tokens": 6, "total_tokens": 18}},
+    ]
+    calls: list[dict[str, object]] = []
+
+    def fake_urlopen(request, timeout=0):
+        calls.append(json.loads(request.data.decode("utf-8")))
+        return _FakeHTTPResponse(responses[len(calls) - 1])
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.setattr(orchestrator_module.urllib_request, "urlopen", fake_urlopen)
+
+    ok = orchestrator._run_agent(
+        {"name": "developer", "description": "Implement the task", "timeout": 5, "provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.6"},
+        "implementation",
+    )
+
+    assert ok is True
+    assert target_file.read_text(encoding="utf-8") == "updated\n"
+    payload = json.loads((orchestrator.logger.run_dir / "agents" / "implementation" / "developer.json").read_text(encoding="utf-8"))
+    assert payload["write_tools_used"] == ["write_file"]
+    assert payload["parsed_output"] == "status=implemented"
+    assert len(calls) == 2
 
 
 def test_developer_write_cannot_escape_target_workspace(tmp_path: Path) -> None:
@@ -2866,7 +2967,7 @@ def test_failed_agents_are_excluded_from_previous_context_and_phase_summary_json
         "market-analyst",
         {
             "status": "invalid_output",
-            "result": "missing russian translation section",
+            "result": "malformed structured output",
             "elapsed_s": 20,
             "returncode": 0,
             "message": "prompt",

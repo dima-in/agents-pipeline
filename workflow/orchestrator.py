@@ -349,10 +349,18 @@ class WorkflowOrchestrator:
                     return False
                 dependency_error = self._selected_task_dependency_error()
                 if dependency_error:
+                    if self._retry_selection_after_dependency_error():
+                        selection = self._prepare_implementation_backlog_selection(require_backlog=True)
+                        if selection["error"]:
+                            self.logger.error(selection["error"])
+                            had_failures = True
+                            return False
+                        dependency_error = self._selected_task_dependency_error()
                     self.logger.error(dependency_error)
-                    self._phase_failure_status = "task_dependencies_incomplete"
-                    had_failures = True
-                    return False
+                    if dependency_error:
+                        self._phase_failure_status = "task_dependencies_incomplete"
+                        had_failures = True
+                        return False
             if phase_key == "implementation" and agent["name"] == "developer":
                 selection = self._prepare_implementation_backlog_selection(require_backlog=True)
                 if selection["error"]:
@@ -361,16 +369,31 @@ class WorkflowOrchestrator:
                     return False
                 dependency_error = self._selected_task_dependency_error()
                 if dependency_error:
+                    if self._retry_selection_after_dependency_error():
+                        selection = self._prepare_implementation_backlog_selection(require_backlog=True)
+                        if selection["error"]:
+                            self.logger.error(selection["error"])
+                            had_failures = True
+                            return False
+                        dependency_error = self._selected_task_dependency_error()
                     self.logger.error(dependency_error)
-                    self._phase_failure_status = "task_dependencies_incomplete"
-                    had_failures = True
-                    return False
+                    if dependency_error:
+                        self._phase_failure_status = "task_dependencies_incomplete"
+                        had_failures = True
+                        return False
                 task_designer_required = any(str(candidate.get("name") or "") == "task-designer" for candidate in phase.get("agents", []))
                 if task_designer_required and str((self._selected_implementation_item or {}).get("contract_source") or "") != "task-designer":
-                    self.logger.error("Task designer output is missing. Run task-designer before developer.")
-                    self._phase_failure_status = "task_designer_invalid"
-                    had_failures = True
-                    return False
+                    if self.from_agent_name == "developer":
+                        if not self._run_task_designer_before_developer(phase, total=total):
+                            self.logger.error("Task designer output is missing. Run task-designer before developer.")
+                            self._phase_failure_status = "task_designer_invalid"
+                            had_failures = True
+                            return False
+                    else:
+                        self.logger.error("Task designer output is missing. Run task-designer before developer.")
+                        self._phase_failure_status = "task_designer_invalid"
+                        had_failures = True
+                        return False
                 if not self._enforce_implementation_scope_plan():
                     had_failures = True
                     return False
@@ -799,11 +822,7 @@ class WorkflowOrchestrator:
             for line in parsed_output.splitlines():
                 self.logger.agent_progress(agent_name, line)
 
-        require_translation = not (
-            phase == "implementation"
-            and agent_name in {"implementation-planner", "task-designer", "developer"}
-        )
-        failure_reason = self._detect_agent_failure(stdout, stderr, parsed_output, require_translation=require_translation)
+        failure_reason = self._detect_agent_failure(stdout, stderr, parsed_output, require_translation=False)
         if failure_reason:
             details = (
                 f"elapsed_s={elapsed:.2f}"
@@ -817,6 +836,15 @@ class WorkflowOrchestrator:
             failure_status = self._classify_failure_status(failure_reason)
             save_agent_report(failure_status, failure_reason, elapsed, stdout, stderr, parsed_output, " ".join(cmd), process.returncode)
             self.logger.agent_end(agent_name, failure_status, failure_reason)
+            return False
+        contract_failure = self._detect_agent_output_contract_failure(phase, agent_name, parsed_output)
+        if contract_failure:
+            self.logger.error(
+                f"РђРіРµРЅС‚ РІРµСЂРЅСѓР» РЅРµРєРѕСЂСЂРµРєС‚РЅС‹Р№ СЂРµР·СѓР»СЊС‚Р°С‚: {agent_name}",
+                f"elapsed_s={elapsed:.2f} | detected_failure={contract_failure} | stdout_tail={self._tail_text(stdout)}",
+            )
+            save_agent_report("invalid_output", contract_failure, elapsed, stdout, stderr, parsed_output, " ".join(cmd), process.returncode)
+            self.logger.agent_end(agent_name, "invalid_output", contract_failure)
             return False
 
         if process.returncode != 0:
@@ -1238,29 +1266,31 @@ class WorkflowOrchestrator:
     ) -> dict[str, Any]:
         prompt_text = prompt_file.read_text(encoding="utf-8").strip()
         task = str(agent_config.get("description", "") or "").strip()
-        translation_instruction = (
-            "Output format is mandatory. Write the full primary answer in English first. "
-            "Then add a second section titled exactly 'Russian translation' with a clear Russian translation "
-            "of the full answer. Keep both sections aligned in meaning. "
-            "Do not omit the Russian translation section. Do not end the answer before that section appears."
-        )
+        translation_instruction = "Формат ответа обязателен. Пиши ответ полностью на русском языке."
         if phase == "implementation" and agent_name == "developer":
             translation_instruction = (
-                "Output format is mandatory. Do not write narrative text, explanations, plans, or translations. "
-                "During the edit loop, respond only with one JSON tool request and no surrounding prose. "
-                "If you complete at least one file edit, the final non-JSON response must be exactly "
-                "`status=implemented`. If you cannot safely edit within scope, the final non-JSON response must be "
+                "Формат ответа обязателен. Не пиши повествовательный текст, объяснения, планы или переводы. "
+                "Во время edit loop отвечай только одним JSON tool request без окружающего текста. "
+                "Если выполнено хотя бы одно реальное изменение файла, финальный не-JSON ответ должен быть ровно "
+                "`status=implemented`. Если безопасно изменить ничего нельзя, финальный не-JSON ответ должен быть "
                 "`status=no_changes: <reason>`."
             )
         elif phase == "implementation" and agent_name == "implementation-planner":
             translation_instruction = (
-                "Output format is mandatory. Return only structured YAML or JSON for the backlog outline. "
-                "Do not add translations, explanations, markdown fences, or commentary."
+                "Формат ответа обязателен. Верни только структурированный YAML или JSON для backlog outline. "
+                "Не добавляй переводы, объяснения, markdown fences или комментарии."
             )
         elif phase == "implementation" and agent_name == "task-designer":
             translation_instruction = (
-                "Output format is mandatory. Return only structured YAML or JSON for the selected task contract. "
-                "Do not add translations, explanations, markdown fences, or commentary."
+                "Формат ответа обязателен. Верни только структурированный YAML или JSON для контракта выбранной задачи. "
+                "Не добавляй переводы, объяснения, markdown fences или комментарии."
+            )
+        if phase == "implementation" and agent_name == "qa":
+            translation_instruction = (
+                "Формат ответа обязателен. Пиши ответ полностью на русском языке. "
+                "Финальный ответ должен быть завершённым QA-отчётом, а не описанием процесса проверки. "
+                "Используй точные заголовки: `Вердикт QA:`, `Проверенные файлы:`, `Соответствие контракту:`, `Замечания:`, `Итог:`. "
+                "Не заканчивай ответ фразами вроде `проверяю`, `читаю`, `нужно убедиться`."
             )
         context_profile = "default"
         repository_context = ""
@@ -2162,13 +2192,19 @@ class WorkflowOrchestrator:
         )
         if phase == "implementation":
             if agent_name == "developer":
-                return base + (
+                developer_base = (
+                    "Supported requests are: "
+                    '{"tool":"read_file","path":"relative/path.py"}, '
+                    '{"tool":"read_files","paths":["relative/path.py"]}. '
+                    "Use relative workspace paths only. "
+                )
+                return developer_base + (
                     'You may also request write operations with '
                     '{"tool":"write_file","path":"gateway-v4/app/services/monitoring.py","content":"..."} '
                     'or {"tool":"apply_patch","path":"gateway-v4/app/services/proxy.py","search":"old","replace":"new"}. '
                     "Before writing, inspect the exact target files first. "
-                    "If the selected task contract already provides exact file paths, start with read_file/read_files for those exact paths instead of list_files. "
-                    "Use list_files only when the contract does not already provide the concrete file paths you need. "
+                    "Use only read_file/read_files for contract and reference paths during retrieval. "
+                    "Do not use search_text or list_files in developer implementation mode. "
                     "Make the smallest viable backend-only change. "
                     "Do not return narrative-only output when a safe edit is required. "
                     "Keep using JSON tool requests until you have either completed a real file edit or determined that no safe scoped edit is possible. "
@@ -2176,8 +2212,16 @@ class WorkflowOrchestrator:
                     "If you cannot safely edit within scope, your final non-JSON response must be status=no_changes: <reason>."
                 )
             if agent_name == "qa":
-                return base + (
-                    "Use retrieval for local inspection only; inspect the actual git diff before approving. "
+                qa_base = (
+                    "Supported requests are: "
+                    '{"tool":"read_file","path":"relative/path.py"}, '
+                    '{"tool":"read_files","paths":["relative/path.py"]}. '
+                    "Use relative workspace paths only. "
+                )
+                return qa_base + (
+                    "Use retrieval only for changed files, contract files, and exact reference paths already present in context. "
+                    "Do not use search_text or list_files in QA mode. "
+                    "Inspect the actual git diff before approving. "
                     "Test execution is handled outside this JSON retrieval loop. "
                     "When you have enough information, return the final answer normally instead of JSON."
                 )
@@ -2267,6 +2311,20 @@ class WorkflowOrchestrator:
                 }
             return {"tool": "tool_batch", "requests": json_sequence}
         if stripped:
+            block_read_files_match = re.search(
+                r"<read_files>\s*<paths>(?P<body>[\s\S]*?)</paths>\s*</read_files>",
+                stripped,
+                flags=re.IGNORECASE,
+            )
+            if block_read_files_match:
+                body = str(block_read_files_match.group("body") or "")
+                paths = [
+                    str(path).strip()
+                    for path in re.findall(r"<path>\s*([\s\S]*?)\s*</path>", body, flags=re.IGNORECASE)
+                    if str(path).strip()
+                ]
+                if paths:
+                    return {"tool": "read_files", "paths": paths}
             tag_matches = list(
                 re.finditer(
                     r"<(?P<tool>[a-z_][a-z0-9_-]*)\s+(?P<attrs>[^<>]*?)/>",
@@ -2538,6 +2596,15 @@ class WorkflowOrchestrator:
             f"Allowed paths: {allowed_paths}. Existing reference files: {existing_paths}. New files allowed: {new_files}."
         )
 
+    def _build_developer_protocol_repair_instruction(self) -> str:
+        return (
+            "You claimed status=implemented, but orchestration recorded no write_file/apply_patch. "
+            "Do not explain. On the next response do exactly one of the following: "
+            '1) emit one JSON write request using {"tool":"write_file", ...}, {"tool":"apply_patch", ...}, '
+            'or a tool_batch that actually includes a write_file/apply_patch; '
+            "or 2) return exactly status=no_changes: <concrete reason>."
+        )
+
     def _direct_api_read_files(self, paths: list[str], limit: int = 8000) -> str:
         chunks: list[str] = []
         total = 0
@@ -2760,7 +2827,12 @@ class WorkflowOrchestrator:
         ]
         max_turns = 1
         if message_bundle.get("retrieval_enabled"):
-            max_turns = 6 if phase == "implementation" and agent_name == "developer" else 3
+            if phase == "implementation" and agent_name == "developer":
+                max_turns = 6
+            elif phase == "implementation" and agent_name == "qa":
+                max_turns = 2
+            else:
+                max_turns = 3
 
         self.logger.agent_progress(agent_name, "Executor command:")
         self.logger.agent_progress(agent_name, command)
@@ -2828,6 +2900,12 @@ class WorkflowOrchestrator:
                     and str(retrieval_request.get("tool") or "") in {"search_text", "list_files"}
                 ):
                     blocked_retrieval_count += 1
+                if (
+                    phase == "implementation"
+                    and agent_name == "qa"
+                    and str(retrieval_request.get("tool") or "") in {"search_text", "list_files"}
+                ):
+                    blocked_retrieval_count += 1
                 messages.append({"role": "assistant", "content": output_text})
                 messages.append(
                     {
@@ -2866,6 +2944,22 @@ class WorkflowOrchestrator:
                                         "Разработчик превысил допустимую политику retrieval, не выполнив scoped-изменение файла. "
                                         "Используй только read_file/read_files для точных путей из контракта, затем запиши target/test файл или сообщи конкретную нехватку scope."
                                     )
+                                }
+                            }
+                        ],
+                        "model": normalized_model,
+                    }
+                    break
+                if (
+                    phase == "implementation"
+                    and agent_name == "qa"
+                    and (blocked_retrieval_count >= 1 or turn >= 2)
+                ):
+                    response_payload = {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": "Превышен лимит раундов retrieval."
                                 }
                             }
                         ],
@@ -2931,11 +3025,7 @@ class WorkflowOrchestrator:
             for line in parsed_output.splitlines():
                 self.logger.agent_progress(agent_name, line)
 
-        require_translation = not (
-            phase == "implementation"
-            and agent_name in {"implementation-planner", "task-designer", "developer"}
-        )
-        failure_reason = self._detect_agent_failure(stdout, "", parsed_output, require_translation=require_translation)
+        failure_reason = self._detect_agent_failure(stdout, "", parsed_output, require_translation=False)
         if failure_reason:
             failure_status = self._classify_failure_status(failure_reason)
             self.logger.error(
@@ -2945,12 +3035,66 @@ class WorkflowOrchestrator:
             save_agent_report(failure_status, failure_reason, elapsed, stdout, "", parsed_output, command, 0)
             self.logger.agent_end(agent_name, failure_status, failure_reason)
             return False
+        contract_failure = self._detect_agent_output_contract_failure(phase, agent_name, parsed_output)
+        if contract_failure:
+            self.logger.error(
+                f"Agent returned invalid direct_api output: {agent_name}",
+                f"elapsed_s={elapsed:.2f} | detected_failure={contract_failure} | stdout_tail={self._tail_text(stdout)}",
+            )
+            save_agent_report("invalid_output", contract_failure, elapsed, stdout, "", parsed_output, command, 0)
+            self.logger.agent_end(agent_name, "invalid_output", contract_failure)
+            return False
 
         if phase == "implementation" and agent_name == "developer":
             developer_extras = self._get_agent_report_extras("implementation", "developer")
             write_tools_used = developer_extras.get("write_tools_used", [])
             normalized_output = str(parsed_output or "").strip()
             normalized_output_lower = normalized_output.lower()
+            if not write_tools_used and normalized_output_lower.startswith("status=implemented"):
+                messages.append({"role": "assistant", "content": output_text})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": self._build_developer_protocol_repair_instruction(),
+                    }
+                )
+                repair_payload = {
+                    "model": normalized_model,
+                    "messages": messages,
+                    "temperature": 0.2,
+                }
+                repair_max_tokens = self._direct_api_max_tokens(phase, agent_name)
+                if repair_max_tokens is not None:
+                    repair_payload["max_tokens"] = repair_max_tokens
+                _status_code, repair_raw_body = self._perform_direct_api_request(repair_payload, api_key, timeout)
+                repair_response_payload = json.loads(repair_raw_body)
+                repair_output_text = self._extract_direct_api_text(repair_response_payload)
+                repair_request = self._parse_direct_api_retrieval_request(repair_output_text)
+                if repair_request:
+                    repair_result = self._execute_direct_api_retrieval_request(repair_request, phase=phase, agent_name=agent_name)
+                    self.logger.agent_progress(agent_name, "Direct API developer repair turn: " + str(repair_request.get("tool")))
+                    messages.append({"role": "assistant", "content": repair_output_text})
+                    messages.append({"role": "user", "content": "Local retrieval result:\n" + (repair_result or "No matching local results.")})
+                    developer_extras = self._get_agent_report_extras("implementation", "developer")
+                    write_tools_used = developer_extras.get("write_tools_used", [])
+                    if write_tools_used:
+                        parsed_output = "status=implemented"
+                        stdout_payload["output_text"] = parsed_output
+                        stdout = json.dumps(stdout_payload, ensure_ascii=False)
+                        normalized_output = parsed_output
+                        normalized_output_lower = parsed_output.lower()
+                    else:
+                        normalized_output = str(repair_output_text or "").strip()
+                        normalized_output_lower = normalized_output.lower()
+                        parsed_output = normalized_output or "status=no_changes: protocol_violation"
+                        stdout_payload["output_text"] = parsed_output
+                        stdout = json.dumps(stdout_payload, ensure_ascii=False)
+                else:
+                    parsed_output = str(repair_output_text or "").strip()
+                    stdout_payload["output_text"] = parsed_output
+                    stdout = json.dumps(stdout_payload, ensure_ascii=False)
+                    normalized_output = parsed_output
+                    normalized_output_lower = normalized_output.lower()
             if write_tools_used:
                 if not normalized_output_lower.startswith("status=implemented"):
                     parsed_output = "status=implemented"
@@ -3284,7 +3428,7 @@ class WorkflowOrchestrator:
 
     def _collect_scope_watchdog_diff_diagnostics(self) -> dict[str, Any]:
         name_only_output = self._run_local_capture(["git", "diff", "--name-only"], timeout=10, cwd=self.target_workspace)
-        status_output = self._run_local_capture(["git", "status", "--porcelain"], timeout=10, cwd=self.target_workspace)
+        status_output = self._run_local_capture(["git", "status", "--porcelain", "-uall"], timeout=10, cwd=self.target_workspace)
         git_error_markers = (
             "not a git repository",
             "fatal:",
@@ -3846,6 +3990,11 @@ class WorkflowOrchestrator:
             "backlog_source": backlog_source,
             "error": "",
         }
+
+    def _reset_selected_implementation_item(self) -> None:
+        self._selected_implementation_item = None
+        self._implementation_backlog_cache = []
+        self._implementation_backlog_source = ""
 
     def _build_implementation_backlog(
         self,
@@ -5150,16 +5299,12 @@ class WorkflowOrchestrator:
 
         if len(must_contain) < 2:
             errors.append(f"{task_id}:must_contain_too_short")
-        elif len(must_contain) > 5:
-            errors.append(f"{task_id}:must_contain_too_long")
         for value in must_contain:
             if self._is_vague_contract_item(value):
                 errors.append(f"{task_id}:vague_must_contain:{value[:80]}")
 
         if len(must_test) < 1:
             errors.append(f"{task_id}:must_test_empty")
-        elif len(must_test) > 3:
-            errors.append(f"{task_id}:must_test_too_long")
         for value in must_test:
             if self._is_vague_contract_item(value):
                 errors.append(f"{task_id}:vague_must_test:{value[:80]}")
@@ -5937,6 +6082,31 @@ class WorkflowOrchestrator:
             f"Selected task {task_id} has incomplete dependencies. "
             f"Resolve depends_on first: {'; '.join(unresolved)}"
         )
+
+    def _retry_selection_after_dependency_error(self) -> bool:
+        if self.config["workflow"]["mode"] == "auto":
+            return False
+        if self.from_agent_name not in {"task-designer", "developer", "qa", "template-validator"}:
+            return False
+        self.selected_task_ref = ""
+        self._reset_selected_implementation_item()
+        return True
+
+    def _run_task_designer_before_developer(self, phase: dict[str, Any], *, total: int) -> bool:
+        task_designer_config: dict[str, Any] | None = None
+        task_designer_index = 0
+        for idx, candidate in enumerate(phase.get("agents", []), start=1):
+            if str(candidate.get("name") or "") == "task-designer":
+                task_designer_config = candidate
+                task_designer_index = idx
+                break
+        if not task_designer_config:
+            return False
+        self.logger.info("Selected task requires a fresh task-designer contract. Running task-designer before developer.")
+        if not self._run_agent(task_designer_config, "implementation", index=task_designer_index, total=total):
+            return False
+        task_designer_report = self._load_saved_agent_report("implementation", "task-designer") or {}
+        return self._apply_task_designer_contract_from_report(task_designer_report)
 
     def _mark_implementation_task_completed(self) -> None:
         if not self._selected_implementation_item:
@@ -6777,6 +6947,8 @@ class WorkflowOrchestrator:
         combined = "\n".join(part for part in (stdout or "", stderr or "", parsed_output or "") if part).lower()
         if not combined:
             return ""
+        if "exceeded retrieval rounds" in combined or "превышен лимит раундов retrieval" in combined:
+            return "retrieval rounds exceeded"
         if "llm request timed out" in combined:
             return "llm request timeout"
         if "the model did not produce a response before the llm idle timeout" in combined:
@@ -6785,8 +6957,31 @@ class WorkflowOrchestrator:
             return "llm idle timeout"
         if "did not produce a response" in combined:
             return "llm produced no response"
-        if require_translation and parsed_output and "russian translation" not in parsed_output.lower():
-            return "missing russian translation section"
+        return ""
+
+    @staticmethod
+    def _detect_agent_output_contract_failure(phase: str, agent_name: str, parsed_output: str) -> str:
+        normalized = str(parsed_output or "").strip()
+        lowered = normalized.lower()
+        if phase == "implementation" and agent_name == "qa":
+            required_markers = [
+                "вердикт qa:",
+                "проверенные файлы:",
+                "соответствие контракту:",
+                "замечания:",
+                "итог:",
+            ]
+            if any(marker not in lowered for marker in required_markers):
+                return "qa incomplete final report"
+            unfinished_prefixes = (
+                "проверяю ",
+                "читаю ",
+                "нужно убедиться",
+                "необходимо убедиться",
+            )
+            last_line = normalized.splitlines()[-1].strip().lower() if normalized else ""
+            if any(last_line.startswith(prefix) for prefix in unfinished_prefixes):
+                return "qa incomplete final report"
         return ""
 
     @staticmethod

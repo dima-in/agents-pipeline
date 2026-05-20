@@ -15,13 +15,22 @@ def test_detect_agent_failure_recognizes_idle_timeout() -> None:
     assert reason == "llm idle timeout"
 
 
-def test_detect_agent_failure_requires_russian_translation_section() -> None:
+def test_detect_agent_failure_recognizes_retrieval_round_limit() -> None:
+    reason = WorkflowOrchestrator._detect_agent_failure(
+        "",
+        "",
+        "Превышен лимит раундов retrieval.",
+    )
+    assert reason == "retrieval rounds exceeded"
+
+
+def test_detect_agent_failure_does_not_require_russian_translation_section() -> None:
     reason = WorkflowOrchestrator._detect_agent_failure(
         "",
         "",
         "English section only without the required translated block.",
     )
-    assert reason == "missing russian translation section"
+    assert reason == ""
 
 
 def test_classify_failure_status_timeout() -> None:
@@ -30,8 +39,17 @@ def test_classify_failure_status_timeout() -> None:
 
 
 def test_classify_failure_status_invalid_output() -> None:
-    status = WorkflowOrchestrator._classify_failure_status("missing russian translation section")
+    status = WorkflowOrchestrator._classify_failure_status("malformed structured output")
     assert status == "invalid_output"
+
+
+def test_detect_agent_output_contract_failure_for_incomplete_qa_report() -> None:
+    reason = WorkflowOrchestrator._detect_agent_output_contract_failure(
+        "implementation",
+        "qa",
+        "Проверяю соответствие реализации контракту.\n\nЧитаю содержимое каждого файла.",
+    )
+    assert reason == "qa incomplete final report"
 
 
 def test_run_phase_agents_continues_after_failure_when_fail_fast_false(monkeypatch) -> None:

@@ -5,7 +5,7 @@ Implement only the selected task scope in the target workspace. Keep the diff fo
 Execution contract:
 - You must make real file edits when a safe scoped change is possible.
 - Do not answer with code blocks, pseudo-diffs, or narrative-only implementation summaries before making an edit.
-- Do not write narrative explanations, plans, summaries, or translations.
+- Do not write narrative explanations, plans, or summaries.
 - Follow the full developer contract from the selected task strictly.
 - Treat `target_file.path` as the primary implementation file and `test_file.path` as the required test file for this task.
 - Use `must_contain`, `must_import`, `integration`, `reference_files`, and `reference_excerpts` as binding implementation guidance.
