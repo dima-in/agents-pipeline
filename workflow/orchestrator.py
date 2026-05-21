@@ -2719,6 +2719,35 @@ class WorkflowOrchestrator:
             f"Remaining repair attempts after this message: {max(0, remaining_attempts)}."
         )
 
+    def _build_developer_exact_path_repair_instruction(self) -> str:
+        item = self._selected_implementation_item or {}
+        exact_paths: list[str] = []
+        for path in (item.get("allowed_paths") or []):
+            normalized = self._normalize_repo_relative_path(path)
+            if normalized:
+                exact_paths.append(normalized)
+        target_file = item.get("target_file") or {}
+        test_file = item.get("test_file") or {}
+        if isinstance(target_file, dict):
+            normalized = self._normalize_repo_relative_path(target_file.get("path"))
+            if normalized:
+                exact_paths.append(normalized)
+        if isinstance(test_file, dict):
+            normalized = self._normalize_repo_relative_path(test_file.get("path"))
+            if normalized:
+                exact_paths.append(normalized)
+        exact_paths = sorted(dict.fromkeys(exact_paths))
+        path_lines = "\n".join(f"- {path}" for path in exact_paths) or "- none"
+        return (
+            "Your previous retrieval request used a disallowed broad tool for developer implementation mode. "
+            "Do not use list_files or search_text again. "
+            "On the next response, do exactly one of the following: "
+            '1) emit a JSON read_file/read_files request using only these exact contract paths:\n'
+            f"{path_lines}\n"
+            '2) emit a JSON write_file/apply_patch request using only these exact contract paths; '
+            "or 3) return exactly status=no_changes: <concrete reason>."
+        )
+
     def _direct_api_read_files(self, paths: list[str], limit: int = 8000) -> str:
         chunks: list[str] = []
         total = 0
@@ -2998,6 +3027,7 @@ class WorkflowOrchestrator:
         response_payload: dict[str, Any] | None = None
         retrieval_rounds = 0
         blocked_retrieval_count = 0
+        developer_performed_write = False
         developer_base_retrieval_limit = 4
         if phase == "implementation" and agent_name == "developer":
             self._set_agent_report_extras(
@@ -3031,6 +3061,14 @@ class WorkflowOrchestrator:
                 if not retrieval_request:
                     break
                 retrieval_output = self._execute_direct_api_retrieval_request(retrieval_request, phase=phase, agent_name=agent_name)
+                if (
+                    phase == "implementation"
+                    and agent_name == "developer"
+                    and str(retrieval_request.get("tool") or "") in {"write_file", "apply_patch", "tool_batch"}
+                ):
+                    current_write_tools = self._get_agent_report_extras("implementation", "developer").get("write_tools_used") or []
+                    if current_write_tools or str(retrieval_output or "").startswith(("Wrote file:", "Patched file:")):
+                        developer_performed_write = True
                 retrieval_rounds = turn
                 message_bundle["retrieval_rounds"] = retrieval_rounds
                 self.logger.agent_progress(
@@ -3043,6 +3081,12 @@ class WorkflowOrchestrator:
                     and str(retrieval_request.get("tool") or "") in {"search_text", "list_files"}
                 ):
                     blocked_retrieval_count += 1
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": self._build_developer_exact_path_repair_instruction(),
+                        }
+                    )
                 if (
                     phase == "implementation"
                     and agent_name == "qa"
@@ -3091,6 +3135,8 @@ class WorkflowOrchestrator:
                     and not write_tools_used
                     and (blocked_retrieval_count >= 2 or turn >= developer_base_retrieval_limit)
                 ):
+                    if blocked_retrieval_count == 1 and turn < max_turns:
+                        continue
                     if failed_write_attempts > 0 and turn < max_turns:
                         continue
                     if failed_write_attempts > 0:
@@ -3233,7 +3279,7 @@ class WorkflowOrchestrator:
             write_tools_used = developer_extras.get("write_tools_used", [])
             normalized_output = str(parsed_output or "").strip()
             normalized_output_lower = normalized_output.lower()
-            if not write_tools_used and normalized_output_lower.startswith("status=implemented"):
+            if not write_tools_used and not developer_performed_write and normalized_output_lower.startswith("status=implemented"):
                 messages.append({"role": "assistant", "content": output_text})
                 messages.append(
                     {
@@ -3278,7 +3324,7 @@ class WorkflowOrchestrator:
                     stdout = json.dumps(stdout_payload, ensure_ascii=False)
                     normalized_output = parsed_output
                     normalized_output_lower = normalized_output.lower()
-            if write_tools_used:
+            if write_tools_used or developer_performed_write:
                 if not normalized_output_lower.startswith("status=implemented"):
                     parsed_output = "status=implemented"
                     stdout_payload["output_text"] = parsed_output
