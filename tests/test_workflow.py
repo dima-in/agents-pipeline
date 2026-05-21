@@ -1,4 +1,5 @@
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -3335,6 +3336,239 @@ def test_from_agent_developer_reuses_planner_and_selected_task(tmp_path: Path, m
     assert ok is True
     assert calls == ["developer", "qa", "template-validator"]
     assert orchestrator.selected_task_ref == "planner-task"
+
+
+def test_extract_qa_verdict_detects_pass_and_fail(tmp_path: Path) -> None:
+    config_path = tmp_path / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(tmp_path), launch_cwd=str(tmp_path))
+
+    assert orchestrator._extract_qa_verdict("Вердикт QA: НЕ ПРОЙДЕНО\n\nИтог: есть замечания") == "failed"
+    assert orchestrator._extract_qa_verdict("Вердикт QA: ПРОЙДЕНО\n\nИтог: ок") == "passed"
+    assert orchestrator._extract_qa_verdict("Итог: без вердикта") == ""
+
+
+def test_developer_bundle_includes_retry_feedback(tmp_path: Path, monkeypatch) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    engine_root.mkdir(parents=True, exist_ok=True)
+    target_workspace.mkdir(parents=True, exist_ok=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    prompt_file = engine_root / ".openclaw" / "agents" / "implementation" / "developer" / "prompt.md"
+    prompt_file.parent.mkdir(parents=True, exist_ok=True)
+    prompt_file.write_text("Developer prompt", encoding="utf-8")
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    orchestrator._implementation_retry_from_agent = "developer"
+    orchestrator._implementation_attempt = 2
+    feedback_file = orchestrator._save_feedback(1, "developer", "Implementation repair feedback\n\nQA findings to repair\n- fix migration")
+    orchestrator._developer_feedback_file = str(feedback_file)
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_build_implementation_phase_context",
+        lambda agent_name, limit=12000: {
+            "repository_context": "repo",
+            "previous_context": "prev",
+            "research_handoff_sources": [],
+            "selected_task_scope": "backend-only",
+            "selected_task_id": "TASK-001",
+            "selected_task_allowed_paths": ["workflow/orchestrator.py"],
+            "backlog_task_count": 1,
+            "implementation_planner_output_chars": 0,
+            "planner_model": "",
+            "planner_invalid_paths": [],
+            "planner_repair_attempted": False,
+            "validated_backlog_task_count": 1,
+            "planner_missing_directories": [],
+            "planner_missing_tests": [],
+            "planner_conflicting_forbidden_paths": [],
+            "generic_root_dirs_rejected": [],
+            "planner_dependency_graph": {},
+            "planner_future_known_paths": {},
+            "planner_dependency_validation_errors": [],
+            "planner_rejection_reason": "",
+            "planner_feedback_file": "",
+            "planner_feedback_source": "",
+            "planner_feedback_chars": 0,
+            "planner_parse_error": "",
+            "planner_schema_errors": [],
+            "planner_raw_output_excerpt": "",
+            "planner_extracted_payload_excerpt": "",
+            "planner_validation_stage": "",
+            "reused_architect_output": False,
+            "architect_output_source": "",
+            "planner_retry_count": 0,
+            "planner_retry_reason": "",
+            "repo_map_path": "",
+            "repo_map_file_count": 0,
+            "repo_map_directory_count": 0,
+            "backlog_source": "test",
+            "contract_completeness": True,
+            "contract_compliance": True,
+            "missing_must_contain": [],
+            "missing_test_file": False,
+            "context_chars": 8,
+        },
+    )
+
+    bundle = orchestrator._build_agent_message_bundle(
+        "developer",
+        {"name": "developer", "description": "Implement the task"},
+        prompt_file,
+        "implementation",
+    )
+
+    assert "Previous validation feedback to repair" in bundle["combined_message"]
+    assert "fix migration" in bundle["combined_message"]
+    assert bundle["developer_feedback_chars"] > 0
+    assert bundle["developer_feedback_source"].endswith("developer.md")
+
+
+def test_implementation_phase_retries_from_developer_after_qa_failed(tmp_path: Path, monkeypatch) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (target_workspace / "workflow").mkdir(parents=True, exist_ok=True)
+    (target_workspace / "workflow" / "orchestrator.py").write_text("pass\n", encoding="utf-8")
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    orchestrator.config["phases"]["implementation"] = {
+        "name": "Implementation",
+        "max_retries": 2,
+        "agents": [
+            {"name": "architect"},
+            {"name": "implementation-planner"},
+            {"name": "task-designer"},
+            {"name": "developer"},
+            {"name": "qa"},
+            {"name": "template-validator"},
+        ],
+    }
+    _seed_research_run(
+        orchestrator.logger.log_dir,
+        "20260101_120260",
+        [{"agent_name": "product-manager", "handoff_summary": "agent: product-manager\nfindings:\n- summary\nrisks:\n- none\ndecisions:\n- none\nrecommended_next_tasks:\n- none"}],
+    )
+
+    calls: list[tuple[int, str]] = []
+
+    monkeypatch.setattr(orchestrator, "_refresh_repo_map", lambda snapshot_path=None: True)
+    monkeypatch.setattr(orchestrator, "_load_repo_map", lambda: {"target_workspace": str(target_workspace), "files": [], "directories": []})
+    monkeypatch.setattr(orchestrator, "_wait_for_user", lambda _prompt: True)
+    monkeypatch.setattr(orchestrator, "_prepare_implementation_backlog_selection", lambda require_backlog=True: {"error": "", "backlog": [{"id": "TASK-001"}], "backlog_source": "test"})
+    monkeypatch.setattr(orchestrator, "_selected_task_dependency_error", lambda: "")
+    monkeypatch.setattr(orchestrator, "_enforce_implementation_scope_plan", lambda: True)
+    monkeypatch.setattr(orchestrator, "_enforce_implementation_scope_diff", lambda: True)
+    monkeypatch.setattr(orchestrator, "_capture_repo_map_after_developer", lambda: None)
+    monkeypatch.setattr(orchestrator, "_merge_git", lambda: True)
+    monkeypatch.setattr(orchestrator, "_prompt_post_implementation_action", lambda: "stop")
+    monkeypatch.setattr(orchestrator, "_validate_or_repair_implementation_planner", lambda *args, **kwargs: True)
+    monkeypatch.setattr(orchestrator, "_apply_task_designer_contract_from_report", lambda report: setattr(orchestrator, "_selected_implementation_item", {"id": "TASK-001", "contract_source": "task-designer"}) or True)
+
+    def fake_run_agent(agent_config, phase_key, index=None, total=None):
+        calls.append((orchestrator._implementation_attempt, agent_config["name"]))
+        name = agent_config["name"]
+        if orchestrator._implementation_attempt == 1 and name == "qa":
+            orchestrator._phase_failure_status = "qa_failed"
+            orchestrator.logger.save_agent_report(
+                "implementation",
+                "qa",
+                {
+                    "status": "qa_failed",
+                    "result": "qa reported regressions",
+                    "parsed_output": "Вердикт QA: НЕ ПРОЙДЕНО\n\nПроверенные файлы:\n- a\n\nСоответствие контракту:\n- нет\n\nЗамечания:\n- fix migration\n\nИтог:\n- переделать",
+                    "selected_task_id": "TASK-001",
+                },
+            )
+            return False
+        orchestrator.logger.save_agent_report(
+            "implementation",
+            name,
+            {
+                "status": "success",
+                "result": "completed",
+                "parsed_output": "done",
+                "selected_task_id": "TASK-001",
+            },
+        )
+        return True
+
+    monkeypatch.setattr(orchestrator, "_run_agent", fake_run_agent)
+
+    ok = orchestrator._run_implementation_phase()
+
+    assert ok is True
+    assert calls == [
+        (1, "architect"),
+        (1, "implementation-planner"),
+        (1, "task-designer"),
+        (1, "developer"),
+        (1, "qa"),
+        (1, "template-validator"),
+        (2, "developer"),
+        (2, "qa"),
+        (2, "template-validator"),
+    ]
+    assert orchestrator._developer_feedback_file.endswith("developer.md")
+
+
+def test_developer_deterministic_checks_fail_on_python_compile_error(tmp_path: Path, monkeypatch) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    bad_file = target_workspace / "gateway-v4" / "tests" / "test_bad.py"
+    bad_file.parent.mkdir(parents=True, exist_ok=True)
+    bad_file.write_text("def broken(:\n    pass\n", encoding="utf-8")
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    orchestrator.task_counter = 1
+    orchestrator._selected_implementation_item = {"id": "TASK-001", "test_file": {"path": "gateway-v4/tests/test_bad.py"}}
+    orchestrator.logger.save_agent_report(
+        "implementation",
+        "developer",
+        {
+            "status": "success",
+            "result": "completed",
+            "parsed_output": "status=implemented",
+            "developer_changed_files": ["gateway-v4/tests/test_bad.py"],
+            "selected_task_id": "TASK-001",
+        },
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_run_local_command",
+        lambda command, timeout=10, cwd=None: (1, "", "SyntaxError: invalid syntax")
+        if command[:3] == [sys.executable, "-m", "py_compile"]
+        else (0, "ok", ""),
+    )
+
+    ok = orchestrator._run_developer_deterministic_checks()
+
+    assert ok is False
+    assert orchestrator._phase_failure_status == "developer_checks_failed"
+    report = orchestrator._load_saved_agent_report("implementation", "developer-checks") or {}
+    assert report["status"] == "failed"
+    assert "py_compile failed" in report["parsed_output"]
+
+
+def test_validate_changed_migration_files_rejects_none_down_revision(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    versions_dir = target_workspace / "gateway-v4" / "alembic" / "versions"
+    versions_dir.mkdir(parents=True, exist_ok=True)
+    (versions_dir / "0005_personalization.py").write_text("revision = '0005'\ndown_revision = '0004'\n", encoding="utf-8")
+    (versions_dir / "20240801_add_provider_metrics.py").write_text(
+        "revision = '20240801_add_provider_metrics'\ndown_revision = None\n",
+        encoding="utf-8",
+    )
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+
+    issues = orchestrator._validate_changed_migration_files(["gateway-v4/alembic/versions/20240801_add_provider_metrics.py"])
+
+    assert issues == ["gateway-v4/alembic/versions/20240801_add_provider_metrics.py: down_revision must not be None"]
 
 
 def test_from_agent_developer_reselects_task_when_reused_selection_has_incomplete_dependencies(

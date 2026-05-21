@@ -2540,6 +2540,75 @@ def test_developer_status_implemented_without_write_triggers_repair(monkeypatch,
     assert len(calls) == 2
 
 
+def test_developer_failed_write_gets_repair_turn_with_validator_error(monkeypatch, tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    (engine_root / "workflow").mkdir(parents=True)
+    target_workspace.mkdir(parents=True)
+    (engine_root / "workflow" / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"executor": "direct_api", "mode": "auto", "require_registry_preflight": False, "require_model_list_preflight": False},
+                "project": {"name": "agents-pipeline", "workspace": ".", "default_branch": "main"},
+                "paths": {"agents_dir": ".openclaw/agents", "logs_dir": ".openclaw/logs", "feedback_dir": ".openclaw/feedback"},
+                "phases": {},
+                "runtime": {"provider": "openrouter", "model": "perplexity/sonar", "thinking": "low"},
+                "git": {"enabled": False, "branch_prefix": "feature/", "auto_rollback": True},
+                "logging": {"level": "INFO", "console": False, "file": False, "json": False},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    target_file = target_workspace / "gateway-v4" / "app" / "services" / "monitoring.py"
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    target_file.write_text("initial\n", encoding="utf-8")
+    (target_workspace / "README.md").write_text("target readme", encoding="utf-8")
+    _ensure_temp_agent_prompt(engine_root, "implementation", "developer")
+
+    orchestrator = WorkflowOrchestrator(
+        str(engine_root / "workflow" / "config.yaml"),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    _seed_research_run(
+        orchestrator.logger.log_dir,
+        "20260101_120013",
+        [{"agent_name": "product-manager", "handoff_summary": "agent: product-manager\nfindings:\n- implement monitoring\nrisks:\n- none\ndecisions:\n- backend only\nrecommended_next_tasks:\n- edit monitoring file"}],
+    )
+
+    responses = [
+        {"choices": [{"message": {"content": '{"tool":"read_file","path":"gateway-v4/app/services/monitoring.py"}'}}], "model": "anthropic/claude-sonnet-4.6"},
+        {"choices": [{"message": {"content": '{"tool":"read_file","path":"README.md"}'}}], "model": "anthropic/claude-sonnet-4.6"},
+        {"choices": [{"message": {"content": '{"tool":"read_files","paths":["gateway-v4/app/services/monitoring.py","README.md"]}'}}], "model": "anthropic/claude-sonnet-4.6"},
+        {"choices": [{"message": {"content": '{"tool":"write_file","path":"gateway-v4/app/services/not_allowed.py","content":"bad\\n"}'}}], "model": "anthropic/claude-sonnet-4.6"},
+        {"choices": [{"message": {"content": '{"tool":"write_file","path":"gateway-v4/app/services/monitoring.py","content":"updated\\n"}'}}], "model": "anthropic/claude-sonnet-4.6"},
+        {"choices": [{"message": {"content": "status=implemented"}}], "model": "anthropic/claude-sonnet-4.6", "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}},
+    ]
+    calls: list[dict[str, object]] = []
+
+    def fake_urlopen(request, timeout=0):
+        calls.append(json.loads(request.data.decode("utf-8")))
+        return _FakeHTTPResponse(responses[len(calls) - 1])
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.setattr(orchestrator_module.urllib_request, "urlopen", fake_urlopen)
+
+    ok = orchestrator._run_agent(
+        {"name": "developer", "description": "Implement the task", "timeout": 5, "provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.6"},
+        "implementation",
+    )
+
+    assert ok is True
+    assert target_file.read_text(encoding="utf-8") == "updated\n"
+    payload = json.loads((orchestrator.logger.run_dir / "agents" / "implementation" / "developer.json").read_text(encoding="utf-8"))
+    assert payload["write_tools_used"] == ["write_file"]
+    assert payload["failed_write_attempts"] == 1
+    repair_messages = [message["content"] for message in calls[4]["messages"] if message["role"] == "user"]
+    assert any("Validator error:" in str(message) for message in repair_messages)
+    assert any("not_allowed.py" in str(message) for message in repair_messages)
+
+
 def test_developer_write_cannot_escape_target_workspace(tmp_path: Path) -> None:
     engine_root = tmp_path / "engine"
     target_workspace = tmp_path / "target"

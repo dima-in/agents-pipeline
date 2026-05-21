@@ -5,6 +5,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import textwrap
 import time
 import traceback
@@ -148,6 +149,10 @@ class WorkflowOrchestrator:
         self._task_designer_feedback_file = ""
         self._task_designer_feedback_source = ""
         self._task_designer_rejection_reason = ""
+        self._developer_feedback_file = ""
+        self._developer_feedback_source = ""
+        self._developer_feedback_chars = 0
+        self._implementation_retry_from_agent = ""
         self._implementation_attempt = 0
         self._repo_map_cache: dict[str, Any] | None = None
         self._repo_map_before: dict[str, Any] | None = None
@@ -269,6 +274,10 @@ class WorkflowOrchestrator:
         self._task_designer_feedback_file = ""
         self._task_designer_feedback_source = ""
         self._task_designer_rejection_reason = ""
+        self._developer_feedback_file = ""
+        self._developer_feedback_source = ""
+        self._developer_feedback_chars = 0
+        self._implementation_retry_from_agent = ""
         self._implementation_attempt = 0
         self.logger.phase_start(phase["name"])
         research_reports, _run_dir = self._load_latest_project_research_reports()
@@ -341,6 +350,9 @@ class WorkflowOrchestrator:
                 return True
 
             self._save_feedback(task_id, "qa", f"Попытка {attempt} завершилась ошибкой. Проверь логи и исправь регрессии.")
+            if self._phase_failure_status in {"qa_failed", "developer_checks_failed"}:
+                self._capture_developer_retry_feedback(task_id)
+                self._implementation_retry_from_agent = "developer"
             if self.config["git"]["enabled"] and self.config["git"]["auto_rollback"]:
                 self._rollback_git(f"attempt {attempt} failed")
                 if attempt < max_retries:
@@ -443,6 +455,9 @@ class WorkflowOrchestrator:
             if phase_key == "implementation" and agent["name"] == "developer":
                 self._capture_repo_map_after_developer()
                 if not self._enforce_implementation_scope_diff():
+                    had_failures = True
+                    return False
+                if not self._run_developer_deterministic_checks():
                     had_failures = True
                     return False
             if self._phase_cost_limit_exceeded(phase_key):
@@ -564,6 +579,8 @@ class WorkflowOrchestrator:
         self.logger.agent_progress(agent_name, f"Diagnostic repo_map_path={message_bundle['repo_map_path']}")
         self.logger.agent_progress(agent_name, f"Diagnostic repo_map_file_count={message_bundle['repo_map_file_count']}")
         self.logger.agent_progress(agent_name, f"Diagnostic repo_map_directory_count={message_bundle['repo_map_directory_count']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic developer_feedback_source={message_bundle['developer_feedback_source']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic developer_feedback_chars={message_bundle['developer_feedback_chars']}")
         self.logger.agent_progress(agent_name, f"Diagnostic backlog_source={message_bundle['backlog_source']}")
         self.logger.agent_progress(agent_name, f"Diagnostic selected_task_id={message_bundle['selected_task_id']}")
         self.logger.agent_progress(agent_name, f"Diagnostic research_handoff_sources={', '.join(message_bundle['research_handoff_sources'])}")
@@ -639,6 +656,8 @@ class WorkflowOrchestrator:
                     "repo_map_path": message_bundle["repo_map_path"],
                     "repo_map_file_count": message_bundle["repo_map_file_count"],
                     "repo_map_directory_count": message_bundle["repo_map_directory_count"],
+                    "developer_feedback_source": message_bundle["developer_feedback_source"],
+                    "developer_feedback_chars": message_bundle["developer_feedback_chars"],
                     "research_handoff_sources": message_bundle["research_handoff_sources"],
                     "selected_task_scope": message_bundle["selected_task_scope"],
                     "selected_task_allowed_paths": message_bundle["selected_task_allowed_paths"],
@@ -1358,6 +1377,9 @@ class WorkflowOrchestrator:
         repo_map_path = ""
         repo_map_file_count = 0
         repo_map_directory_count = 0
+        developer_feedback_text = ""
+        developer_feedback_source = ""
+        developer_feedback_chars = 0
         contract_completeness = False
         contract_compliance = False
         missing_must_contain: list[str] = []
@@ -1409,6 +1431,9 @@ class WorkflowOrchestrator:
             repo_map_path = implementation_context["repo_map_path"]
             repo_map_file_count = implementation_context["repo_map_file_count"]
             repo_map_directory_count = implementation_context["repo_map_directory_count"]
+            if agent_name == "developer" and self._implementation_retry_from_agent == "developer":
+                developer_feedback_text, developer_feedback_source = self._load_developer_feedback_for_retry()
+                developer_feedback_chars = len(developer_feedback_text)
             contract_completeness = implementation_context["contract_completeness"]
             contract_compliance = implementation_context["contract_compliance"]
             missing_must_contain = implementation_context["missing_must_contain"]
@@ -1431,6 +1456,8 @@ class WorkflowOrchestrator:
             combined_parts.append(f"Repository context collected locally:\n{repository_context}")
         if previous_context:
             combined_parts.append(f"Previous agent context:\n{previous_context}")
+        if developer_feedback_text:
+            combined_parts.append(f"Previous validation feedback to repair:\n{developer_feedback_text}")
         if phase == "implementation":
             combined_parts.append(self._build_implementation_scope_instruction(selected_task_scope))
         combined_parts.append(translation_instruction)
@@ -1445,6 +1472,8 @@ class WorkflowOrchestrator:
             system_parts.append(self._build_direct_api_retrieval_instruction(phase=phase, agent_name=agent_name))
         if previous_context:
             system_parts.append(f"Previous agent context:\n{previous_context}")
+        if developer_feedback_text:
+            system_parts.append(f"Previous validation feedback to repair:\n{developer_feedback_text}")
         if phase == "implementation":
             system_parts.append(self._build_implementation_scope_instruction(selected_task_scope))
         system_parts.append(translation_instruction)
@@ -1498,6 +1527,8 @@ class WorkflowOrchestrator:
             "repo_map_path": repo_map_path if phase == "implementation" else "",
             "repo_map_file_count": repo_map_file_count if phase == "implementation" else 0,
             "repo_map_directory_count": repo_map_directory_count if phase == "implementation" else 0,
+            "developer_feedback_source": developer_feedback_source if phase == "implementation" else "",
+            "developer_feedback_chars": developer_feedback_chars if phase == "implementation" else 0,
             "contract_completeness": contract_completeness if phase == "implementation" else False,
             "contract_compliance": contract_compliance if phase == "implementation" else False,
             "missing_must_contain": missing_must_contain if phase == "implementation" else [],
@@ -1828,6 +1859,21 @@ class WorkflowOrchestrator:
         if output:
             return output
         return (process.stderr or "").strip()
+
+    def _run_local_command(self, command: list[str], timeout: int = 10, cwd: Path | None = None) -> tuple[int, str, str]:
+        try:
+            process = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                cwd=cwd or self.target_workspace,
+            )
+        except Exception as exc:
+            return 1, "", str(exc)
+        return process.returncode, (process.stdout or "").strip(), (process.stderr or "").strip()
 
     def _build_compact_architecture_summary(self) -> str:
         return "\n".join(
@@ -2661,6 +2707,18 @@ class WorkflowOrchestrator:
             "or 2) return exactly status=no_changes: <concrete reason>."
         )
 
+    def _build_developer_write_repair_instruction(self, error_text: str, remaining_attempts: int) -> str:
+        return (
+            "Your last write_file/apply_patch request did not pass orchestration validation. "
+            f"Validator error: {error_text}. "
+            "Do not request more broad retrieval. "
+            "On your next response do exactly one of the following: "
+            '1) emit one corrected JSON write request using {"tool":"write_file", ...}, {"tool":"apply_patch", ...}, '
+            "or a tool_batch that includes a corrected write; "
+            "or 2) return exactly status=no_changes: <concrete reason>. "
+            f"Remaining repair attempts after this message: {max(0, remaining_attempts)}."
+        )
+
     def _direct_api_read_files(self, paths: list[str], limit: int = 8000) -> str:
         chunks: list[str] = []
         total = 0
@@ -2819,11 +2877,32 @@ class WorkflowOrchestrator:
         current = self._get_agent_report_extras("implementation", "developer")
         used = list(current.get("write_tools_used") or [])
         used.append(tool_name)
-        self._set_agent_report_extras("implementation", "developer", {"write_tools_used": used})
+        self._set_agent_report_extras(
+            "implementation",
+            "developer",
+            {
+                "write_tools_used": used,
+                "last_write_error": "",
+            },
+        )
+
+    def _record_failed_write_attempt(self, tool_name: str, error_text: str) -> None:
+        current = self._get_agent_report_extras("implementation", "developer")
+        failed_attempts = int(current.get("failed_write_attempts") or 0) + 1
+        self._set_agent_report_extras(
+            "implementation",
+            "developer",
+            {
+                "last_write_tool": tool_name,
+                "last_write_error": error_text,
+                "failed_write_attempts": failed_attempts,
+            },
+        )
 
     def _direct_api_write_file(self, path: str, content: str) -> str:
         allowed, detail, candidate = self._validate_direct_api_write_request(path, [content])
         if not allowed or candidate is None:
+            self._record_failed_write_attempt("write_file", detail)
             return detail
         candidate.parent.mkdir(parents=True, exist_ok=True)
         candidate.write_text(content, encoding="utf-8")
@@ -2833,14 +2912,18 @@ class WorkflowOrchestrator:
     def _direct_api_apply_patch(self, path: str, search: str, replace: str) -> str:
         allowed, detail, candidate = self._validate_direct_api_write_request(path, [search, replace])
         if not allowed or candidate is None:
+            self._record_failed_write_attempt("apply_patch", detail)
             return detail
         if not candidate.exists() or not candidate.is_file():
+            self._record_failed_write_attempt("apply_patch", f"Target file does not exist: {detail}")
             return f"Target file does not exist: {detail}"
         try:
             original = candidate.read_text(encoding="utf-8", errors="replace")
         except OSError:
+            self._record_failed_write_attempt("apply_patch", f"Unable to read target file: {detail}")
             return f"Unable to read target file: {detail}"
         if search not in original:
+            self._record_failed_write_attempt("apply_patch", f"Search block not found in {detail}")
             return f"Search block not found in {detail}"
         updated = original.replace(search, replace, 1)
         candidate.write_text(updated, encoding="utf-8")
@@ -2915,6 +2998,7 @@ class WorkflowOrchestrator:
         response_payload: dict[str, Any] | None = None
         retrieval_rounds = 0
         blocked_retrieval_count = 0
+        developer_base_retrieval_limit = 4
         if phase == "implementation" and agent_name == "developer":
             self._set_agent_report_extras(
                 "implementation",
@@ -2924,6 +3008,9 @@ class WorkflowOrchestrator:
                     "developer_changed_files": [],
                     "developer_diff_lines": 0,
                     "no_changes_detected": False,
+                    "failed_write_attempts": 0,
+                    "last_write_error": "",
+                    "last_write_tool": "",
                 },
             )
         try:
@@ -2969,11 +3056,15 @@ class WorkflowOrchestrator:
                         "content": "Local retrieval result:\n" + (retrieval_output or "No matching local results."),
                     }
                 )
+                developer_extras = self._get_agent_report_extras("implementation", "developer")
+                write_tools_used = developer_extras.get("write_tools_used") or []
+                failed_write_attempts = int(developer_extras.get("failed_write_attempts") or 0)
+                last_write_error = str(developer_extras.get("last_write_error") or "").strip()
                 if (
                     phase == "implementation"
                     and agent_name == "developer"
                     and turn >= 3
-                    and not self._get_agent_report_extras("implementation", "developer").get("write_tools_used")
+                    and not write_tools_used
                 ):
                     messages.append(
                         {
@@ -2984,22 +3075,49 @@ class WorkflowOrchestrator:
                 if (
                     phase == "implementation"
                     and agent_name == "developer"
-                    and not self._get_agent_report_extras("implementation", "developer").get("write_tools_used")
-                    and (blocked_retrieval_count >= 2 or turn >= 4)
+                    and str(retrieval_request.get("tool") or "") in {"write_file", "apply_patch", "tool_batch"}
+                    and not write_tools_used
+                    and last_write_error
                 ):
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": self._build_developer_write_repair_instruction(last_write_error, max_turns - turn),
+                        }
+                    )
+                if (
+                    phase == "implementation"
+                    and agent_name == "developer"
+                    and not write_tools_used
+                    and (blocked_retrieval_count >= 2 or turn >= developer_base_retrieval_limit)
+                ):
+                    if failed_write_attempts > 0 and turn < max_turns:
+                        continue
+                    if failed_write_attempts > 0:
+                        developer_failure_text = (
+                            "status=no_changes\n"
+                            "Developer exhausted the write repair budget after validation errors. "
+                            f"Last validator error: {last_write_error}\n\n"
+                            "Russian translation\n"
+                            "status=no_changes\n"
+                            "Разработчик исчерпал бюджет repair-попыток после ошибок валидации записи. "
+                            f"Последняя ошибка валидатора: {last_write_error}"
+                        )
+                    else:
+                        developer_failure_text = (
+                            "status=no_changes\n"
+                            "Developer exceeded the allowed retrieval policy without making a scoped file edit. "
+                            "Use only read_file/read_files for exact contract paths, then write the target/test file or report a concrete scope gap.\n\n"
+                            "Russian translation\n"
+                            "status=no_changes\n"
+                            "Разработчик превысил допустимую политику retrieval, не выполнив scoped-изменение файла. "
+                            "Используй только read_file/read_files для точных путей из контракта, затем запиши target/test файл или сообщи конкретную нехватку scope."
+                        )
                     response_payload = {
                         "choices": [
                             {
                                 "message": {
-                                    "content": (
-                                        "status=no_changes\n"
-                                        "Developer exceeded the allowed retrieval policy without making a scoped file edit. "
-                                        "Use only read_file/read_files for exact contract paths, then write the target/test file or report a concrete scope gap.\n\n"
-                                        "Russian translation\n"
-                                        "status=no_changes\n"
-                                        "Разработчик превысил допустимую политику retrieval, не выполнив scoped-изменение файла. "
-                                        "Используй только read_file/read_files для точных путей из контракта, затем запиши target/test файл или сообщи конкретную нехватку scope."
-                                    )
+                                    "content": developer_failure_text
                                 }
                             }
                         ],
@@ -3100,6 +3218,15 @@ class WorkflowOrchestrator:
             save_agent_report("invalid_output", contract_failure, elapsed, stdout, "", parsed_output, command, 0)
             self.logger.agent_end(agent_name, "invalid_output", contract_failure)
             return False
+
+        if phase == "implementation" and agent_name == "qa":
+            qa_verdict = self._extract_qa_verdict(parsed_output)
+            if qa_verdict == "failed":
+                result = "qa reported regressions"
+                save_agent_report("qa_failed", result, elapsed, stdout, "", parsed_output, command, 0)
+                self.logger.agent_end(agent_name, "qa_failed", result)
+                self._phase_failure_status = "qa_failed"
+                return False
 
         if phase == "implementation" and agent_name == "developer":
             developer_extras = self._get_agent_report_extras("implementation", "developer")
@@ -5572,6 +5699,8 @@ class WorkflowOrchestrator:
         return self.retry_agent_name in {"developer", "qa", "template-validator"}
 
     def _should_skip_implementation_agent(self, agent_name: str) -> bool:
+        if self._implementation_retry_from_agent == "developer":
+            return agent_name in {"architect", "implementation-planner", "task-designer"}
         if self._should_reuse_architect_for_implementation() and agent_name == "architect":
             return True
         if self._should_reuse_planner_for_implementation() and agent_name == "implementation-planner":
@@ -6006,6 +6135,219 @@ class WorkflowOrchestrator:
         self.logger.info(f"Diagnostic feedback_file={feedback_file}")
         self.logger.info(f"Р¤Р°Р№Р» РѕР±СЂР°С‚РЅРѕР№ СЃРІСЏР·Рё СЃРѕС…СЂР°РЅРµРЅ: {feedback_file}")
         return feedback_file
+
+    def _developer_feedback_path_for_current_attempt(self) -> Path:
+        feedback_root = self._engine_path(self.config.get("paths", {}).get("feedback_dir", ".openclaw/feedback"))
+        run_id = self.logger.run_dir.name
+        attempt = self._implementation_attempt if self._implementation_attempt > 0 else 1
+        return feedback_root / self.project_id / run_id / f"attempt_{attempt}" / "developer.md"
+
+    def _load_developer_feedback_for_retry(self) -> tuple[str, str]:
+        candidates: list[Path] = []
+        current_attempt_path = self._developer_feedback_path_for_current_attempt()
+        candidates.append(current_attempt_path)
+        if self._developer_feedback_file:
+            candidates.append(Path(self._developer_feedback_file))
+        latest_path = self._engine_path(self.config.get("paths", {}).get("feedback_dir", ".openclaw/feedback")) / self.project_id / "latest" / "developer.md"
+        candidates.append(latest_path)
+        for candidate in candidates:
+            try:
+                if candidate.exists():
+                    text = candidate.read_text(encoding="utf-8").strip()
+                    if text:
+                        self._developer_feedback_source = str(candidate)
+                        self._developer_feedback_chars = len(text)
+                        return text, str(candidate)
+            except Exception:
+                continue
+        self._developer_feedback_source = ""
+        self._developer_feedback_chars = 0
+        return "", ""
+
+    @staticmethod
+    def _extract_qa_verdict(parsed_output: str) -> str:
+        text = str(parsed_output or "")
+        match = re.search(r"Вердикт QA:\s*(.+)", text, re.IGNORECASE)
+        if not match:
+            return ""
+        verdict = match.group(1).strip().lower()
+        if "не пройдено" in verdict:
+            return "failed"
+        if "пройдено" in verdict:
+            return "passed"
+        return ""
+
+    def _capture_developer_retry_feedback(self, task_id: int) -> None:
+        sections: list[str] = []
+        developer_report = self._load_saved_agent_report("implementation", "developer") or {}
+        qa_report = self._load_saved_agent_report("implementation", "qa") or {}
+        validator_report = self._load_saved_agent_report("implementation", "template-validator") or {}
+        deterministic_report = self._load_saved_agent_report("implementation", "developer-checks") or {}
+
+        developer_findings: list[str] = []
+        last_write_error = str(developer_report.get("last_write_error") or "").strip()
+        if last_write_error:
+            developer_findings.append("Developer write validator error:")
+            developer_findings.append(last_write_error)
+        developer_result = str(developer_report.get("result") or "").strip()
+        if developer_result and developer_result not in developer_findings:
+            developer_findings.append("Developer result:")
+            developer_findings.append(developer_result)
+        if developer_findings:
+            sections.append("\n".join(["Developer feedback", *developer_findings]))
+
+        qa_output = str(qa_report.get("parsed_output") or "").strip()
+        if qa_output:
+            sections.append("\n".join(["QA findings to repair", qa_output]))
+
+        validator_output = str(validator_report.get("parsed_output") or "").strip()
+        if validator_output:
+            sections.append("\n".join(["Template validator findings to respect", validator_output]))
+
+        deterministic_output = str(deterministic_report.get("parsed_output") or deterministic_report.get("result") or "").strip()
+        if deterministic_output:
+            sections.append("\n".join(["Deterministic checks to repair", deterministic_output]))
+
+        if not sections:
+            return
+        feedback = "\n\n".join(
+            [
+                "Implementation repair feedback",
+                "Fix all findings below in the next developer attempt.",
+                *sections,
+            ]
+        )
+        feedback_file = self._save_feedback(task_id, "developer", feedback)
+        self._developer_feedback_file = str(feedback_file)
+        self._developer_feedback_source = str(feedback_file)
+        self._developer_feedback_chars = len(feedback)
+
+    def _save_developer_checks_report(self, status: str, result: str, parsed_output: str = "") -> None:
+        self.logger.save_agent_report(
+            "implementation",
+            "developer-checks",
+            {
+                "phase": "implementation",
+                "agent": "developer-checks",
+                "agent_name": "developer-checks",
+                "status": status,
+                "result": result,
+                "parsed_output": parsed_output or result,
+                "selected_task_id": self.selected_task_ref,
+            },
+        )
+
+    @staticmethod
+    def _is_alembic_migration_path(path: str) -> bool:
+        normalized = path.replace("\\", "/").lower()
+        return "/alembic/versions/" in f"/{normalized}" or "/migrations/" in f"/{normalized}"
+
+    def _validate_changed_migration_files(self, paths: list[str]) -> list[str]:
+        issues: list[str] = []
+        normalized_paths = [self._normalize_repo_relative_path(path) for path in paths if self._normalize_repo_relative_path(path)]
+        migration_paths = [path for path in normalized_paths if self._is_alembic_migration_path(path)]
+        for relative_path in migration_paths:
+            candidate = self.target_workspace / relative_path
+            if not candidate.exists() or not candidate.is_file():
+                issues.append(f"{relative_path}: migration file is missing")
+                continue
+            try:
+                text = candidate.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                issues.append(f"{relative_path}: unable to read migration file: {exc}")
+                continue
+            revision_match = re.search(r"^revision\s*=\s*['\"]([^'\"]+)['\"]", text, re.MULTILINE)
+            down_revision_match = re.search(r"^down_revision\s*=\s*(.+)$", text, re.MULTILINE)
+            revision = revision_match.group(1).strip() if revision_match else ""
+            raw_down_revision = down_revision_match.group(1).strip() if down_revision_match else ""
+            if not revision:
+                issues.append(f"{relative_path}: missing revision identifier")
+            if not raw_down_revision:
+                issues.append(f"{relative_path}: missing down_revision")
+                continue
+            normalized_down_revision = raw_down_revision.split("#", 1)[0].strip().rstrip(",")
+            normalized_down_revision = normalized_down_revision.strip()
+            if normalized_down_revision.lower() == "none":
+                issues.append(f"{relative_path}: down_revision must not be None")
+                continue
+            if normalized_down_revision.startswith(("'", '"')) and normalized_down_revision.endswith(("'", '"')):
+                normalized_down_revision = normalized_down_revision[1:-1].strip()
+            if not normalized_down_revision:
+                issues.append(f"{relative_path}: down_revision is empty")
+                continue
+            versions_dir = candidate.parent
+            revision_index: dict[str, str] = {}
+            for sibling in versions_dir.glob("*.py"):
+                try:
+                    sibling_text = sibling.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                sibling_match = re.search(r"^revision\s*=\s*['\"]([^'\"]+)['\"]", sibling_text, re.MULTILINE)
+                if sibling_match:
+                    revision_index[sibling_match.group(1).strip()] = str(sibling.relative_to(self.target_workspace)).replace("\\", "/")
+            if normalized_down_revision not in revision_index:
+                issues.append(
+                    f"{relative_path}: down_revision '{normalized_down_revision}' does not match any existing migration revision in {versions_dir}"
+                )
+        return issues
+
+    def _run_developer_deterministic_checks(self) -> bool:
+        developer_report = self._load_saved_agent_report("implementation", "developer") or {}
+        changed_files = [
+            self._normalize_repo_relative_path(path)
+            for path in (developer_report.get("developer_changed_files") or [])
+            if self._normalize_repo_relative_path(path)
+        ]
+        changed_python_files = [path for path in changed_files if path.endswith(".py")]
+        item = self._selected_implementation_item or {}
+        test_file_path = ""
+        if isinstance(item.get("test_file"), dict):
+            test_file_path = self._normalize_repo_relative_path((item.get("test_file") or {}).get("path"))
+
+        findings: list[str] = []
+        if changed_python_files:
+            compile_command = [sys.executable, "-m", "py_compile", *changed_python_files]
+            returncode, stdout, stderr = self._run_local_command(compile_command, timeout=30, cwd=self.target_workspace)
+            if returncode != 0:
+                findings.append("py_compile failed for changed Python files:")
+                findings.append(stderr or stdout or "unknown py_compile failure")
+
+        if test_file_path:
+            candidate = self.target_workspace / test_file_path
+            if not candidate.exists() or not candidate.is_file():
+                findings.append(f"selected test_file is missing: {test_file_path}")
+            elif test_file_path.endswith(".py"):
+                returncode, stdout, stderr = self._run_local_command(
+                    [sys.executable, "-m", "pytest", test_file_path],
+                    timeout=60,
+                    cwd=self.target_workspace,
+                )
+                if returncode != 0:
+                    findings.append(f"pytest failed for selected test file: {test_file_path}")
+                    findings.append(stderr or stdout or "unknown pytest failure")
+
+        findings.extend(self._validate_changed_migration_files(changed_python_files))
+
+        if findings:
+            parsed_output = "\n".join(findings)
+            self._save_developer_checks_report("failed", "developer deterministic checks failed", parsed_output)
+            feedback = "\n\n".join(
+                [
+                    "Deterministic validation findings",
+                    parsed_output,
+                ]
+            )
+            feedback_file = self._save_feedback(self.task_counter or 0, "developer", feedback)
+            self._developer_feedback_file = str(feedback_file)
+            self._developer_feedback_source = str(feedback_file)
+            self._developer_feedback_chars = len(feedback)
+            self._implementation_retry_from_agent = "developer"
+            self._phase_failure_status = "developer_checks_failed"
+            self.logger.error("Developer deterministic checks failed", parsed_output)
+            return False
+
+        self._save_developer_checks_report("success", "developer deterministic checks passed", "developer deterministic checks passed")
+        return True
 
     def _ensure_repo_map_workspace_consistency(self, agent_name: str) -> bool:
         repo_map = self._load_repo_map()
