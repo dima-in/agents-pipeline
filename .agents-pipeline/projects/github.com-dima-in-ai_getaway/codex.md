@@ -27,3 +27,20 @@ Current development focus:
 - backend routing / proxy / monitoring work is the preferred safe area
 - be careful around `billing`, `auth`, deploy config, and production secrets
 - preserve multi-provider model routing behavior and existing chat flows unless task explicitly changes them
+
+<!-- AUTO-GENERATED:RUN-CONTEXT START -->
+## Auto-updated Run Context
+
+- updated_at: 2026-05-21T17:48:16
+- last_run_id: run_20260521_174722
+- phases_touched: implementation
+- completed_agents: 3
+- failed_agents: 1
+- total_tokens: 36439
+- estimated_cost_usd: 0.136179
+
+### Current Selected Implementation Task
+
+- id: TASK-001
+- scope: backend-only
+<!-- AUTO-GENERATED:RUN-CONTEXT END -->

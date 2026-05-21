@@ -3571,6 +3571,61 @@ def test_validate_changed_migration_files_rejects_none_down_revision(tmp_path: P
     assert issues == ["gateway-v4/alembic/versions/20240801_add_provider_metrics.py: down_revision must not be None"]
 
 
+def test_no_changes_completion_claim_triggers_deterministic_validation(tmp_path: Path, monkeypatch) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True, exist_ok=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    orchestrator.task_counter = 1
+    orchestrator._selected_implementation_item = {
+        "id": "TASK-001",
+        "target_file": {"path": "gateway-v4/alembic/versions/20240801_add_provider_metrics.py"},
+        "test_file": {"path": "gateway-v4/tests/test_provider_metrics_migration.py"},
+        "must_contain": ["def upgrade()"],
+    }
+    orchestrator.logger.save_agent_report(
+        "implementation",
+        "developer",
+        {
+            "status": "success",
+            "result": "completed",
+            "parsed_output": "status=no_changes: The implementation is already complete and satisfies all contract requirements.",
+            "selected_task_id": "TASK-001",
+        },
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_collect_scope_watchdog_diff_diagnostics",
+        lambda: {
+            "allowed": True,
+            "changed_files": [],
+            "changed_files_count": 0,
+            "diff_lines_count": 0,
+            "forbidden_hits": [],
+            "allowed_paths_matched": [],
+            "scope_policy_result": "allowed",
+        },
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_run_local_command",
+        lambda command, timeout=10, cwd=None: (1, "", "SyntaxError: invalid syntax")
+        if command[:3] == [sys.executable, "-m", "py_compile"]
+        else (0, "ok", ""),
+    )
+
+    ok = orchestrator._enforce_implementation_scope_diff()
+
+    assert ok is False
+    assert orchestrator._phase_failure_status == "developer_checks_failed"
+    report = orchestrator._load_saved_agent_report("implementation", "developer-checks") or {}
+    assert report["status"] == "failed"
+    assert "contract_compliance check failed" in report["parsed_output"]
+    assert orchestrator._developer_feedback_file.endswith("developer.md")
+
+
 def test_from_agent_developer_reselects_task_when_reused_selection_has_incomplete_dependencies(
     tmp_path: Path, monkeypatch
 ) -> None:

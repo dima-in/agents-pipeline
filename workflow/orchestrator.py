@@ -3724,6 +3724,119 @@ class WorkflowOrchestrator:
         self._phase_failure_status = "no_changes"
         return False
 
+    @staticmethod
+    def _developer_no_changes_claims_completion(reason: str) -> bool:
+        lowered = str(reason or "").strip().lower()
+        if not lowered:
+            return False
+        completion_markers = [
+            "already complete",
+            "already implemented",
+            "already exists",
+            "no modifications are needed",
+            "implementation is already complete",
+            "implementation is complete",
+            "satisfy all contract requirements",
+            "satisfies all contract requirements",
+            "already satisfies",
+            "no changes needed",
+            "nothing to change",
+        ]
+        return any(marker in lowered for marker in completion_markers)
+
+    def _run_developer_no_change_validation(self, reason: str) -> bool:
+        item = self._selected_implementation_item or {}
+        relevant_paths: list[str] = []
+        target_file = item.get("target_file") or {}
+        test_file = item.get("test_file") or {}
+        if isinstance(target_file, dict):
+            normalized = self._normalize_repo_relative_path(target_file.get("path"))
+            if normalized:
+                relevant_paths.append(normalized)
+        if isinstance(test_file, dict):
+            normalized = self._normalize_repo_relative_path(test_file.get("path"))
+            if normalized:
+                relevant_paths.append(normalized)
+        for path in (item.get("required_test_paths") or []):
+            normalized = self._normalize_repo_relative_path(path)
+            if normalized:
+                relevant_paths.append(normalized)
+        python_paths = [path for path in sorted(set(relevant_paths)) if path.endswith(".py")]
+
+        findings: list[str] = []
+        contract_diag = self._evaluate_selected_task_contract_compliance()
+        if not contract_diag.get("contract_compliance", False):
+            findings.append("contract_compliance check failed for developer no_changes claim")
+            missing_must_contain = list(contract_diag.get("missing_must_contain") or [])
+            if missing_must_contain:
+                findings.append("missing_must_contain: " + ", ".join(missing_must_contain))
+            if contract_diag.get("missing_test_file", False):
+                findings.append("missing_test_file: selected test_file is missing")
+            forbidden_hits = list(contract_diag.get("forbidden_contract_hits") or [])
+            if forbidden_hits:
+                findings.append("forbidden_contract_hits: " + ", ".join(forbidden_hits))
+
+        if python_paths:
+            returncode, stdout, stderr = self._run_local_command(
+                [sys.executable, "-m", "py_compile", *python_paths],
+                timeout=30,
+                cwd=self.target_workspace,
+            )
+            if returncode != 0:
+                findings.append("py_compile failed for developer no_changes validation")
+                findings.append(stderr or stdout or "unknown py_compile failure")
+
+        selected_test_path = ""
+        if isinstance(test_file, dict):
+            selected_test_path = self._normalize_repo_relative_path(test_file.get("path"))
+        if selected_test_path:
+            candidate = self.target_workspace / selected_test_path
+            if not candidate.exists() or not candidate.is_file():
+                findings.append(f"selected test_file is missing: {selected_test_path}")
+            elif selected_test_path.endswith(".py"):
+                returncode, stdout, stderr = self._run_local_command(
+                    [sys.executable, "-m", "pytest", selected_test_path],
+                    timeout=60,
+                    cwd=self.target_workspace,
+                )
+                if returncode != 0:
+                    findings.append(f"pytest failed for selected test file: {selected_test_path}")
+                    findings.append(stderr or stdout or "unknown pytest failure")
+
+        findings.extend(self._validate_changed_migration_files(python_paths))
+
+        if not findings:
+            self._save_developer_checks_report(
+                "success",
+                "developer no_changes claim passed deterministic validation",
+                "developer no_changes claim passed deterministic validation",
+            )
+            return True
+
+        parsed_output = "\n".join(findings)
+        self._save_developer_checks_report(
+            "failed",
+            "developer no_changes claim failed deterministic validation",
+            parsed_output,
+        )
+        feedback = "\n\n".join(
+            [
+                "Developer no_changes claim is not valid",
+                f"Original reason: {reason}",
+                "",
+                "Deterministic validation findings",
+                parsed_output,
+            ]
+        )
+        feedback_file = self._save_feedback(self.task_counter or 0, "developer", feedback)
+        self._developer_feedback_file = str(feedback_file)
+        self._developer_feedback_source = str(feedback_file)
+        self._developer_feedback_chars = len(feedback)
+        self._implementation_retry_from_agent = "developer"
+        self._phase_failure_status = "developer_checks_failed"
+        self.logger.error("Developer no_changes claim failed deterministic validation", parsed_output)
+        return False
+
     def _enforce_implementation_scope_diff(self) -> bool:
         diagnostics = self._collect_scope_watchdog_diff_diagnostics()
         diagnostics["developer_changed_files"] = diagnostics["changed_files"]
@@ -3743,6 +3856,10 @@ class WorkflowOrchestrator:
         if existing_developer:
             self._overwrite_agent_report("implementation", "developer", {**existing_developer, **diagnostics})
         if diagnostics["changed_files_count"] == 0:
+            developer_report = self._load_saved_agent_report("implementation", "developer") or {}
+            developer_reason = str(developer_report.get("parsed_output") or developer_report.get("result") or "").strip()
+            if self._developer_no_changes_claims_completion(developer_reason):
+                return self._run_developer_no_change_validation(developer_reason)
             return self._mark_developer_no_changes(
                 "Developer completed without modifying target files. Return status=no_changes or make a scoped file edit."
             )
