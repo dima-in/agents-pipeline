@@ -564,6 +564,7 @@ def test_project_state_dirs_are_created_under_engine_root(tmp_path: Path) -> Non
     assert (base / "settings.yaml").exists()
     assert (base / "local.yaml").exists()
     assert (base / "codex.md").exists()
+    assert (base / "resume.md").exists()
 
     shared_settings = yaml.safe_load((base / "settings.yaml").read_text(encoding="utf-8")) or {}
     local_settings = yaml.safe_load((base / "local.yaml").read_text(encoding="utf-8")) or {}
@@ -640,6 +641,31 @@ def test_project_codex_context_is_loaded_into_agent_context(tmp_path: Path) -> N
     assert "Current rollout owner: Dima." in context
 
 
+def test_project_resume_context_is_loaded_into_agent_context(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    (target_workspace / "README.md").write_text("target readme", encoding="utf-8")
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    orchestrator.project_resume_context_path.write_text(
+        "# Project Resume\n\nContinue with TASK-7 in gateway-v4/app/services/router.py.\n",
+        encoding="utf-8",
+    )
+    orchestrator.project_resume_context = orchestrator._load_project_resume_context()
+
+    context = orchestrator._build_external_project_repository_context("project-analyst", limit=4000)
+
+    assert "Shared resume handoff" in context
+    assert "Continue with TASK-7 in gateway-v4/app/services/router.py." in context
+
+
 def test_persist_project_codex_context_preserves_manual_notes(tmp_path: Path) -> None:
     engine_root = tmp_path / "engine"
     target_workspace = tmp_path / "target"
@@ -681,6 +707,52 @@ def test_persist_project_codex_context_preserves_manual_notes(tmp_path: Path) ->
     assert "project-analyst: repo stable" in content
 
 
+def test_persist_project_resume_context_preserves_manual_notes(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+        user_goal="Ship implementation resume",
+    )
+    orchestrator.project_resume_context_path.write_text(
+        "# Project Resume\n\nManual resume note stays.\n",
+        encoding="utf-8",
+    )
+    orchestrator.project_resume_context = orchestrator._load_project_resume_context()
+    orchestrator._selected_implementation_item = {
+        "id": "TASK-9",
+        "scope": "Finish backend routing patch.",
+        "allowed_paths": ["gateway-v4/app/services/router.py", "gateway-v4/tests/test_router.py"],
+    }
+    orchestrator.logger.save_agent_report(
+        "implementation",
+        "developer",
+        {
+            "status": "success",
+            "result": "completed",
+            "elapsed_s": 2.0,
+            "parsed_output": "status=implemented",
+            "usage": {"input_tokens": 20, "output_tokens": 10, "total_tokens": 30, "estimated_cost_usd": 0.002},
+        },
+    )
+
+    orchestrator._persist_project_resume_context()
+    content = orchestrator.project_resume_context_path.read_text(encoding="utf-8")
+
+    assert "Manual resume note stays." in content
+    assert "<!-- AUTO-GENERATED:RESUME-CONTEXT START -->" in content
+    assert "Resume Checkpoint" in content
+    assert "next_step: Continue implementation task TASK-9" in content
+    assert "- id: TASK-9" in content
+    assert "gateway-v4/app/services/router.py" in content
+
+
 def test_run_research_phase_auto_updates_project_codex_context(tmp_path: Path, monkeypatch) -> None:
     engine_root = tmp_path / "engine"
     target_workspace = tmp_path / "target"
@@ -702,6 +774,30 @@ def test_run_research_phase_auto_updates_project_codex_context(tmp_path: Path, m
     assert ok is True
     assert "## Auto-updated Run Context" in content
     assert "Document current state" in content
+    assert orchestrator.logger.run_dir.name in content
+
+
+def test_run_research_phase_auto_updates_project_resume_context(tmp_path: Path, monkeypatch) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+        user_goal="Document resume state",
+    )
+    monkeypatch.setattr(orchestrator, "_run_standard_phase", lambda _phase: True)
+
+    ok = orchestrator.run_research_phase()
+    content = orchestrator.project_resume_context_path.read_text(encoding="utf-8")
+
+    assert ok is True
+    assert "## Resume Checkpoint" in content
+    assert "Document resume state" in content
     assert orchestrator.logger.run_dir.name in content
 
 

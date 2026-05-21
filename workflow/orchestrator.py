@@ -31,6 +31,12 @@ PROJECT_CODEX_TEMPLATE = (
 )
 PROJECT_CODEX_AUTO_START = "<!-- AUTO-GENERATED:RUN-CONTEXT START -->"
 PROJECT_CODEX_AUTO_END = "<!-- AUTO-GENERATED:RUN-CONTEXT END -->"
+PROJECT_RESUME_TEMPLATE = (
+    "# Project Resume\n\n"
+    "Add temporary handoff notes here if needed. This file is auto-loaded on every run across machines.\n"
+)
+PROJECT_RESUME_AUTO_START = "<!-- AUTO-GENERATED:RESUME-CONTEXT START -->"
+PROJECT_RESUME_AUTO_END = "<!-- AUTO-GENERATED:RESUME-CONTEXT END -->"
 
 
 class WorkflowOrchestrator:
@@ -67,9 +73,11 @@ class WorkflowOrchestrator:
         self.project_settings_path = self.project_state_dir / "settings.yaml"
         self.project_local_settings_path = self.project_state_dir / "local.yaml"
         self.project_codex_context_path = self.project_state_dir / "codex.md"
+        self.project_resume_context_path = self.project_state_dir / "resume.md"
         self.project_settings = self._load_project_settings()
         self.project_local_settings = self._load_project_local_settings()
         self.project_codex_context = self._load_project_codex_context()
+        self.project_resume_context = self._load_project_resume_context()
         self.repo_map_path = self.project_state_dir / "context" / "repo_map.json"
         self.repository_context_root = self.engine_root if self.context_mode == "engine_self_analysis" else self.target_workspace
         self.retrieval_root = self.target_workspace
@@ -168,6 +176,8 @@ class WorkflowOrchestrator:
             return True
         finally:
             summary = self.logger.save_summary()
+            self._persist_project_codex_context()
+            self._persist_project_resume_context()
             self.logger.info(f"Сводка сохранена: {summary}")
 
     def run_research_phase(self) -> bool:
@@ -177,6 +187,7 @@ class WorkflowOrchestrator:
             return False
         ok = self.run_phase("research")
         self._persist_project_codex_context()
+        self._persist_project_resume_context()
         return ok
 
     def run_implementation_phase(self) -> bool:
@@ -186,6 +197,7 @@ class WorkflowOrchestrator:
             return False
         ok = self.run_phase("implementation")
         self._persist_project_codex_context()
+        self._persist_project_resume_context()
         return ok
 
     def run_deployment_phase(self) -> bool:
@@ -193,6 +205,7 @@ class WorkflowOrchestrator:
             return False
         ok = self.run_phase("deployment")
         self._persist_project_codex_context()
+        self._persist_project_resume_context()
         return ok
 
     def run_phase(self, phase_key: str) -> bool:
@@ -1596,6 +1609,7 @@ class WorkflowOrchestrator:
             sections = [
                 ("User goal", user_goal_summary),
                 ("Shared Codex project context", self._build_project_codex_context_summary(limit=1600)),
+                ("Shared resume handoff", self._build_project_resume_context_summary(limit=1600)),
                 ("Git status --short", self._run_local_capture(["git", "status", "--short"], cwd=self.target_workspace)),
                 ("Git log --oneline -5", self._run_local_capture(["git", "log", "--oneline", "-5"], cwd=self.target_workspace)),
                 ("README.md", self._read_file_excerpt(self.target_workspace / "README.md", 2000)),
@@ -1610,6 +1624,7 @@ class WorkflowOrchestrator:
             sections = [
                 ("User goal", user_goal_summary),
                 ("Shared Codex project context", self._build_project_codex_context_summary(limit=1200)),
+                ("Shared resume handoff", self._build_project_resume_context_summary(limit=1200)),
                 ("Compressed project-analyst summary", self._build_fallback_project_summary()),
                 ("README.md", self._read_file_excerpt(self.target_workspace / "README.md", 1400)),
                 ("Compact architecture summary", self._build_compact_architecture_summary()),
@@ -1620,6 +1635,7 @@ class WorkflowOrchestrator:
             sections = [
                 ("User goal", user_goal_summary),
                 ("Shared Codex project context", self._build_project_codex_context_summary(limit=1000)),
+                ("Shared resume handoff", self._build_project_resume_context_summary(limit=1000)),
                 ("Positioning", self._build_positioning_summary()),
                 ("Workflow goals", self._build_workflow_goals_summary()),
                 ("Target users and use cases", self._build_target_users_summary()),
@@ -1628,6 +1644,7 @@ class WorkflowOrchestrator:
             sections = [
                 ("User goal", user_goal_summary),
                 ("Shared Codex project context", self._build_project_codex_context_summary(limit=1200)),
+                ("Shared resume handoff", self._build_project_resume_context_summary(limit=1200)),
                 ("Execution architecture", self._build_execution_architecture_summary()),
                 (
                     "direct_api implementation",
@@ -1660,6 +1677,7 @@ class WorkflowOrchestrator:
             sections = [
                 ("User goal", user_goal_summary),
                 ("Shared Codex project context", self._build_project_codex_context_summary(limit=1000)),
+                ("Shared resume handoff", self._build_project_resume_context_summary(limit=1000)),
                 ("Compressed project summary", self._build_fallback_project_summary()),
                 ("Compact architecture summary", self._build_compact_architecture_summary()),
                 ("Known constraints and problems", self._build_known_constraints_summary()),
@@ -1673,6 +1691,7 @@ class WorkflowOrchestrator:
             sections = [
                 ("User goal", user_goal_summary),
                 ("Shared Codex project context", self._build_project_codex_context_summary(limit=1000)),
+                ("Shared resume handoff", self._build_project_resume_context_summary(limit=1000)),
                 ("README.md", self._read_file_excerpt(self.target_workspace / "README.md", 1500)),
             ]
 
@@ -1704,6 +1723,7 @@ class WorkflowOrchestrator:
             sections = [
                 ("User goal", user_goal_summary),
                 ("Shared Codex project context", self._build_project_codex_context_summary(limit=1600)),
+                ("Shared resume handoff", self._build_project_resume_context_summary(limit=1600)),
                 ("Target workspace", str(self.target_workspace)),
                 ("Target git remote", self.git_remote or "unavailable"),
                 ("Git status --short", self._run_local_capture(["git", "status", "--short"], cwd=self.target_workspace)),
@@ -1716,6 +1736,7 @@ class WorkflowOrchestrator:
             sections = [
                 ("User goal", user_goal_summary),
                 ("Shared Codex project context", self._build_project_codex_context_summary(limit=1200)),
+                ("Shared resume handoff", self._build_project_resume_context_summary(limit=1200)),
                 ("Compressed target project summary", self._build_fallback_project_summary()),
                 ("Target README excerpt", self._read_target_repo_file("README.md", 1600)),
                 ("Target product and architecture summary", self._build_target_product_architecture_summary()),
@@ -1726,6 +1747,7 @@ class WorkflowOrchestrator:
             sections = [
                 ("User goal", user_goal_summary),
                 ("Shared Codex project context", self._build_project_codex_context_summary(limit=1000)),
+                ("Shared resume handoff", self._build_project_resume_context_summary(limit=1000)),
                 ("Target project summary", self._build_fallback_project_summary()),
                 ("Target product positioning", self._build_target_positioning_summary()),
                 ("Target workflow and business goals", self._build_target_goals_summary()),
@@ -1735,6 +1757,7 @@ class WorkflowOrchestrator:
             sections = [
                 ("User goal", user_goal_summary),
                 ("Shared Codex project context", self._build_project_codex_context_summary(limit=1200)),
+                ("Shared resume handoff", self._build_project_resume_context_summary(limit=1200)),
                 ("Target backend/frontend structure", self._build_target_backend_frontend_summary()),
                 ("Target dependency and config files", self._build_target_dependency_context(limit=4200)),
                 ("Target docker and deployment files", self._build_target_deployment_context(limit=2400)),
@@ -1745,6 +1768,7 @@ class WorkflowOrchestrator:
             sections = [
                 ("User goal", user_goal_summary),
                 ("Shared Codex project context", self._build_project_codex_context_summary(limit=1000)),
+                ("Shared resume handoff", self._build_project_resume_context_summary(limit=1000)),
                 ("Target project summary", self._build_fallback_project_summary()),
                 ("Target constraints and problems", self._build_target_constraints_summary()),
                 ("External inspiration focus", "Look for product, UX, workflow, and automation ideas relevant to this target repository."),
@@ -1754,6 +1778,7 @@ class WorkflowOrchestrator:
             sections = [
                 ("User goal", user_goal_summary),
                 ("Shared Codex project context", self._build_project_codex_context_summary(limit=1200)),
+                ("Shared resume handoff", self._build_project_resume_context_summary(limit=1200)),
                 ("Target docs excerpts", self._build_target_docs_excerpts(limit=2200)),
                 ("Target dependency and config files", self._build_target_dependency_context(limit=2200)),
             ]
@@ -1761,6 +1786,7 @@ class WorkflowOrchestrator:
             sections = [
                 ("User goal", user_goal_summary),
                 ("Shared Codex project context", self._build_project_codex_context_summary(limit=1000)),
+                ("Shared resume handoff", self._build_project_resume_context_summary(limit=1000)),
                 ("Target README excerpt", self._read_target_repo_file("README.md", 1500)),
             ]
 
@@ -3652,6 +3678,7 @@ class WorkflowOrchestrator:
             sections = [
                 ("User goal", self._build_user_goal_summary()),
                 ("Shared Codex project context", self._build_project_codex_context_summary(limit=1200)),
+                ("Shared resume handoff", self._build_project_resume_context_summary(limit=1200)),
                 ("Selected implementation scope", selected_scope),
                 ("Repo map summary", self._build_repo_map_summary(repo_map=repo_map, agent_name=agent_name, limit=1600)),
                 ("Target README and docs", self._build_target_docs_excerpts(limit=900)),
@@ -3662,6 +3689,7 @@ class WorkflowOrchestrator:
             sections = [
                 ("User goal", self._build_user_goal_summary()),
                 ("Shared Codex project context", self._build_project_codex_context_summary(limit=1600)),
+                ("Shared resume handoff", self._build_project_resume_context_summary(limit=1600)),
                 ("Selected implementation scope", selected_scope),
                 ("Repo map summary", self._build_repo_map_summary(repo_map=repo_map, agent_name=agent_name, limit=2600)),
                 ("Target README and docs", self._build_target_docs_excerpts(limit=2000)),
@@ -6273,6 +6301,7 @@ class WorkflowOrchestrator:
         settings_path = base / "settings.yaml"
         local_settings_path = base / "local.yaml"
         codex_context_path = base / "codex.md"
+        resume_context_path = base / "resume.md"
         settings_payload: dict[str, Any] = {}
         local_settings_payload: dict[str, Any] = {}
         if settings_path.exists():
@@ -6301,6 +6330,8 @@ class WorkflowOrchestrator:
         local_settings_path.write_text(yaml.safe_dump(local_payload, sort_keys=False), encoding="utf-8")
         if not codex_context_path.exists():
             codex_context_path.write_text(PROJECT_CODEX_TEMPLATE, encoding="utf-8")
+        if not resume_context_path.exists():
+            resume_context_path.write_text(PROJECT_RESUME_TEMPLATE, encoding="utf-8")
         return base
 
     def _load_project_settings(self) -> dict[str, Any]:
@@ -6321,6 +6352,14 @@ class WorkflowOrchestrator:
             return ""
         return content
 
+    def _load_project_resume_context(self) -> str:
+        if not self.project_resume_context_path.exists():
+            return ""
+        content = self.project_resume_context_path.read_text(encoding="utf-8").strip()
+        if not content or content == PROJECT_RESUME_TEMPLATE.strip():
+            return ""
+        return content
+
     def _save_project_settings(self) -> None:
         self.project_settings_path.write_text(yaml.safe_dump(self.project_settings, sort_keys=False), encoding="utf-8")
 
@@ -6331,6 +6370,19 @@ class WorkflowOrchestrator:
         summary = (
             "Shared Codex project context synced via git. "
             "Treat it as durable project memory that applies across machines.\n"
+            f"{context}"
+        )
+        if len(summary) <= limit:
+            return summary
+        return summary[:limit].rstrip()
+
+    def _build_project_resume_context_summary(self, limit: int = 2600) -> str:
+        context = str(self.project_resume_context or "").strip()
+        if not context:
+            return ""
+        summary = (
+            "Shared resume handoff synced via git. "
+            "Use it to continue from the latest known project checkpoint across machines.\n"
             f"{context}"
         )
         if len(summary) <= limit:
@@ -6361,6 +6413,31 @@ class WorkflowOrchestrator:
             self.project_codex_context = self._load_project_codex_context()
         except Exception as exc:
             self.logger.warning(f"Unable to persist project Codex context automatically: {exc}")
+
+    def _persist_project_resume_context(self) -> None:
+        try:
+            auto_block = self._build_project_resume_auto_block()
+            existing = (
+                self.project_resume_context_path.read_text(encoding="utf-8")
+                if self.project_resume_context_path.exists()
+                else PROJECT_RESUME_TEMPLATE
+            )
+            start = existing.find(PROJECT_RESUME_AUTO_START)
+            end = existing.find(PROJECT_RESUME_AUTO_END)
+            if start != -1 and end != -1 and end > start:
+                updated = (
+                    existing[:start].rstrip()
+                    + "\n\n"
+                    + auto_block
+                    + "\n"
+                    + existing[end + len(PROJECT_RESUME_AUTO_END):].lstrip()
+                ).rstrip() + "\n"
+            else:
+                updated = existing.rstrip() + "\n\n" + auto_block + "\n"
+            self.project_resume_context_path.write_text(updated, encoding="utf-8")
+            self.project_resume_context = self._load_project_resume_context()
+        except Exception as exc:
+            self.logger.warning(f"Unable to persist project resume context automatically: {exc}")
 
     def _build_project_codex_auto_block(self) -> str:
         reports = self.logger._load_agent_reports()
@@ -6416,6 +6493,126 @@ class WorkflowOrchestrator:
         lines.append(PROJECT_CODEX_AUTO_END)
         return "\n".join(lines)
 
+    def _build_project_resume_auto_block(self) -> str:
+        reports = self.logger._load_agent_reports()
+        run_summary_path = self.logger.save_run_summary()
+        run_summary = json.loads(run_summary_path.read_text(encoding="utf-8")) if run_summary_path.exists() else {}
+        last_report = reports[-1] if reports else {}
+        last_agent = str(last_report.get("agent_name") or "").strip() or "none"
+        last_phase = str(last_report.get("phase") or "").strip() or "none"
+        last_status = str(last_report.get("status") or "").strip() or "none"
+        next_step = self._build_resume_next_step_hint(run_summary=run_summary, reports=reports)
+        lines = [
+            PROJECT_RESUME_AUTO_START,
+            "## Resume Checkpoint",
+            "",
+            f"- updated_at: {datetime.now().isoformat(timespec='seconds')}",
+            f"- last_run_id: {self.logger.run_dir.name}",
+            f"- last_phase: {last_phase}",
+            f"- last_agent: {last_agent}",
+            f"- last_status: {last_status}",
+            f"- next_step: {next_step}",
+        ]
+        if self.saved_user_goal:
+            lines.extend(["", "### User Goal", "", self.saved_user_goal])
+        task_lines = self._build_resume_selected_task_lines()
+        if task_lines:
+            lines.extend(["", "### Current Task", ""])
+            lines.extend(task_lines)
+        failure_lines = self._build_resume_failure_lines(reports)
+        if failure_lines:
+            lines.extend(["", "### Attention", ""])
+            lines.extend(failure_lines)
+        handoff_lines = self._build_resume_handoff_lines()
+        if handoff_lines:
+            lines.extend(["", "### Latest Handoffs", ""])
+            lines.extend(handoff_lines)
+        lines.append(PROJECT_RESUME_AUTO_END)
+        return "\n".join(lines)
+
+    def _build_resume_next_step_hint(self, *, run_summary: dict[str, Any], reports: list[dict[str, Any]]) -> str:
+        failed_agents = int(run_summary.get("failed_agents") or 0)
+        if failed_agents > 0 and reports:
+            failed = next((report for report in reversed(reports) if str(report.get("status") or "") != "success"), {})
+            failed_agent = str(failed.get("agent_name") or failed.get("agent") or "").strip()
+            failed_result = " ".join(str(failed.get("result") or "").split())
+            if failed_agent and failed_result:
+                return f"Inspect failed agent {failed_agent}: {failed_result[:220]}"
+            if failed_agent:
+                return f"Inspect failed agent {failed_agent} before continuing."
+        if self._selected_implementation_item:
+            task_id = str(self._selected_implementation_item.get("id") or "").strip()
+            scope = " ".join(str(self._selected_implementation_item.get("scope") or "").split())
+            if task_id and scope:
+                return f"Continue implementation task {task_id}: {scope[:220]}"
+            if task_id:
+                return f"Continue implementation task {task_id}."
+        completed_tasks = self._completed_implementation_task_ids()
+        if completed_tasks:
+            return "Resume from the next uncompleted implementation task or start deployment if implementation is done."
+        research_summaries = self._load_research_handoff_summaries()
+        if research_summaries:
+            return "Use the latest research handoffs to start or continue implementation."
+        return "Review the latest repo state and choose the next phase."
+
+    def _build_resume_selected_task_lines(self) -> list[str]:
+        item = dict(self._selected_implementation_item or {})
+        if not item:
+            report, _source = self._load_latest_implementation_report_with_selected_task()
+            if report:
+                item = dict(report.get("selected_task_contract") or {})
+                if not item:
+                    item = {
+                        "id": report.get("selected_task_id"),
+                        "scope": report.get("selected_task_scope"),
+                        "allowed_paths": report.get("selected_task_allowed_paths") or [],
+                    }
+        task_id = str(item.get("id") or "").strip()
+        scope = " ".join(str(item.get("scope") or "").split())
+        allowed_paths = [str(path).strip() for path in (item.get("allowed_paths") or []) if str(path).strip()]
+        lines: list[str] = []
+        if task_id:
+            lines.append(f"- id: {task_id}")
+        if scope:
+            lines.append(f"- scope: {scope[:300]}")
+        if allowed_paths:
+            lines.append(f"- allowed_paths: {', '.join(allowed_paths[:6])}")
+        return lines
+
+    @staticmethod
+    def _build_resume_failure_lines(reports: list[dict[str, Any]]) -> list[str]:
+        failed = [report for report in reports if str(report.get("status") or "") != "success"]
+        lines: list[str] = []
+        for report in failed[-3:]:
+            agent_name = str(report.get("agent_name") or report.get("agent") or "").strip() or "agent"
+            result = " ".join(str(report.get("result") or "").split())
+            status = str(report.get("status") or "").strip() or "failed"
+            if result:
+                lines.append(f"- {agent_name} [{status}]: {result[:240]}")
+            else:
+                lines.append(f"- {agent_name} [{status}]")
+        return lines
+
+    def _build_resume_handoff_lines(self) -> list[str]:
+        lines: list[str] = []
+        for summary in self._load_research_handoff_summaries()[:4]:
+            handoff_text = str(summary.get("handoff_summary") or "").strip()
+            sections = self._extract_handoff_sections(handoff_text)
+            finding = next(
+                (
+                    item
+                    for item in (sections.get("findings") or [])
+                    if not str(item).strip().lower().startswith("agent:")
+                ),
+                "",
+            )
+            recommendation = next(iter(sections.get("recommended_next_tasks") or []), "")
+            compact = finding or recommendation or (handoff_text.splitlines()[0] if handoff_text else "")
+            compact = " ".join(str(compact).split())
+            if compact:
+                lines.append(f"- {summary.get('agent_name')}: {compact[:240]}")
+        return lines
+
     def _set_user_goal(self, goal: str) -> None:
         normalized = str(goal or "").strip()
         self.user_goal = normalized
@@ -6467,6 +6664,7 @@ class WorkflowOrchestrator:
         self.logger.info(f"Startup diagnostic: project_settings_path={self.project_settings_path}")
         self.logger.info(f"Startup diagnostic: project_local_settings_path={self.project_local_settings_path}")
         self.logger.info(f"Startup diagnostic: project_codex_context_path={self.project_codex_context_path}")
+        self.logger.info(f"Startup diagnostic: project_resume_context_path={self.project_resume_context_path}")
         self.logger.info(f"Startup diagnostic: context_mode={self.context_mode}")
         self.logger.info(f"Startup diagnostic: repository_context_root={self.repository_context_root}")
         self.logger.info(f"Startup diagnostic: retrieval_root={self.retrieval_root}")
