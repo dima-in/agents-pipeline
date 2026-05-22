@@ -2,15 +2,21 @@
 
 Add temporary handoff notes here if needed. This file is auto-loaded on every run across machines.
 
+Manual handoff:
+- current work is on making implementation retries actually useful for `ai_getaway` task repair
+- on a failed developer attempt, inspect `.openclaw/feedback/github.com-dima-in-ai_getaway/<run_id>/attempt_<n>/developer.md`
+- on a failed QA attempt, inspect the matching `qa.md`
+- next developer retry should include a `Previous validation feedback to repair:` block in its prompt when feedback exists
+
 <!-- AUTO-GENERATED:RESUME-CONTEXT START -->
 ## Resume Checkpoint
 
-- updated_at: 2026-05-21T18:04:00
-- last_run_id: run_20260521_175633
+- updated_at: 2026-05-22T11:33:25
+- last_run_id: run_20260522_105421
 - last_phase: implementation
 - last_agent: task-designer
 - last_status: success
-- next_step: Inspect failed agent developer: Developer completed without modifying target files. Return status=no_changes or make a scoped file edit.
+- next_step: Inspect failed agent developer-checks: developer deterministic checks failed
 
 ### Current Task
 
@@ -21,5 +27,4 @@ Add temporary handoff notes here if needed. This file is auto-loaded on every ru
 ### Attention
 
 - developer-checks [failed]: developer deterministic checks failed
-- developer [no_changes]: Developer completed without modifying target files. Return status=no_changes or make a scoped file edit.
 <!-- AUTO-GENERATED:RESUME-CONTEXT END -->

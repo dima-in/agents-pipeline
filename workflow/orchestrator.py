@@ -591,6 +591,7 @@ class WorkflowOrchestrator:
         self.logger.agent_progress(agent_name, f"Diagnostic contract_compliance={message_bundle['contract_compliance']}")
         self.logger.agent_progress(agent_name, f"Diagnostic missing_must_contain={message_bundle['missing_must_contain']}")
         self.logger.agent_progress(agent_name, f"Diagnostic missing_test_file={message_bundle['missing_test_file']}")
+        self._log_operator_summary("Prompt brief (RU)", self._build_prompt_brief_lines(agent_name, phase, message_bundle))
 
         def save_agent_report(
             status: str,
@@ -1528,6 +1529,7 @@ class WorkflowOrchestrator:
             "repo_map_file_count": repo_map_file_count if phase == "implementation" else 0,
             "repo_map_directory_count": repo_map_directory_count if phase == "implementation" else 0,
             "developer_feedback_source": developer_feedback_source if phase == "implementation" else "",
+            "developer_feedback_text": developer_feedback_text if phase == "implementation" else "",
             "developer_feedback_chars": developer_feedback_chars if phase == "implementation" else 0,
             "contract_completeness": contract_completeness if phase == "implementation" else False,
             "contract_compliance": contract_compliance if phase == "implementation" else False,
@@ -2748,6 +2750,62 @@ class WorkflowOrchestrator:
             "or 3) return exactly status=no_changes: <concrete reason>."
         )
 
+    def _log_operator_summary(self, title: str, lines: list[str]) -> None:
+        filtered = [str(line).strip() for line in lines if str(line).strip()]
+        if not filtered:
+            return
+        self.logger.info(title)
+        for line in filtered:
+            self.logger.info(f"  - {line}")
+
+    def _build_prompt_brief_lines(self, agent_name: str, phase: str, message_bundle: dict[str, Any]) -> list[str]:
+        lines = [
+            f"фаза={phase}",
+            f"агент={agent_name}",
+        ]
+        user_task = str(message_bundle.get("user_message") or "").strip()
+        if user_task:
+            lines.append(f"задача={user_task}")
+        selected_task_id = str(message_bundle.get("selected_task_id") or "").strip()
+        if selected_task_id:
+            lines.append(f"implementation_task={selected_task_id}")
+        selected_task_scope = str(message_bundle.get("selected_task_scope") or "").strip()
+        if selected_task_scope:
+            lines.append(f"scope={selected_task_scope}")
+        allowed_paths = list(message_bundle.get("selected_task_allowed_paths") or [])
+        if allowed_paths:
+            preview = ", ".join(str(path) for path in allowed_paths[:4])
+            if len(allowed_paths) > 4:
+                preview += f" ... (+{len(allowed_paths) - 4})"
+            lines.append(f"allowed_paths={preview}")
+        if message_bundle.get("retrieval_enabled"):
+            lines.append("retrieval=enabled")
+        else:
+            lines.append("retrieval=disabled")
+        developer_feedback_source = str(message_bundle.get("developer_feedback_source") or "").strip()
+        developer_feedback_chars = int(message_bundle.get("developer_feedback_chars") or 0)
+        if developer_feedback_source:
+            lines.append(f"repair_feedback_injected=yes")
+            lines.append(f"repair_feedback_source={developer_feedback_source}")
+            lines.append(f"repair_feedback_chars={developer_feedback_chars}")
+        else:
+            lines.append("repair_feedback_injected=no")
+        prompt_sections = ["base_prompt"]
+        if message_bundle.get("repository_context_chars"):
+            prompt_sections.append("repo_context")
+        if message_bundle.get("previous_context"):
+            prompt_sections.append("previous_agent_context")
+        if developer_feedback_source:
+            prompt_sections.append("repair_feedback")
+        if phase == "implementation":
+            prompt_sections.append("scope_instruction")
+        prompt_sections.append("translation_instruction")
+        lines.append("prompt_sections=" + ", ".join(prompt_sections))
+        return lines
+
+    def _log_retry_outcome_summary(self, title: str, lines: list[str]) -> None:
+        self._log_operator_summary(title, lines)
+
     def _direct_api_read_files(self, paths: list[str], limit: int = 8000) -> str:
         chunks: list[str] = []
         total = 0
@@ -3016,8 +3074,18 @@ class WorkflowOrchestrator:
                 f"timeout_s={timeout}"
             ),
         )
-        self.logger.agent_progress(agent_name, "Full prompt message:")
-        for line in str(message_bundle["combined_message"]).splitlines():
+        developer_feedback_text = str(message_bundle.get("developer_feedback_text") or "").strip()
+        if developer_feedback_text:
+            self.logger.agent_progress(agent_name, "Developer repair feedback:")
+            for line in developer_feedback_text.splitlines():
+                self.logger.agent_progress(agent_name, line)
+            self.logger.agent_progress(agent_name, "")
+        self.logger.agent_progress(agent_name, "System prompt (raw):")
+        for line in str(message_bundle["system_message"]).splitlines():
+            self.logger.agent_progress(agent_name, line)
+        self.logger.agent_progress(agent_name, "")
+        self.logger.agent_progress(agent_name, "User task (raw):")
+        for line in str(message_bundle["user_message"]).splitlines():
             self.logger.agent_progress(agent_name, line)
         self.logger.agent_progress(agent_name, "")
         self.logger.agent_progress(agent_name, "Waiting for direct_api response...")
@@ -3272,6 +3340,14 @@ class WorkflowOrchestrator:
                 save_agent_report("qa_failed", result, elapsed, stdout, "", parsed_output, command, 0)
                 self.logger.agent_end(agent_name, "qa_failed", result)
                 self._phase_failure_status = "qa_failed"
+                self._log_retry_outcome_summary(
+                    "Human summary (RU)",
+                    [
+                        "QA нашёл регрессии или несоответствия контракту.",
+                        "Следующий шаг: сформировать repair-feedback и вернуть задачу в developer.",
+                        "Подробности смотри в сохранённом qa.md и в следующем developer feedback.",
+                    ],
+                )
                 return False
 
         if phase == "implementation" and agent_name == "developer":
@@ -3881,6 +3957,14 @@ class WorkflowOrchestrator:
         self._implementation_retry_from_agent = "developer"
         self._phase_failure_status = "developer_checks_failed"
         self.logger.error("Developer no_changes claim failed deterministic validation", parsed_output)
+        self._log_retry_outcome_summary(
+            "Human summary (RU)",
+            [
+                "developer заявил, что правки не нужны, но детерминированная проверка это опровергла.",
+                "Что сломалось: " + (findings[0] if findings else "см. feedback файл"),
+                f"Следующий шаг: retry developer с feedback из {feedback_file}",
+            ],
+        )
         return False
 
     def _enforce_implementation_scope_diff(self) -> bool:
@@ -6507,6 +6591,14 @@ class WorkflowOrchestrator:
             self._implementation_retry_from_agent = "developer"
             self._phase_failure_status = "developer_checks_failed"
             self.logger.error("Developer deterministic checks failed", parsed_output)
+            self._log_retry_outcome_summary(
+                "Human summary (RU)",
+                [
+                    "developer внёс правки, но автоматические проверки не пропустили результат.",
+                    "Что сломалось: " + (findings[0] if findings else "см. feedback файл"),
+                    f"Следующий шаг: retry developer с feedback из {feedback_file}",
+                ],
+            )
             return False
 
         self._save_developer_checks_report("success", "developer deterministic checks passed", "developer deterministic checks passed")
