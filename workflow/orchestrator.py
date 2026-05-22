@@ -562,8 +562,6 @@ class WorkflowOrchestrator:
         self.logger.agent_progress(agent_name, f"Diagnostic planner_missing_tests={message_bundle['planner_missing_tests']}")
         self.logger.agent_progress(agent_name, f"Diagnostic planner_conflicting_forbidden_paths={message_bundle['planner_conflicting_forbidden_paths']}")
         self.logger.agent_progress(agent_name, f"Diagnostic generic_root_dirs_rejected={message_bundle['generic_root_dirs_rejected']}")
-        self.logger.agent_progress(agent_name, f"Diagnostic planner_dependency_graph={message_bundle['planner_dependency_graph']}")
-        self.logger.agent_progress(agent_name, f"Diagnostic planner_future_known_paths={message_bundle['planner_future_known_paths']}")
         self.logger.agent_progress(agent_name, f"Diagnostic planner_dependency_validation_errors={message_bundle['planner_dependency_validation_errors']}")
         self.logger.agent_progress(agent_name, f"Diagnostic planner_rejection_reason={message_bundle['planner_rejection_reason']}")
         self.logger.agent_progress(agent_name, f"Diagnostic planner_feedback_file={message_bundle['planner_feedback_file']}")
@@ -591,6 +589,10 @@ class WorkflowOrchestrator:
         self.logger.agent_progress(agent_name, f"Diagnostic contract_compliance={message_bundle['contract_compliance']}")
         self.logger.agent_progress(agent_name, f"Diagnostic missing_must_contain={message_bundle['missing_must_contain']}")
         self.logger.agent_progress(agent_name, f"Diagnostic missing_test_file={message_bundle['missing_test_file']}")
+        if message_bundle["planner_dependency_graph"]:
+            self.logger.info("Diagnostic planner_dependency_graph=%s", message_bundle["planner_dependency_graph"])
+        if message_bundle["planner_future_known_paths"]:
+            self.logger.info("Diagnostic planner_future_known_paths=%s", message_bundle["planner_future_known_paths"])
         self._log_operator_summary("Prompt brief (RU)", self._build_prompt_brief_lines(agent_name, phase, message_bundle))
 
         def save_agent_report(
@@ -619,6 +621,9 @@ class WorkflowOrchestrator:
                     "runtime": agent_runtime,
                     "command": command,
                     "message": message,
+                    "system_message": message_bundle["system_message"],
+                    "user_message": message_bundle["user_message"],
+                    "developer_feedback_text": message_bundle.get("developer_feedback_text", ""),
                     "prompt_stats": prompt_stats,
                     "context_profile": message_bundle["context_profile"],
                     "repository_context_chars": message_bundle["repository_context_chars"],
@@ -2806,6 +2811,18 @@ class WorkflowOrchestrator:
     def _log_retry_outcome_summary(self, title: str, lines: list[str]) -> None:
         self._log_operator_summary(title, lines)
 
+    @staticmethod
+    def _is_compact_console_prompt_mode(agent_name: str, phase: str) -> bool:
+        return phase == "implementation" and agent_name == "developer"
+
+    @staticmethod
+    def _build_prompt_preview_lines(text: str, limit: int = 24) -> list[str]:
+        lines = str(text or "").splitlines()
+        if len(lines) <= limit:
+            return lines
+        remaining = len(lines) - limit
+        return [*lines[:limit], f"... [truncated {remaining} lines; full prompt is saved in agent report]"]
+
     def _direct_api_read_files(self, paths: list[str], limit: int = 8000) -> str:
         chunks: list[str] = []
         total = 0
@@ -3075,15 +3092,20 @@ class WorkflowOrchestrator:
             ),
         )
         developer_feedback_text = str(message_bundle.get("developer_feedback_text") or "").strip()
+        compact_console_prompt = self._is_compact_console_prompt_mode(agent_name, phase)
         if developer_feedback_text:
             self.logger.agent_progress(agent_name, "Developer repair feedback:")
-            for line in developer_feedback_text.splitlines():
+            feedback_lines = self._build_prompt_preview_lines(developer_feedback_text, limit=18) if compact_console_prompt else developer_feedback_text.splitlines()
+            for line in feedback_lines:
                 self.logger.agent_progress(agent_name, line)
             self.logger.agent_progress(agent_name, "")
-        self.logger.agent_progress(agent_name, "System prompt (raw):")
-        for line in str(message_bundle["system_message"]).splitlines():
-            self.logger.agent_progress(agent_name, line)
-        self.logger.agent_progress(agent_name, "")
+        if compact_console_prompt:
+            self.logger.agent_progress(agent_name, "System prompt (raw) saved in agent report file.")
+        else:
+            self.logger.agent_progress(agent_name, "System prompt (raw):")
+            for line in str(message_bundle["system_message"]).splitlines():
+                self.logger.agent_progress(agent_name, line)
+            self.logger.agent_progress(agent_name, "")
         self.logger.agent_progress(agent_name, "User task (raw):")
         for line in str(message_bundle["user_message"]).splitlines():
             self.logger.agent_progress(agent_name, line)
