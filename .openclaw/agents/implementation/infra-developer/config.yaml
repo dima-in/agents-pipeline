@@ -1,0 +1,4 @@
+name: infra-developer
+phase: implementation
+description: "Write migrations/config/infra files only and return JSON operations"
+

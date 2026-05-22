@@ -110,6 +110,26 @@ phases:
 
   implementation:
     name: "Implementation"
+    execution_mode: single_developer
+    multi_developer_agents:
+      - name: code-developer
+        description: "Write application code only"
+        timeout: 1800
+        provider: openrouter
+        model: openrouter/anthropic/claude-sonnet-4.5
+        thinking: low
+      - name: infra-developer
+        description: "Write migrations and config only"
+        timeout: 1800
+        provider: openrouter
+        model: openrouter/anthropic/claude-sonnet-4.5
+        thinking: low
+      - name: test-developer
+        description: "Write pytest tests only"
+        timeout: 1200
+        provider: openrouter
+        model: openrouter/anthropic/claude-3.5-haiku
+        thinking: low
     agents:
       - name: architect
         description: "Prepare technical plan"

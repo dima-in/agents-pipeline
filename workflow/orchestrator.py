@@ -24,6 +24,9 @@ import yaml
 
 from tools.repo_map import compare_repo_maps, generate_repo_map, validate_agent_paths
 from workflow.logger import WorkflowLogger
+from workflow.multi_developer_applier import apply_operations
+from workflow.multi_developer_constraints import parse_and_validate
+from workflow.multi_developer_dispatcher import route_paths
 from workflow.runtime import has_provider_credentials, load_runtime_config, required_key_env, resolve_runner_path
 
 PROJECT_CODEX_TEMPLATE = (
@@ -439,10 +442,16 @@ class WorkflowOrchestrator:
                 if not self._enforce_implementation_scope_plan():
                     had_failures = True
                     return False
-            if not self._run_agent(agent, phase_key, index=index, total=total):
-                had_failures = True
-                if fail_fast:
-                    return False
+            if phase_key == "implementation" and agent["name"] == "developer" and self._get_implementation_execution_mode() == "multi_developer_json":
+                if not self._run_multi_developer_json_flow(phase, index=index, total=total):
+                    had_failures = True
+                    if fail_fast:
+                        return False
+            else:
+                if not self._run_agent(agent, phase_key, index=index, total=total):
+                    had_failures = True
+                    if fail_fast:
+                        return False
             if phase_key == "implementation" and agent["name"] == "implementation-planner":
                 if not self._validate_or_repair_implementation_planner(agent, phase_key, index=index, total=total):
                     had_failures = True
@@ -464,6 +473,117 @@ class WorkflowOrchestrator:
                 had_failures = True
                 break
         return not had_failures
+
+    def _get_implementation_execution_mode(self) -> str:
+        implementation = self.config.get("phases", {}).get("implementation", {})
+        return str(implementation.get("execution_mode") or "single_developer").strip().lower()
+
+    def _get_multi_developer_agent_configs(self) -> dict[str, dict[str, Any]]:
+        implementation = self.config.get("phases", {}).get("implementation", {})
+        configs: dict[str, dict[str, Any]] = {}
+        for item in implementation.get("multi_developer_agents", []) or []:
+            name = str(item.get("name") or "").strip()
+            if name:
+                configs[name] = dict(item)
+        return configs
+
+    def _build_multi_developer_allowed_paths(self) -> list[str]:
+        item = self._selected_implementation_item or {}
+        paths: list[str] = []
+        for key in ("allowed_paths", "existing_paths", "new_files"):
+            for path in item.get(key, []) or []:
+                normalized = self._normalize_repo_relative_path(path)
+                if normalized:
+                    paths.append(normalized)
+        target_file = item.get("target_file") or {}
+        test_file = item.get("test_file") or {}
+        for candidate in (target_file, test_file):
+            if isinstance(candidate, dict):
+                normalized = self._normalize_repo_relative_path(candidate.get("path"))
+                if normalized:
+                    paths.append(normalized)
+        return sorted(dict.fromkeys(paths))
+
+    def _save_multi_developer_synthetic_report(self, applied_agents: list[str], changed_paths: list[str], warnings: list[str]) -> None:
+        parsed_lines = [
+            "status=implemented",
+            "execution_mode=multi_developer_json",
+            "applied_agents=" + (", ".join(applied_agents) if applied_agents else "none"),
+            "changed_paths=" + (", ".join(changed_paths) if changed_paths else "none"),
+        ]
+        if warnings:
+            parsed_lines.append("warnings=" + " | ".join(warnings))
+        payload = {
+            "phase": "implementation",
+            "agent": "developer",
+            "agent_name": "developer",
+            "status": "success",
+            "result": "completed",
+            "elapsed_s": 0.0,
+            "returncode": 0,
+            "runtime": {"provider": "internal", "model": "multi_developer_json", "thinking": "n/a"},
+            "command": "multi_developer_json",
+            "message": "Synthetic developer report generated from multi_developer_json flow.",
+            "parsed_output": "\n".join(parsed_lines),
+            "developer_changed_files": changed_paths,
+            "developer_diff_lines": 0,
+            "write_tools_used": ["multi_developer_json"],
+            "no_changes_detected": not bool(changed_paths),
+        }
+        self.logger.save_agent_report("implementation", "developer", payload)
+
+    def _run_multi_developer_json_flow(self, phase: dict[str, Any], *, index: int, total: int) -> bool:
+        agent_configs = self._get_multi_developer_agent_configs()
+        allowed_paths = self._build_multi_developer_allowed_paths()
+        routed_agents = route_paths(allowed_paths)
+        if not routed_agents:
+            self.logger.error("multi_developer_json could not route any developer agents", "No allowed_paths were classified.")
+            self._phase_failure_status = "failed"
+            return False
+        self._log_operator_summary(
+            "Multi developer plan (RU)",
+            [
+                f"task={str((self._selected_implementation_item or {}).get('id') or '')}",
+                "agents=" + ", ".join(routed_agents),
+                "allowed_paths=" + ", ".join(allowed_paths[:6]) + (f" ... (+{len(allowed_paths) - 6})" if len(allowed_paths) > 6 else ""),
+            ],
+        )
+        applied_agents: list[str] = []
+        changed_paths: list[str] = []
+        warnings: list[str] = []
+        for routed_name in routed_agents:
+            agent_config = agent_configs.get(routed_name)
+            if not agent_config:
+                self.logger.error(f"multi_developer_json agent config is missing: {routed_name}")
+                self._phase_failure_status = "failed"
+                return False
+            if not self._wait_for_user(f"Запустить агента {routed_name} ({index}/{total})?"):
+                self.logger.warning(f"Агент пропущен: {routed_name}")
+                continue
+            if not self._run_agent(agent_config, "implementation", index=index, total=total):
+                return False
+            report = self._load_saved_agent_report("implementation", routed_name) or {}
+            raw_output = str(report.get("parsed_output") or report.get("stdout") or "").strip()
+            parsed, errors = parse_and_validate(raw_output, allowed_paths, routed_name)
+            if errors:
+                self.logger.error(f"Constraint validation failed for {routed_name}", "\n".join(errors))
+                self._phase_failure_status = "invalid_output"
+                return False
+            operations = list((parsed or {}).get("operations") or [])
+            try:
+                changed = apply_operations(self.target_workspace, operations)
+            except Exception:
+                self.logger.error(f"Failed to apply multi_developer_json operations for {routed_name}", traceback.format_exc())
+                self._phase_failure_status = "failed"
+                return False
+            applied_agents.append(routed_name)
+            changed_paths.extend(changed)
+            for warning in (parsed or {}).get("warnings") or []:
+                warning_text = str(warning).strip()
+                if warning_text:
+                    warnings.append(f"{routed_name}: {warning_text}")
+        self._save_multi_developer_synthetic_report(applied_agents, sorted(dict.fromkeys(changed_paths)), warnings)
+        return True
 
     def _run_agent(self, agent_config: dict[str, Any], phase: str, index: int | None = None, total: int | None = None) -> bool:
         agent_name = agent_config["name"]

@@ -1,0 +1,4 @@
+name: test-developer
+phase: implementation
+description: "Write pytest files only and return JSON operations"
+
