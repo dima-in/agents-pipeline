@@ -2823,6 +2823,16 @@ class WorkflowOrchestrator:
         remaining = len(lines) - limit
         return [*lines[:limit], f"... [truncated {remaining} lines; full prompt is saved in agent report]"]
 
+    @staticmethod
+    def _build_feedback_preview_lines(text: str, limit: int = 18) -> list[str]:
+        lines = [line.rstrip() for line in str(text or "").splitlines()]
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        if len(lines) <= limit:
+            return lines
+        remaining = len(lines) - limit
+        return [*lines[:limit], f"... [truncated {remaining} lines; full feedback is saved in feedback file]"]
+
     def _direct_api_read_files(self, paths: list[str], limit: int = 8000) -> str:
         chunks: list[str] = []
         total = 0
@@ -6402,6 +6412,11 @@ class WorkflowOrchestrator:
         latest_file.write_text(content, encoding="utf-8")
         self.logger.info(f"Diagnostic run_feedback_dir={run_feedback_dir}")
         self.logger.info(f"Diagnostic feedback_file={feedback_file}")
+        preview_lines = self._build_feedback_preview_lines(feedback)
+        if preview_lines:
+            self.logger.info(f"Feedback preview ({agent}):")
+            for line in preview_lines:
+                self.logger.info(f"  {line}")
         self.logger.info(f"Р¤Р°Р№Р» РѕР±СЂР°С‚РЅРѕР№ СЃРІСЏР·Рё СЃРѕС…СЂР°РЅРµРЅ: {feedback_file}")
         return feedback_file
 
