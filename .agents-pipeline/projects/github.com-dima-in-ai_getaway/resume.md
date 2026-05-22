@@ -7,6 +7,7 @@ Manual handoff:
 - on a failed developer attempt, inspect `.openclaw/feedback/github.com-dima-in-ai_getaway/<run_id>/attempt_<n>/developer.md`
 - on a failed QA attempt, inspect the matching `qa.md`
 - next developer retry should include a `Previous validation feedback to repair:` block in its prompt when feedback exists
+- console UX should stay compact: show feedback preview directly in terminal, avoid dumping giant planner dependency objects to screen
 
 <!-- AUTO-GENERATED:RESUME-CONTEXT START -->
 ## Resume Checkpoint

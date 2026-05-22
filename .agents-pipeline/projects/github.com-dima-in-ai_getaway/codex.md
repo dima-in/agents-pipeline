@@ -33,6 +33,7 @@ Implementation pipeline notes:
 - if `developer` claims `status=no_changes` / "already complete", the pipeline runs forced deterministic validation before accepting that claim
 - if `developer` uses forbidden broad retrieval like `list_files` in implementation mode, the next turn includes exact-path repair instructions instead of immediately killing the attempt
 - per-attempt feedback files live under `.openclaw/feedback/<project_id>/<run_id>/attempt_<n>/developer.md` and `qa.md`
+- operator preference: keep console output compact; show prompt brief and feedback preview in console, but keep full heavy prompt/planner internals only in report/log files
 
 <!-- AUTO-GENERATED:RUN-CONTEXT START -->
 ## Auto-updated Run Context
