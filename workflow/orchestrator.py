@@ -590,9 +590,9 @@ class WorkflowOrchestrator:
         self.logger.agent_progress(agent_name, f"Diagnostic missing_must_contain={message_bundle['missing_must_contain']}")
         self.logger.agent_progress(agent_name, f"Diagnostic missing_test_file={message_bundle['missing_test_file']}")
         if message_bundle["planner_dependency_graph"]:
-            self.logger.info("Diagnostic planner_dependency_graph=%s", message_bundle["planner_dependency_graph"])
+            self.logger.info(f"Diagnostic planner_dependency_graph={message_bundle['planner_dependency_graph']}")
         if message_bundle["planner_future_known_paths"]:
-            self.logger.info("Diagnostic planner_future_known_paths=%s", message_bundle["planner_future_known_paths"])
+            self.logger.info(f"Diagnostic planner_future_known_paths={message_bundle['planner_future_known_paths']}")
         self._log_operator_summary("Prompt brief (RU)", self._build_prompt_brief_lines(agent_name, phase, message_bundle))
 
         def save_agent_report(
