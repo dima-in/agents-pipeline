@@ -81,6 +81,7 @@ def _write_minimal_workflow_config(config_path: Path, workspace: str = ".") -> N
                     "enabled": False,
                     "branch_prefix": "feature/",
                     "auto_rollback": True,
+                    "rollback_dirty_strategy": "fail",
                 },
                 "logging": {"level": "INFO", "console": False, "file": False, "json": False},
             },
@@ -104,6 +105,21 @@ def _seed_research_run(log_root: Path, run_id: str, reports: list[dict[str, obje
         }
         (research_dir / f"{agent_name}.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return run_dir
+
+
+def _init_git_repo(workspace: Path, branch: str = "main") -> git.Repo:
+    repo = git.Repo.init(workspace)
+    with repo.config_writer() as writer:
+        writer.set_value("user", "name", "Test")
+        writer.set_value("user", "email", "test@example.com")
+    tracked = workspace / "README.md"
+    tracked.write_text("seed\n", encoding="utf-8")
+    repo.git.add("README.md")
+    repo.index.commit("initial")
+    current_branch = repo.active_branch.name
+    if current_branch != branch:
+        repo.git.branch("-M", branch)
+    return repo
 
 
 def test_config_loads() -> None:
@@ -190,6 +206,78 @@ def test_create_git_branch_reuses_existing_branch_on_rerun(tmp_path: Path) -> No
     assert orchestrator._create_git_branch(1) is True
     assert repo.active_branch.name == "feature/task_1"
     assert orchestrator.current_branch == "feature/task_1"
+
+
+def test_rollback_git_returns_false_on_dirty_worktree_with_fail_strategy(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    repo = _init_git_repo(workspace)
+    repo.git.checkout("-b", "feature/task_1")
+    (workspace / "README.md").write_text("dirty\n", encoding="utf-8")
+
+    config_path = tmp_path / "workflow.yaml"
+    _write_minimal_workflow_config(config_path, workspace=str(workspace))
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    payload["git"]["enabled"] = True
+    config_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    orchestrator = WorkflowOrchestrator(str(config_path))
+    orchestrator.current_branch = "feature/task_1"
+
+    assert orchestrator._rollback_git("attempt failed") is False
+    assert repo.active_branch.name == "feature/task_1"
+    assert orchestrator.current_branch == "feature/task_1"
+    log_text = orchestrator.logger.log_file.read_text(encoding="utf-8")
+    assert "rollback_dirty_worktree=True" in log_text
+    assert "rollback_action=failed" in log_text
+
+
+def test_rollback_git_stashes_dirty_worktree_when_strategy_is_stash(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    repo = _init_git_repo(workspace)
+    repo.git.checkout("-b", "feature/task_1")
+    (workspace / "README.md").write_text("dirty\n", encoding="utf-8")
+    (workspace / "scratch.txt").write_text("temp\n", encoding="utf-8")
+
+    config_path = tmp_path / "workflow.yaml"
+    _write_minimal_workflow_config(config_path, workspace=str(workspace))
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    payload["git"]["enabled"] = True
+    payload["git"]["rollback_dirty_strategy"] = "stash"
+    config_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    orchestrator = WorkflowOrchestrator(str(config_path))
+    orchestrator.current_branch = "feature/task_1"
+    orchestrator._implementation_attempt = 2
+
+    assert orchestrator._rollback_git("attempt failed") is True
+    assert repo.active_branch.name == "main"
+    assert orchestrator.current_branch is None
+    assert repo.is_dirty(untracked_files=True) is False
+    assert "feature/task_1" not in {head.name for head in repo.heads}
+    assert "agents-pipeline rollback safety stash" in repo.git.stash("list")
+
+
+def test_rollback_git_succeeds_on_clean_worktree(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    repo = _init_git_repo(workspace)
+    repo.git.checkout("-b", "feature/task_1")
+
+    config_path = tmp_path / "workflow.yaml"
+    _write_minimal_workflow_config(config_path, workspace=str(workspace))
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    payload["git"]["enabled"] = True
+    config_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    orchestrator = WorkflowOrchestrator(str(config_path))
+    orchestrator.current_branch = "feature/task_1"
+
+    assert orchestrator._rollback_git("attempt failed") is True
+    assert repo.active_branch.name == "main"
+    assert orchestrator.current_branch is None
+    assert "feature/task_1" not in {head.name for head in repo.heads}
 
 
 def test_agent_directories_exist() -> None:
@@ -3513,6 +3601,94 @@ def test_implementation_phase_retries_from_developer_after_qa_failed(tmp_path: P
     assert orchestrator._developer_feedback_file.endswith("developer.md")
 
 
+def test_implementation_phase_stops_when_rollback_fails_after_qa_failure(tmp_path: Path, monkeypatch) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True, exist_ok=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    orchestrator.config["git"]["enabled"] = True
+    orchestrator.config["phases"]["implementation"] = {
+        "name": "Implementation",
+        "max_retries": 3,
+        "agents": [
+            {"name": "developer", "max_retries": 3},
+            {"name": "qa"},
+        ],
+    }
+
+    create_branch_calls: list[int] = []
+    run_calls: list[int] = []
+    rollback_reasons: list[str] = []
+
+    monkeypatch.setattr(orchestrator, "_create_git_branch", lambda task_id: create_branch_calls.append(task_id) or True)
+    monkeypatch.setattr(orchestrator, "_load_latest_project_research_reports", lambda: ([{"agent_name": "product-manager"}], None))
+    monkeypatch.setattr(orchestrator, "_refresh_repo_map", lambda snapshot_path=None: True)
+    monkeypatch.setattr(orchestrator, "_load_repo_map", lambda: {"target_workspace": str(target_workspace), "files": [], "directories": []})
+    monkeypatch.setattr(orchestrator, "_prompt_post_implementation_action", lambda: "stop")
+
+    def fake_run_phase_agents(_phase, _phase_key):
+        run_calls.append(orchestrator._implementation_attempt)
+        orchestrator._phase_failure_status = "qa_failed"
+        return False
+
+    monkeypatch.setattr(orchestrator, "_run_phase_agents", fake_run_phase_agents)
+    monkeypatch.setattr(orchestrator, "_rollback_git", lambda reason="": rollback_reasons.append(reason) or False)
+    monkeypatch.setattr(orchestrator, "_capture_developer_retry_feedback", lambda _task_id: None)
+
+    ok = orchestrator._run_implementation_phase()
+
+    assert ok is False
+    assert orchestrator._phase_failure_status == "rollback_failed"
+    assert run_calls == [1]
+    assert create_branch_calls == [1]
+    assert rollback_reasons == ["attempt 1 failed"]
+
+
+def test_implementation_phase_stops_when_rollback_fails_after_fatal_status(tmp_path: Path, monkeypatch) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True, exist_ok=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    orchestrator.config["git"]["enabled"] = True
+    orchestrator.config["phases"]["implementation"] = {
+        "name": "Implementation",
+        "max_retries": 3,
+        "agents": [
+            {"name": "developer", "max_retries": 3},
+        ],
+    }
+
+    create_branch_calls: list[int] = []
+    run_calls: list[int] = []
+    rollback_reasons: list[str] = []
+
+    monkeypatch.setattr(orchestrator, "_create_git_branch", lambda task_id: create_branch_calls.append(task_id) or True)
+    monkeypatch.setattr(orchestrator, "_load_latest_project_research_reports", lambda: ([{"agent_name": "product-manager"}], None))
+    monkeypatch.setattr(orchestrator, "_refresh_repo_map", lambda snapshot_path=None: True)
+    monkeypatch.setattr(orchestrator, "_load_repo_map", lambda: {"target_workspace": str(target_workspace), "files": [], "directories": []})
+    monkeypatch.setattr(orchestrator, "_prompt_post_implementation_action", lambda: "stop")
+
+    def fake_run_phase_agents(_phase, _phase_key):
+        run_calls.append(orchestrator._implementation_attempt)
+        orchestrator._phase_failure_status = "no_changes"
+        return False
+
+    monkeypatch.setattr(orchestrator, "_run_phase_agents", fake_run_phase_agents)
+    monkeypatch.setattr(orchestrator, "_rollback_git", lambda reason="": rollback_reasons.append(reason) or False)
+
+    ok = orchestrator._run_implementation_phase()
+
+    assert ok is False
+    assert orchestrator._phase_failure_status == "rollback_failed"
+    assert run_calls == [1]
+    assert create_branch_calls == [1]
+    assert rollback_reasons == ["no changes"]
+
+
 def test_developer_deterministic_checks_fail_on_python_compile_error(tmp_path: Path, monkeypatch) -> None:
     engine_root = tmp_path / "engine"
     target_workspace = tmp_path / "target"
@@ -3624,6 +3800,79 @@ def test_no_changes_completion_claim_triggers_deterministic_validation(tmp_path:
     assert report["status"] == "failed"
     assert "contract_compliance check failed" in report["parsed_output"]
     assert orchestrator._developer_feedback_file.endswith("developer.md")
+
+
+def test_normalize_planner_task_adds_required_migration_contract_markers(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True, exist_ok=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+
+    raw_item = {
+        "id": "TASK-001",
+        "title": "Add migration",
+        "scope": "backend-only",
+        "existing_paths": ["gateway-v4/app/models.py"],
+        "new_files": ["gateway-v4/alembic/versions/20240801_add_provider_metrics.py"],
+        "allowed_paths": [
+            "gateway-v4/alembic/versions/20240801_add_provider_metrics.py",
+            "gateway-v4/tests/test_provider_metrics_migration.py",
+        ],
+        "required_test_paths": ["gateway-v4/tests/test_provider_metrics_migration.py"],
+        "target_file": {"path": "gateway-v4/alembic/versions/20240801_add_provider_metrics.py", "action": "create", "purpose": "Create migration."},
+        "test_file": {"path": "gateway-v4/tests/test_provider_metrics_migration.py", "action": "create"},
+        "must_contain": ["def upgrade():", "def downgrade():"],
+    }
+
+    normalized, errors = orchestrator._normalize_planner_task(raw_item, item_index=1)
+
+    assert errors == []
+    assert normalized is not None
+    assert 'revision = "<non-empty string>"' in normalized["must_contain"]
+    assert 'down_revision = "0005"' in normalized["must_contain"]
+
+
+def test_prevalidate_current_scope_rejects_forbidden_test_developer_imports(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    test_file = target_workspace / "gateway-v4" / "tests" / "test_provider_metrics_migration.py"
+    test_file.parent.mkdir(parents=True, exist_ok=True)
+    test_file.write_text("import pytest\nimport ast\n", encoding="utf-8")
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    orchestrator._selected_implementation_item = {
+        "id": "TASK-001",
+        "scope": "backend-only",
+        "target_file": {"path": "gateway-v4/tests/test_provider_metrics_migration.py", "action": "update", "purpose": "Static migration test."},
+        "test_file": {"path": "gateway-v4/tests/test_provider_metrics_migration.py", "action": "update"},
+        "must_contain": ["import ast"],
+        "forbidden": [],
+        "contract_completeness": True,
+    }
+
+    ok, detail = orchestrator._prevalidate_current_scope("test-developer")
+
+    assert ok is False
+    assert "forbidden import: pytest" in detail
+
+
+def test_multi_developer_synthetic_report_marks_noop_when_nothing_changed(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True, exist_ok=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+
+    orchestrator._save_multi_developer_synthetic_report(["test-developer"], [], ["test-developer: no-op, already valid"])
+    report = orchestrator._load_saved_agent_report("implementation", "developer") or {}
+
+    assert report["status"] == "no_changes"
+    assert report["result"] == "no-op, already valid"
+    assert str(report["parsed_output"]).startswith("status=no_changes: no-op, already valid")
 
 
 def test_from_agent_developer_reselects_task_when_reused_selection_has_incomplete_dependencies(
@@ -4891,4 +5140,6 @@ def test_task_designer_contract_preserves_overlong_must_contain(tmp_path: Path) 
 
     assert ok is True
     assert orchestrator._selected_implementation_item["contract_source"] == "task-designer"
-    assert len(orchestrator._selected_implementation_item["must_contain"]) == 6
+    assert len(orchestrator._selected_implementation_item["must_contain"]) == 8
+    assert 'revision = "<non-empty string>"' in orchestrator._selected_implementation_item["must_contain"]
+    assert 'down_revision = "0005"' in orchestrator._selected_implementation_item["must_contain"]

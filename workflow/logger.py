@@ -79,6 +79,23 @@ class WorkflowLogger:
         self._console(Fore.WHITE, message)
         self.logger.info("INFO: %s", message)
 
+    def operator_box(self, title: str, lines: list[str] | None = None, *, color: str = "cyan") -> None:
+        palette = {
+            "cyan": Fore.CYAN,
+            "green": Fore.GREEN,
+            "yellow": Fore.YELLOW,
+            "magenta": Fore.MAGENTA,
+            "red": Fore.RED,
+            "white": Fore.WHITE,
+        }
+        selected = palette.get(color, Fore.CYAN)
+        clean_title = str(title or "").strip()
+        self._console(selected + Style.BRIGHT, f"+-- {clean_title}")
+        for line in lines or []:
+            self._console(selected, f"| {line}")
+        self._console(selected + Style.BRIGHT, "+--")
+        self.logger.info("OPERATOR_BOX: %s - %s", clean_title, " | ".join(str(line) for line in (lines or [])))
+
     def warning(self, message: str) -> None:
         self._console(Fore.YELLOW, message)
         self.logger.warning("WARNING: %s", message)
@@ -361,6 +378,14 @@ class WorkflowLogger:
 
     @staticmethod
     def _translate_status(status: str) -> str:
+        fixed_mapping = {
+            "success": "успех",
+            "failed": "ошибка",
+            "rejected": "отклонено",
+            "timeout": "таймаут",
+            "invalid_output": "некорректный вывод",
+        }
+        return fixed_mapping.get(status, status)
         mapping = {
             "success": "успех",
             "failed": "ошибка",
@@ -382,4 +407,14 @@ class WorkflowLogger:
 
     @staticmethod
     def _console(color: str, message: str) -> None:
+        replacements = {
+            "Р¤Р°Р·Р° Р·Р°РІРµСЂС€РµРЅР°": "Фаза завершена",
+            "Р¤Р°Р·Р°": "Фаза",
+            "РђРіРµРЅС‚ Р·Р°РїСѓС‰РµРЅ": "Агент запущен",
+            "РђРіРµРЅС‚ Р·Р°РІРµСЂС€РµРЅ": "Агент завершен",
+            "Р—Р°РґР°С‡Р°": "Задача",
+            "Р РµР·СѓР»СЊС‚Р°С‚": "Результат",
+        }
+        for broken, fixed in replacements.items():
+            message = message.replace(broken, fixed)
         print(color + message + Style.RESET_ALL)

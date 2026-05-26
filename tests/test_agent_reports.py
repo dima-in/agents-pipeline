@@ -2184,6 +2184,77 @@ def test_direct_api_retrieval_parses_tool_call_prefixed_calls() -> None:
     }
 
 
+def test_direct_api_retrieval_parses_markdown_wrapped_apply_patch() -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+
+    payload = orchestrator._parse_direct_api_retrieval_request(
+        "Applying the fix now.\n\n```json\n{\"tool\":\"apply_patch\",\"path\":\"gateway-v4/tests/test_provider_metrics_migration.py\",\"search\":\"old\",\"replace\":\"new\"}\n```"
+    )
+
+    assert payload == {
+        "tool": "apply_patch",
+        "path": "gateway-v4/tests/test_provider_metrics_migration.py",
+        "search": "old",
+        "replace": "new",
+    }
+
+
+def test_direct_api_retrieval_parses_prose_and_escaped_apply_patch() -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+
+    payload = orchestrator._parse_direct_api_retrieval_request(
+        'I will patch the file now. "{\\"tool\\":\\"apply_patch\\",\\"path\\":\\"gateway-v4/tests/test_provider_metrics_migration.py\\",\\"search\\":\\"old\\",\\"replace\\":\\"new\\"}"'
+    )
+
+    assert payload == {
+        "tool": "apply_patch",
+        "path": "gateway-v4/tests/test_provider_metrics_migration.py",
+        "search": "old",
+        "replace": "new",
+    }
+
+
+def test_direct_api_retrieval_returns_tool_batch_when_write_is_mixed_with_reads() -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+
+    payload = orchestrator._parse_direct_api_retrieval_request(
+        'First inspect then patch.\n'
+        '{"tool":"read_file","path":"gateway-v4/tests/test_provider_metrics_migration.py"}\n'
+        '```json\n{"tool":"apply_patch","path":"gateway-v4/tests/test_provider_metrics_migration.py","search":"old","replace":"new"}\n```'
+    )
+
+    assert payload == {
+        "tool": "tool_batch",
+        "requests": [
+            {
+                "tool": "read_file",
+                "path": "gateway-v4/tests/test_provider_metrics_migration.py",
+            },
+            {
+                "tool": "apply_patch",
+                "path": "gateway-v4/tests/test_provider_metrics_migration.py",
+                "search": "old",
+                "replace": "new",
+            },
+        ],
+    }
+
+
+def test_extract_write_operations_finds_apply_patch_inside_mixed_output() -> None:
+    payloads = WorkflowOrchestrator._extract_write_operations(
+        'Done.\n```json\n{"tool":"apply_patch","path":"gateway-v4/tests/test_provider_metrics_migration.py","search":"old","replace":"new"}\n```\nstatus=implemented'
+    )
+
+    assert payloads == [
+        {
+            "tool": "apply_patch",
+            "path": "gateway-v4/tests/test_provider_metrics_migration.py",
+            "search": "old",
+            "replace": "new",
+        }
+    ]
+
+
 def test_direct_api_retrieval_cannot_escape_target_workspace(tmp_path: Path) -> None:
     engine_root = tmp_path / "engine"
     target_workspace = tmp_path / "target"

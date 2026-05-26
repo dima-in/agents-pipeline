@@ -17,6 +17,10 @@ Execution contract:
 - `allowed_paths` is the hard boundary. Do not write outside the selected task contract.
 - Within that boundary, write only the contract `target_file.path` and `test_file.path` for this task.
 - Treat `must_contain`, `must_import`, `integration`, `depends_on`, and `must_test` as binding execution requirements, not suggestions.
+- For Alembic migration targets, the contract `must_contain` list is mandatory and must include:
+  - `revision = "<non-empty string>"`
+  - `down_revision = "<configured default revision>"`
+- Do not treat `down_revision = None` as valid for migrations.
 - Prefer the smallest viable change that satisfies the selected task acceptance criteria.
 - If the task cannot be completed safely within the selected scope, return normal text with `status=no_changes` and a concrete reason.
 - If a safe scoped edit is possible, perform the edit with `write_file` or `apply_patch`.

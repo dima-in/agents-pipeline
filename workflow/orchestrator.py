@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import http.client
 import json
 import os
@@ -24,9 +25,7 @@ import yaml
 
 from tools.repo_map import compare_repo_maps, generate_repo_map, validate_agent_paths
 from workflow.logger import WorkflowLogger
-from workflow.multi_developer_applier import apply_operations
-from workflow.multi_developer_constraints import parse_and_validate
-from workflow.multi_developer_dispatcher import route_paths
+from workflow.multi_developer_dispatcher import filter_paths_for_agent, route_paths
 from workflow.runtime import has_provider_credentials, load_runtime_config, required_key_env, resolve_runner_path
 
 PROJECT_CODEX_TEMPLATE = (
@@ -41,6 +40,9 @@ PROJECT_RESUME_TEMPLATE = (
 )
 PROJECT_RESUME_AUTO_START = "<!-- AUTO-GENERATED:RESUME-CONTEXT START -->"
 PROJECT_RESUME_AUTO_END = "<!-- AUTO-GENERATED:RESUME-CONTEXT END -->"
+DEFAULT_ALEMBIC_DOWN_REVISION = "0005"
+TEST_DEVELOPER_FORBIDDEN_IMPORTS = ("sqlalchemy", "alembic", "pytest")
+TEST_DEVELOPER_ALLOWED_IMPORTS = ("ast", "re", "pathlib", "importlib.util")
 
 
 class WorkflowOrchestrator:
@@ -322,11 +324,17 @@ class WorkflowOrchestrator:
         )
         for attempt in range(1, max_retries + 1):
             self._implementation_attempt = attempt
+            self._phase_failure_status = None
             self.logger.info(f"Попытка реализации {attempt}/{max_retries}")
             ok = self._run_phase_agents(phase, "implementation")
-            if not ok and self._phase_failure_status in {"scope_violation", "no_changes", "planner_invalid", "task_designer_invalid"}:
+            if not ok and self._phase_failure_status in {"scope_violation", "no_changes", "planner_invalid", "task_designer_invalid", "strict_retrieval_blocked"}:
                 if self.config["git"]["enabled"] and self.config["git"]["auto_rollback"]:
-                    self._rollback_git(self._phase_failure_status.replace("_", " "))
+                    if not self._rollback_git(self._phase_failure_status.replace("_", " ")):
+                        self._phase_failure_status = "rollback_failed"
+                        self.logger.error("Rollback failed; stopping to avoid retrying on dirty worktree.")
+                        self.logger.save_phase_summary("implementation", phase["name"])
+                        self.logger.phase_end(phase["name"], self._phase_failure_status)
+                        return False
                 self.logger.save_phase_summary("implementation", phase["name"])
                 self.logger.phase_end(phase["name"], self._phase_failure_status)
                 return False
@@ -353,11 +361,16 @@ class WorkflowOrchestrator:
                 return True
 
             self._save_feedback(task_id, "qa", f"Попытка {attempt} завершилась ошибкой. Проверь логи и исправь регрессии.")
-            if self._phase_failure_status in {"qa_failed", "developer_checks_failed"}:
+            if self._phase_failure_status in {"qa_failed", "developer_checks_failed", "invalid_output"}:
                 self._capture_developer_retry_feedback(task_id)
                 self._implementation_retry_from_agent = "developer"
             if self.config["git"]["enabled"] and self.config["git"]["auto_rollback"]:
-                self._rollback_git(f"attempt {attempt} failed")
+                if not self._rollback_git(f"attempt {attempt} failed"):
+                    self._phase_failure_status = "rollback_failed"
+                    self.logger.error("Rollback failed; stopping to avoid retrying on dirty worktree.")
+                    self.logger.save_phase_summary("implementation", phase["name"])
+                    self.logger.phase_end(phase["name"], self._phase_failure_status)
+                    return False
                 if attempt < max_retries:
                     self._create_git_branch(task_id)
 
@@ -463,6 +476,9 @@ class WorkflowOrchestrator:
                     return False
             if phase_key == "implementation" and agent["name"] == "developer":
                 self._capture_repo_map_after_developer()
+                if self._get_implementation_execution_mode() == "multi_developer_json" and self._phase_failure_status in {"failed", "invalid_output"}:
+                    had_failures = True
+                    return False
                 if not self._enforce_implementation_scope_diff():
                     had_failures = True
                     return False
@@ -487,10 +503,10 @@ class WorkflowOrchestrator:
                 configs[name] = dict(item)
         return configs
 
-    def _build_multi_developer_allowed_paths(self) -> list[str]:
+    def _build_multi_developer_editable_paths(self) -> list[str]:
         item = self._selected_implementation_item or {}
         paths: list[str] = []
-        for key in ("allowed_paths", "existing_paths", "new_files"):
+        for key in ("new_files", "required_test_paths"):
             for path in item.get(key, []) or []:
                 normalized = self._normalize_repo_relative_path(path)
                 if normalized:
@@ -504,9 +520,26 @@ class WorkflowOrchestrator:
                     paths.append(normalized)
         return sorted(dict.fromkeys(paths))
 
+    def _build_multi_developer_task_override(self, agent_name: str, editable_paths: list[str]) -> dict[str, Any]:
+        item = dict(self._selected_implementation_item or {})
+        allowed_paths = filter_paths_for_agent(editable_paths, agent_name)
+        item["allowed_paths"] = list(allowed_paths)
+        for key in ("new_files", "existing_paths", "required_test_paths"):
+            item[key] = [
+                path
+                for path in (item.get(key) or [])
+                if self._normalize_repo_relative_path(path) in allowed_paths
+            ]
+        for key in ("target_file", "test_file"):
+            candidate = item.get(key)
+            if isinstance(candidate, dict):
+                normalized = self._normalize_repo_relative_path(candidate.get("path"))
+                item[key] = dict(candidate) if normalized in allowed_paths else {}
+        return item
+
     def _save_multi_developer_synthetic_report(self, applied_agents: list[str], changed_paths: list[str], warnings: list[str]) -> None:
         parsed_lines = [
-            "status=implemented",
+            "status=implemented" if changed_paths else "status=no_changes: no-op, already valid",
             "execution_mode=multi_developer_json",
             "applied_agents=" + (", ".join(applied_agents) if applied_agents else "none"),
             "changed_paths=" + (", ".join(changed_paths) if changed_paths else "none"),
@@ -517,8 +550,8 @@ class WorkflowOrchestrator:
             "phase": "implementation",
             "agent": "developer",
             "agent_name": "developer",
-            "status": "success",
-            "result": "completed",
+            "status": "success" if changed_paths else "no_changes",
+            "result": "completed" if changed_paths else "no-op, already valid",
             "elapsed_s": 0.0,
             "returncode": 0,
             "runtime": {"provider": "internal", "model": "multi_developer_json", "thinking": "n/a"},
@@ -532,20 +565,173 @@ class WorkflowOrchestrator:
         }
         self.logger.save_agent_report("implementation", "developer", payload)
 
+    def _multi_developer_current_changed_files(self, allowed_paths: list[str]) -> list[str]:
+        diagnostics = self._collect_scope_watchdog_diff_diagnostics()
+        allowed = set(allowed_paths)
+        return sorted(
+            path
+            for path in (diagnostics.get("changed_files") or [])
+            if str(path) in allowed
+        )
+
+    def _build_multi_developer_write_detection(
+        self,
+        allowed_paths: list[str],
+        detected_git_diff_files: list[str],
+        written_paths: list[str],
+        write_tools_used: list[str],
+    ) -> dict[str, Any]:
+        normalized_allowed = sorted(
+            {
+                self._normalize_target_relative_path(path)
+                for path in allowed_paths
+                if self._normalize_target_relative_path(path)
+            }
+        )
+        normalized_diff = sorted(
+            {
+                self._normalize_target_relative_path(path)
+                for path in detected_git_diff_files
+                if self._normalize_target_relative_path(path)
+            }
+        )
+        normalized_written = sorted(
+            {
+                self._normalize_target_relative_path(path)
+                for path in written_paths
+                if self._normalize_target_relative_path(path)
+            }
+        )
+        allowed = set(normalized_allowed)
+        scoped_diff = sorted(path for path in normalized_diff if path in allowed)
+        scoped_written = sorted(path for path in normalized_written if path in allowed)
+        actual_changed = sorted(dict.fromkeys([*scoped_diff, *scoped_written]))
+        write_operation_detected = bool(write_tools_used or scoped_written)
+        if scoped_written:
+            stage = "write_tool"
+        elif scoped_diff:
+            stage = "git_diff"
+        else:
+            stage = "none"
+        return {
+            "actual_changed_files": actual_changed,
+            "detected_git_diff_files": normalized_diff,
+            "normalized_allowed_paths": normalized_allowed,
+            "normalized_written_paths": normalized_written,
+            "scoped_path_match_result": bool(actual_changed),
+            "diff_detection_stage": stage,
+            "write_operation_detected": write_operation_detected,
+            "write_tools_used": list(write_tools_used),
+        }
+
+    def _recover_multi_developer_write_metadata(self, agent_report: dict[str, Any]) -> tuple[list[str], list[str]]:
+        sources = [
+            str(agent_report.get("parsed_output") or ""),
+            str(agent_report.get("stdout") or ""),
+            str(agent_report.get("result") or ""),
+        ]
+        recovered_tools: list[str] = []
+        recovered_paths: list[str] = []
+        for source in sources:
+            if not source.strip():
+                continue
+            for payload in self._extract_write_operations(source):
+                tool = str(payload.get("tool") or "").strip()
+                raw_path = str(payload.get("path") or "")
+                sanitized_path = (
+                    raw_path.replace("\t", "/t")
+                    .replace("\r", "/r")
+                    .replace("\n", "/n")
+                    .replace("\f", "/f")
+                    .replace("\v", "/v")
+                )
+                path = self._normalize_repo_relative_path(
+                    self._normalize_target_relative_path(sanitized_path)
+                )
+                if tool:
+                    recovered_tools.append(tool)
+                if path:
+                    recovered_paths.append(path)
+        return (
+            sorted(dict.fromkeys(recovered_tools)),
+            sorted(dict.fromkeys(recovered_paths)),
+        )
+
+    def _validate_multi_developer_no_changes(
+        self,
+        agent_name: str,
+        scoped_item: dict[str, Any],
+        allowed_paths: list[str],
+        parsed_output: str,
+    ) -> tuple[bool, str]:
+        if "status=no_changes" not in str(parsed_output or "").lower():
+            return False, "agent did not write and did not return status=no_changes"
+
+        findings: list[str] = []
+        existing_paths: list[str] = []
+        for path in allowed_paths:
+            normalized = self._normalize_repo_relative_path(path)
+            candidate = self.target_workspace / normalized
+            if not normalized or not candidate.exists() or not candidate.is_file():
+                findings.append(f"{normalized or path}: scoped file is missing")
+            else:
+                existing_paths.append(normalized)
+
+        py_paths = [path for path in existing_paths if path.endswith(".py")]
+        if py_paths:
+            returncode, stdout, stderr = self._run_local_command(
+                [sys.executable, "-m", "py_compile", *py_paths],
+                timeout=30,
+                cwd=self.target_workspace,
+            )
+            if returncode != 0:
+                findings.append("py_compile failed for scoped files")
+                findings.append(stderr or stdout or "unknown py_compile failure")
+
+        if agent_name == "infra-developer":
+            findings.extend(self._validate_changed_migration_files(py_paths))
+
+        target_file = scoped_item.get("target_file") or {}
+        target_path = self._normalize_repo_relative_path(target_file.get("path")) if isinstance(target_file, dict) else ""
+        if target_path:
+            target_candidate = self.target_workspace / target_path
+            try:
+                target_text = target_candidate.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                target_text = ""
+            for value in [str(item).strip() for item in (scoped_item.get("must_contain") or []) if str(item).strip()]:
+                if not self._contract_requirement_present(target_text, value):
+                    findings.append(f"{target_path}: missing must_contain: {value}")
+
+        forbidden = [str(item).strip() for item in (scoped_item.get("forbidden") or []) if str(item).strip()]
+        if forbidden:
+            for path in existing_paths:
+                try:
+                    text = (self.target_workspace / path).read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    text = ""
+                for value in forbidden:
+                    if value in text:
+                        findings.append(f"{path}: forbidden content present: {value}")
+
+        if findings:
+            return False, "; ".join(findings)
+        return True, "status=no_changes accepted after scoped deterministic validation"
+
     def _run_multi_developer_json_flow(self, phase: dict[str, Any], *, index: int, total: int) -> bool:
         agent_configs = self._get_multi_developer_agent_configs()
-        allowed_paths = self._build_multi_developer_allowed_paths()
-        routed_agents = route_paths(allowed_paths)
+        editable_paths = self._build_multi_developer_editable_paths()
+        routed_agents = route_paths(editable_paths)
         if not routed_agents:
             self.logger.error("multi_developer_json could not route any developer agents", "No allowed_paths were classified.")
             self._phase_failure_status = "failed"
             return False
         self._log_operator_summary(
-            "Multi developer plan (RU)",
+            "План multi-developer",
             [
                 f"task={str((self._selected_implementation_item or {}).get('id') or '')}",
                 "agents=" + ", ".join(routed_agents),
-                "allowed_paths=" + ", ".join(allowed_paths[:6]) + (f" ... (+{len(allowed_paths) - 6})" if len(allowed_paths) > 6 else ""),
+                "editable_paths=" + ", ".join(editable_paths[:6]) + (f" ... (+{len(editable_paths) - 6})" if len(editable_paths) > 6 else ""),
             ],
         )
         applied_agents: list[str] = []
@@ -557,32 +743,99 @@ class WorkflowOrchestrator:
                 self.logger.error(f"multi_developer_json agent config is missing: {routed_name}")
                 self._phase_failure_status = "failed"
                 return False
+            agent_allowed_paths = filter_paths_for_agent(editable_paths, routed_name)
+            if not agent_allowed_paths:
+                continue
+            self.logger.info(f"Multi developer allowed paths ({routed_name}): " + ", ".join(agent_allowed_paths))
+            before_changed = set(self._multi_developer_current_changed_files(agent_allowed_paths))
             if not self._wait_for_user(f"Запустить агента {routed_name} ({index}/{total})?"):
                 self.logger.warning(f"Агент пропущен: {routed_name}")
                 continue
-            if not self._run_agent(agent_config, "implementation", index=index, total=total):
-                return False
-            report = self._load_saved_agent_report("implementation", routed_name) or {}
-            raw_output = str(report.get("parsed_output") or report.get("stdout") or "").strip()
-            parsed, errors = parse_and_validate(raw_output, allowed_paths, routed_name)
-            if errors:
-                self.logger.error(f"Constraint validation failed for {routed_name}", "\n".join(errors))
+            original_selected_item = self._selected_implementation_item
+            scoped_item = self._build_multi_developer_task_override(routed_name, editable_paths)
+            self._selected_implementation_item = scoped_item
+            try:
+                if not self._run_agent(agent_config, "implementation", index=index, total=total):
+                    return False
+            finally:
+                self._selected_implementation_item = original_selected_item
+            after_changed = set(self._multi_developer_current_changed_files(agent_allowed_paths))
+            changed = sorted(after_changed - before_changed)
+            agent_report = self._load_saved_agent_report("implementation", routed_name) or {}
+            agent_extras = self._get_agent_report_extras("implementation", routed_name)
+            write_tools_used = list(agent_extras.get("write_tools_used") or [])
+            write_paths = list(agent_extras.get("write_paths") or [])
+            if not write_tools_used or not write_paths:
+                recovered_tools, recovered_paths = self._recover_multi_developer_write_metadata(agent_report)
+                if not write_tools_used:
+                    write_tools_used = recovered_tools
+                if not write_paths:
+                    write_paths = recovered_paths
+                if recovered_tools or recovered_paths:
+                    self._set_agent_report_extras(
+                        "implementation",
+                        routed_name,
+                        {
+                            "write_tools_used": write_tools_used,
+                            "write_paths": write_paths,
+                        },
+                    )
+            detection = self._build_multi_developer_write_detection(
+                agent_allowed_paths,
+                changed,
+                write_paths,
+                write_tools_used,
+            )
+            self._set_agent_report_extras("implementation", routed_name, detection)
+            if agent_report:
+                self._overwrite_agent_report("implementation", routed_name, {**agent_report, **detection})
+            effective_changed = list(detection["actual_changed_files"])
+            if not effective_changed and not write_tools_used:
+                parsed_output = str(agent_report.get("parsed_output") or agent_report.get("result") or "").strip()
+                no_changes_ok, no_changes_detail = self._validate_multi_developer_no_changes(
+                    routed_name,
+                    scoped_item,
+                    agent_allowed_paths,
+                    parsed_output,
+                )
+                if no_changes_ok:
+                    warnings.append(f"{routed_name}: {no_changes_detail}")
+                    applied_agents.append(routed_name)
+                    continue
+                feedback = "\n".join(
+                    [
+                        "# Multi Developer Validation Feedback",
+                        "",
+                        f"- agent: {routed_name}",
+                        "- result: completed without modifying scoped editable paths",
+                        "- editable_paths: " + ", ".join(agent_allowed_paths),
+                        "",
+                        "Diagnostics:",
+                        "- actual_changed_files: " + ", ".join(detection["actual_changed_files"]),
+                        "- detected_git_diff_files: " + ", ".join(detection["detected_git_diff_files"]),
+                        "- normalized_allowed_paths: " + ", ".join(detection["normalized_allowed_paths"]),
+                        "- normalized_written_paths: " + ", ".join(detection["normalized_written_paths"]),
+                        f"- scoped_path_match_result: {detection['scoped_path_match_result']}",
+                        f"- diff_detection_stage: {detection['diff_detection_stage']}",
+                        f"- write_operation_detected: {detection['write_operation_detected']}",
+                        "",
+                        "Errors:",
+                        "- agent completed but did not change any file in its allowed scope",
+                        "- " + no_changes_detail,
+                        "",
+                        "Required next action:",
+                        "- inspect the scoped file and fix the listed validation errors with write_file or apply_patch",
+                        "- do not return status=no_changes until the scoped deterministic validation passes",
+                    ]
+                )
+                self._save_feedback(self.task_counter, routed_name, feedback)
+                self.logger.error(f"Constraint validation failed for {routed_name}", "agent completed without modifying scoped editable paths")
                 self._phase_failure_status = "invalid_output"
                 return False
-            operations = list((parsed or {}).get("operations") or [])
-            try:
-                changed = apply_operations(self.target_workspace, operations)
-            except Exception:
-                self.logger.error(f"Failed to apply multi_developer_json operations for {routed_name}", traceback.format_exc())
-                self._phase_failure_status = "failed"
-                return False
             applied_agents.append(routed_name)
-            changed_paths.extend(changed)
-            for warning in (parsed or {}).get("warnings") or []:
-                warning_text = str(warning).strip()
-                if warning_text:
-                    warnings.append(f"{routed_name}: {warning_text}")
+            changed_paths.extend(effective_changed or agent_allowed_paths)
         self._save_multi_developer_synthetic_report(applied_agents, sorted(dict.fromkeys(changed_paths)), warnings)
+        self._phase_failure_status = None
         return True
 
     def _run_agent(self, agent_config: dict[str, Any], phase: str, index: int | None = None, total: int | None = None) -> bool:
@@ -630,6 +883,9 @@ class WorkflowOrchestrator:
             self.logger.error(f"Файл prompt.md не найден: {prompt_file}")
             self.logger.agent_end(agent_name, "failed", "missing agent prompt")
             return False
+        if phase == "implementation" and agent_name in {"developer", "test-developer"}:
+            if self._maybe_skip_already_valid_scope(agent_name, agent_runtime):
+                return True
         if phase == "implementation" and agent_name == "qa":
             qa_diff = self._collect_scope_watchdog_diff_diagnostics()
             if qa_diff["changed_files_count"] == 0:
@@ -663,6 +919,7 @@ class WorkflowOrchestrator:
                 return False
 
         message_bundle = self._build_agent_message_bundle(agent_name, agent_config, prompt_file, phase)
+        self._apply_execution_policy(agent_name, phase, message_bundle)
         message = message_bundle["combined_message"]
         prompt_stats = message_bundle["prompt_stats"]
         self.logger.agent_progress(agent_name, f"Diagnostic context_profile={message_bundle['context_profile']}")
@@ -709,6 +966,11 @@ class WorkflowOrchestrator:
         self.logger.agent_progress(agent_name, f"Diagnostic contract_compliance={message_bundle['contract_compliance']}")
         self.logger.agent_progress(agent_name, f"Diagnostic missing_must_contain={message_bundle['missing_must_contain']}")
         self.logger.agent_progress(agent_name, f"Diagnostic missing_test_file={message_bundle['missing_test_file']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic strict_execution_mode={message_bundle['strict_execution_mode']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic retrieval_budget={message_bundle['retrieval_budget']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic retrieval_budget_remaining={message_bundle['retrieval_budget_remaining']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic retrieval_limit_reason={message_bundle['retrieval_limit_reason']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic retrieval_hard_stop_triggered={message_bundle['retrieval_hard_stop_triggered']}")
         self._log_operator_summary("Prompt brief (RU)", self._build_prompt_brief_lines(agent_name, phase, message_bundle))
 
         def save_agent_report(
@@ -784,6 +1046,12 @@ class WorkflowOrchestrator:
                     "selected_task_scope": message_bundle["selected_task_scope"],
                     "selected_task_allowed_paths": message_bundle["selected_task_allowed_paths"],
                     "implementation_retrieval_enabled": message_bundle["implementation_retrieval_enabled"],
+                    "execution_mode": message_bundle["execution_mode"],
+                    "strict_execution_mode": message_bundle["strict_execution_mode"],
+                    "retrieval_budget": message_bundle["retrieval_budget"],
+                    "retrieval_budget_remaining": message_bundle["retrieval_budget_remaining"],
+                    "retrieval_limit_reason": message_bundle["retrieval_limit_reason"],
+                    "retrieval_hard_stop_triggered": message_bundle["retrieval_hard_stop_triggered"],
                     "target_workspace": str(self.target_workspace),
                     "project_id": self.project_id,
                     "git_remote": self.git_remote,
@@ -1033,6 +1301,12 @@ class WorkflowOrchestrator:
         return True
 
     def _wait_for_user(self, prompt: str) -> bool:
+        prompt = (
+            str(prompt)
+            .replace("Р—Р°РїСѓСЃС‚РёС‚СЊ", "Запустить")
+            .replace("Р°РіРµРЅС‚Р°", "агента")
+            .replace("РђРіРµРЅС‚", "Агент")
+        )
         mode = self.config["workflow"]["mode"]
         if mode == "auto":
             delay = self.config["workflow"].get("auto_continue_delay", 3)
@@ -1097,14 +1371,80 @@ class WorkflowOrchestrator:
             return False
         try:
             self.logger.git_operation("rollback", reason)
-            self.repo.git.checkout(self._default_branch())
-            if self.current_branch:
+            default_branch = self._default_branch()
+            dirty_worktree = self.repo.is_dirty(untracked_files=True)
+            dirty_files = self._collect_dirty_worktree_files()
+            self.logger.info(f"rollback_dirty_worktree={dirty_worktree}")
+            self.logger.info(f"rollback_dirty_files={', '.join(dirty_files)}")
+            strategy = self._get_git_rollback_dirty_strategy()
+            if dirty_worktree:
+                if strategy != "stash":
+                    error_message = (
+                        f"Dirty worktree prevents checkout to {default_branch}; "
+                        f"rollback_dirty_strategy={strategy}"
+                    )
+                    self.logger.info("rollback_action=failed")
+                    self.logger.info(f"rollback_error={error_message}")
+                    return False
+                stash_message = (
+                    f"agents-pipeline rollback safety stash {self.logger.run_id} "
+                    f"attempt {self._implementation_attempt}"
+                )
+                stash_result = self.repo.git.stash("push", "--include-untracked", "-m", stash_message)
+                self.logger.info("rollback_action=stash")
+                self.logger.info(f"rollback_stash_result={stash_result}")
+                if self.repo.is_dirty(untracked_files=True):
+                    error_message = "Worktree remained dirty after stash."
+                    self.logger.info(f"rollback_error={error_message}")
+                    return False
+            self.repo.git.checkout(default_branch)
+            self.logger.info("rollback_action=checkout")
+            if self.current_branch and self.current_branch != default_branch:
                 self.repo.delete_head(self.current_branch, force=True)
             self.current_branch = None
             return True
         except Exception as exc:  # pragma: no cover
+            self.logger.info("rollback_action=failed")
+            self.logger.info(f"rollback_error={exc}")
             self.logger.error("Не удалось откатить ветку", str(exc))
             return False
+
+    def _get_git_rollback_dirty_strategy(self) -> str:
+        strategy = str(self.config.get("git", {}).get("rollback_dirty_strategy", "fail")).strip().lower()
+        if strategy not in {"fail", "stash"}:
+            return "fail"
+        return strategy
+
+    def _collect_dirty_worktree_files(self) -> list[str]:
+        if self.repo is None:
+            return []
+
+        dirty_paths: set[str] = set()
+        try:
+            dirty_paths.update(
+                path.replace("\\", "/")
+                for path in self.repo.untracked_files
+                if str(path).strip()
+            )
+        except Exception:
+            pass
+        try:
+            dirty_paths.update(
+                (diff.a_path or diff.b_path or "").replace("\\", "/")
+                for diff in self.repo.index.diff(None)
+                if (diff.a_path or diff.b_path)
+            )
+        except Exception:
+            pass
+        try:
+            dirty_paths.update(
+                (diff.a_path or diff.b_path or "").replace("\\", "/")
+                for diff in self.repo.index.diff("HEAD")
+                if (diff.a_path or diff.b_path)
+            )
+        except Exception:
+            pass
+        return sorted(path for path in dirty_paths if path)
 
     @staticmethod
     def _load_config(config_path: Path) -> dict[str, Any]:
@@ -1553,7 +1893,7 @@ class WorkflowOrchestrator:
             repo_map_path = implementation_context["repo_map_path"]
             repo_map_file_count = implementation_context["repo_map_file_count"]
             repo_map_directory_count = implementation_context["repo_map_directory_count"]
-            if agent_name == "developer" and self._implementation_retry_from_agent == "developer":
+            if self._implementation_retry_from_agent == "developer" and (agent_name == "developer" or self._is_multi_developer_edit_agent(agent_name)):
                 developer_feedback_text, developer_feedback_source = self._load_developer_feedback_for_retry()
                 developer_feedback_chars = len(developer_feedback_text)
             contract_completeness = implementation_context["contract_completeness"]
@@ -1662,6 +2002,12 @@ class WorkflowOrchestrator:
             "selected_task_scope": selected_task_scope,
             "selected_task_allowed_paths": selected_task_allowed_paths,
             "implementation_retrieval_enabled": implementation_retrieval_enabled,
+            "execution_mode": "balanced",
+            "strict_execution_mode": False,
+            "retrieval_budget": None,
+            "retrieval_budget_remaining": None,
+            "retrieval_limit_reason": "",
+            "retrieval_hard_stop_triggered": False,
             "translation_instruction": translation_instruction,
             "system_message": system_message,
             "user_message": user_message,
@@ -1687,7 +2033,178 @@ class WorkflowOrchestrator:
 
     @staticmethod
     def _is_implementation_retrieval_enabled(agent_name: str) -> bool:
-        return agent_name in {"architect", "developer", "qa", "template-validator"}
+        return agent_name in {
+            "architect",
+            "developer",
+            "code-developer",
+            "infra-developer",
+            "test-developer",
+            "qa",
+            "template-validator",
+        }
+
+    @staticmethod
+    def _is_multi_developer_edit_agent(agent_name: str) -> bool:
+        return agent_name in {"code-developer", "infra-developer", "test-developer"}
+
+    def _apply_execution_policy(self, agent_name: str, phase: str, message_bundle: dict[str, Any]) -> None:
+        execution_mode = self._resolve_execution_mode(agent_name, phase, message_bundle)
+        budget = self._retrieval_budget_for_execution_mode(execution_mode)
+        message_bundle["execution_mode"] = execution_mode
+        message_bundle["strict_execution_mode"] = execution_mode == "strict"
+        message_bundle["retrieval_budget"] = budget
+        message_bundle["retrieval_budget_remaining"] = budget
+        message_bundle["retrieval_limit_reason"] = self._strict_execution_limit_reason(agent_name, phase, message_bundle) if execution_mode == "strict" else ""
+        message_bundle["retrieval_hard_stop_triggered"] = False
+        if execution_mode == "strict":
+            strict_instruction = (
+                "Strict execution mode is active. Do not perform repository exploration. "
+                "Allowed retrieval is at most one read_file/read_files operation or two retrieval operations total. "
+                "list_files, search_text, broad scans, and repeated retrieval loops are forbidden. "
+                "If full file content or the exact contract is already injected, write the allowed scoped file immediately."
+            )
+            message_bundle["system_message"] = str(message_bundle["system_message"]).rstrip() + "\n\n" + strict_instruction
+            message_bundle["combined_message"] = str(message_bundle["combined_message"]).rstrip() + "\n\n" + strict_instruction
+            stats = message_bundle.get("prompt_stats") or {}
+            stats["message_chars"] = len(str(message_bundle["combined_message"]))
+            stats["message_lines"] = len(str(message_bundle["combined_message"]).splitlines())
+            message_bundle["prompt_stats"] = stats
+
+    def _resolve_execution_mode(self, agent_name: str, phase: str, message_bundle: dict[str, Any]) -> str:
+        configured = str(message_bundle.get("execution_mode") or "").strip().lower()
+        if configured in {"exploratory", "strict"}:
+            return configured
+        if self.should_enable_strict_mode(agent_name, phase, message_bundle):
+            return "strict"
+        if phase == "research":
+            return "exploratory"
+        return "balanced"
+
+    def should_enable_strict_mode(self, agent_name: str, phase: str, message_bundle: dict[str, Any]) -> bool:
+        if phase != "implementation":
+            return False
+        if agent_name not in {"infra-developer", "test-developer", "code-developer"}:
+            return False
+        if str(message_bundle.get("selected_task_scope") or "").strip() != "backend-only":
+            return False
+        allowed_paths = [
+            self._normalize_target_relative_path(path)
+            for path in (message_bundle.get("selected_task_allowed_paths") or [])
+        ]
+        if not allowed_paths or len(allowed_paths) > 3:
+            return False
+        if not bool(message_bundle.get("contract_completeness")):
+            return False
+        if not self._existing_context_is_injected(message_bundle):
+            return False
+        category = self._infer_strict_task_category(agent_name, allowed_paths)
+        return category in {"migration", "config", "tests", "isolated_file_patch"}
+
+    @staticmethod
+    def _retrieval_budget_for_execution_mode(execution_mode: str) -> int | None:
+        if execution_mode == "strict":
+            return 2
+        if execution_mode == "balanced":
+            return 6
+        return None
+
+    def _strict_execution_limit_reason(self, agent_name: str, phase: str, message_bundle: dict[str, Any]) -> str:
+        allowed_paths = ", ".join(str(path) for path in (message_bundle.get("selected_task_allowed_paths") or []))
+        return (
+            f"strict mode: agent={agent_name}, phase={phase}, "
+            f"scope={message_bundle.get('selected_task_scope')}, allowed_paths={allowed_paths}"
+        )
+
+    @staticmethod
+    def _existing_context_is_injected(message_bundle: dict[str, Any]) -> bool:
+        if bool(message_bundle.get("existing_file_contents_injected")):
+            return True
+        return int(message_bundle.get("implementation_context_chars") or 0) > 0 and int(message_bundle.get("repository_context_chars") or 0) > 0
+
+    def _infer_strict_task_category(self, agent_name: str, allowed_paths: list[str]) -> str:
+        if agent_name == "infra-developer":
+            if any("alembic/versions/" in path or "/migrations/" in path for path in allowed_paths):
+                return "migration"
+            return "config"
+        if agent_name == "test-developer":
+            return "tests"
+        if agent_name == "code-developer" and len(allowed_paths) <= 2:
+            return "isolated_file_patch"
+        return "other"
+
+    def _evaluate_retrieval_budget(
+        self,
+        message_bundle: dict[str, Any],
+        tool_name: str,
+        retrieval_operations_used: int,
+        read_file_operations_used: int,
+    ) -> dict[str, Any]:
+        execution_mode = str(message_bundle.get("execution_mode") or "balanced")
+        budget = message_bundle.get("retrieval_budget")
+        retrieval_tools = {"read_file", "read_files", "search_text", "list_files"}
+        normalized_tool = str(tool_name or "").strip()
+        if normalized_tool not in retrieval_tools:
+            remaining = None if budget is None else max(0, int(budget) - retrieval_operations_used)
+            return {
+                "allowed": True,
+                "reason": "",
+                "remaining": remaining,
+                "hard_stop": False,
+            }
+        if execution_mode != "strict":
+            remaining = None if budget is None else max(0, int(budget) - retrieval_operations_used)
+            return {
+                "allowed": True,
+                "reason": "",
+                "remaining": remaining,
+                "hard_stop": False,
+            }
+        forbidden_tools = {"list_files", "search_text"}
+        if normalized_tool in forbidden_tools:
+            return {
+                "allowed": False,
+                "reason": f"strict mode forbids {normalized_tool}; use injected context or exact read_file only",
+                "remaining": max(0, int(budget or 0) - retrieval_operations_used),
+                "hard_stop": True,
+            }
+        if retrieval_operations_used >= int(budget or 0):
+            return {
+                "allowed": False,
+                "reason": f"strict retrieval budget exhausted before {normalized_tool}",
+                "remaining": 0,
+                "hard_stop": True,
+            }
+        if normalized_tool in {"read_file", "read_files"} and read_file_operations_used >= 1:
+            return {
+                "allowed": False,
+                "reason": "strict mode allows only one read_file/read_files operation",
+                "remaining": max(0, int(budget or 0) - retrieval_operations_used),
+                "hard_stop": True,
+            }
+        return {
+            "allowed": True,
+            "reason": "",
+            "remaining": max(0, int(budget or 0) - retrieval_operations_used - 1),
+            "hard_stop": False,
+        }
+
+    def _build_strict_retrieval_feedback(
+        self,
+        agent_name: str,
+        tool_name: str,
+        reason: str,
+        message_bundle: dict[str, Any],
+    ) -> str:
+        allowed_paths = ", ".join(str(path) for path in (message_bundle.get("selected_task_allowed_paths") or [])) or "none"
+        return (
+            "Strict execution mode stopped unnecessary retrieval.\n\n"
+            f"Agent: {agent_name}\n"
+            f"Blocked tool: {tool_name}\n"
+            f"Reason: {reason}\n"
+            f"Allowed paths: {allowed_paths}\n\n"
+            "Required next action: do not retry automatically. Re-run only after the agent prompt or task contract is adjusted "
+            "to write/apply_patch directly from injected context."
+        )
 
     @staticmethod
     def _default_implementation_scope_policy() -> dict[str, Any]:
@@ -1997,6 +2514,42 @@ class WorkflowOrchestrator:
         except Exception as exc:
             return 1, "", str(exc)
         return process.returncode, (process.stdout or "").strip(), (process.stderr or "").strip()
+
+    def resolve_python_executable(self) -> tuple[str, str, bool]:
+        candidates: list[tuple[Path, str]] = [
+            (self.engine_root / "venv" / "Scripts" / "python.exe", "engine_venv"),
+            (self.target_workspace / ".venv" / "Scripts" / "python.exe", "target_venv"),
+            (Path(sys.executable), "sys_executable"),
+        ]
+
+        first_existing: tuple[str, str, bool] | None = None
+        for candidate, source in candidates:
+            if not candidate.exists():
+                continue
+            pytest_available = self._python_has_pytest(candidate)
+            if first_existing is None:
+                first_existing = (str(candidate), source, pytest_available)
+            if pytest_available:
+                return str(candidate), source, True
+
+        if first_existing is not None:
+            return first_existing
+        return sys.executable, "sys_executable_missing", False
+
+    def _python_has_pytest(self, python_executable: Path) -> bool:
+        try:
+            process = subprocess.run(
+                [str(python_executable), "-m", "pytest", "--version"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                cwd=self.target_workspace,
+            )
+        except Exception:
+            return False
+        return process.returncode == 0
 
     def _build_compact_architecture_summary(self) -> str:
         return "\n".join(
@@ -2494,51 +3047,147 @@ class WorkflowOrchestrator:
         raise RuntimeError("direct_api request failed without response")
 
     @staticmethod
-    def _parse_direct_api_retrieval_request(text: str) -> dict[str, Any] | None:
-        stripped = text.strip()
-        candidates: list[str] = []
-        if stripped:
-            candidates.append(stripped)
-            fenced_matches = re.findall(r"```(?:json)?\s*([\s\S]*?)```", stripped, flags=re.IGNORECASE)
-            candidates.extend(match.strip() for match in fenced_matches if match.strip())
-
-        seen: set[str] = set()
-        for candidate in candidates:
-            if not candidate or candidate in seen:
-                continue
-            seen.add(candidate)
+    def _normalize_tool_payload(payload: Any) -> dict[str, Any] | None:
+        if not isinstance(payload, dict):
+            return None
+        tool_value = payload.get("tool")
+        if not isinstance(tool_value, str):
+            tool_value = payload.get("name")
+        if not isinstance(tool_value, str):
+            return None
+        tool = str(tool_value).strip().lower()
+        if tool not in {"read_file", "read_files", "search_text", "list_files", "write_file", "apply_patch", "tool_batch"}:
+            return None
+        nested = payload.get("arguments")
+        if nested is None:
+            nested = payload.get("args")
+        if nested is None:
+            nested = payload.get("input")
+        if isinstance(nested, str):
             try:
-                payload = json.loads(candidate)
+                nested = json.loads(nested.strip())
             except json.JSONDecodeError:
-                continue
-            if not isinstance(payload, dict):
-                continue
-            tool = payload.get("tool")
-            if isinstance(tool, str):
-                return payload
-        json_sequence = WorkflowOrchestrator._extract_json_tool_sequence(stripped)
-        if json_sequence:
-            if all(payload.get("tool") == "read_file" and payload.get("path") for payload in json_sequence):
-                return {
-                    "tool": "read_files",
-                    "paths": [str(payload["path"]) for payload in json_sequence],
-                }
-            leading_read_files: list[str] = []
-            for payload in json_sequence:
-                if payload.get("tool") == "read_file" and payload.get("path"):
-                    leading_read_files.append(str(payload["path"]))
-                    continue
-                break
-            if len(leading_read_files) >= 2 and len(leading_read_files) == len(json_sequence):
-                return {
-                    "tool": "read_files",
-                    "paths": leading_read_files,
-                }
-            return {"tool": "tool_batch", "requests": json_sequence}
-        if stripped:
+                nested = None
+        merged: dict[str, Any] = {}
+        if isinstance(nested, dict):
+            merged.update(nested)
+        merged.update(payload)
+        if tool == "tool_batch":
+            requests = merged.get("requests")
+            if not isinstance(requests, list):
+                return None
+            normalized_requests = [
+                normalized
+                for request in requests
+                if (normalized := WorkflowOrchestrator._normalize_tool_payload(request)) is not None
+            ]
+            return {"tool": "tool_batch", "requests": normalized_requests}
+        normalized: dict[str, Any] = {"tool": tool}
+        if tool == "read_file":
+            path = merged.get("path")
+            if not isinstance(path, str) or not path.strip():
+                return None
+            normalized["path"] = path.strip()
+        elif tool == "read_files":
+            paths = merged.get("paths")
+            if not isinstance(paths, list):
+                return None
+            cleaned_paths = [str(path).strip() for path in paths if str(path).strip()]
+            if not cleaned_paths:
+                return None
+            normalized["paths"] = cleaned_paths
+        elif tool == "search_text":
+            pattern = merged.get("pattern")
+            if not isinstance(pattern, str) or not pattern.strip():
+                return None
+            normalized["pattern"] = pattern.strip()
+            if merged.get("limit") is not None:
+                normalized["limit"] = merged.get("limit")
+        elif tool == "list_files":
+            directory = merged.get("directory")
+            if isinstance(directory, str) and directory.strip():
+                normalized["directory"] = directory.strip()
+            if merged.get("max_depth") is not None:
+                normalized["max_depth"] = merged.get("max_depth")
+        elif tool == "write_file":
+            path = merged.get("path")
+            content = merged.get("content")
+            if not isinstance(path, str) or not path.strip() or not isinstance(content, str):
+                return None
+            normalized["path"] = path.strip()
+            normalized["content"] = content
+        elif tool == "apply_patch":
+            path = merged.get("path")
+            search = merged.get("search")
+            replace = merged.get("replace")
+            if not isinstance(path, str) or not path.strip() or not isinstance(search, str) or not isinstance(replace, str):
+                return None
+            normalized["path"] = path.strip()
+            normalized["search"] = search
+            normalized["replace"] = replace
+        return normalized
+
+    @staticmethod
+    def _tool_extraction_variants(text: str) -> list[str]:
+        variants: list[str] = []
+        seen: set[str] = set()
+
+        def add(value: str) -> None:
+            cleaned = str(value or "").strip()
+            if cleaned and cleaned not in seen:
+                seen.add(cleaned)
+                variants.append(cleaned)
+
+        add(text)
+        for match in re.findall(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.IGNORECASE):
+            add(match)
+        for candidate in list(variants):
+            if '\\"' in candidate or "\\n" in candidate or "\\t" in candidate:
+                try:
+                    add(bytes(candidate, "utf-8").decode("unicode_escape"))
+                except UnicodeDecodeError:
+                    pass
+            if (candidate.startswith('"') and candidate.endswith('"')) or (candidate.startswith("'") and candidate.endswith("'")):
+                try:
+                    decoded = json.loads(candidate)
+                except json.JSONDecodeError:
+                    decoded = None
+                if isinstance(decoded, str):
+                    add(decoded)
+        return variants
+
+    @staticmethod
+    def _extract_tool_operations(text: str) -> list[dict[str, Any]]:
+        operations: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def append_payload(payload: Any) -> None:
+            normalized = WorkflowOrchestrator._normalize_tool_payload(payload)
+            if normalized is None:
+                return
+            marker = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+            if marker in seen:
+                return
+            seen.add(marker)
+            operations.append(normalized)
+
+        for candidate in WorkflowOrchestrator._tool_extraction_variants(str(text or "")):
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                append_payload(parsed)
+            elif isinstance(parsed, list):
+                for item in parsed:
+                    append_payload(item)
+
+            for payload in WorkflowOrchestrator._extract_json_tool_sequence(candidate):
+                append_payload(payload)
+
             block_read_files_match = re.search(
                 r"<read_files>\s*<paths>(?P<body>[\s\S]*?)</paths>\s*</read_files>",
-                stripped,
+                candidate,
                 flags=re.IGNORECASE,
             )
             if block_read_files_match:
@@ -2549,16 +3198,13 @@ class WorkflowOrchestrator:
                     if str(path).strip()
                 ]
                 if paths:
-                    return {"tool": "read_files", "paths": paths}
-            tag_matches = list(
-                re.finditer(
-                    r"<(?P<tool>[a-z_][a-z0-9_-]*)\s+(?P<attrs>[^<>]*?)/>",
-                    stripped,
-                    flags=re.IGNORECASE,
-                )
-            )
-            xml_payloads: list[dict[str, Any]] = []
-            for match in tag_matches:
+                    append_payload({"tool": "read_files", "paths": paths})
+
+            for match in re.finditer(
+                r"<(?P<tool>[a-z_][a-z0-9_-]*)\s+(?P<attrs>[^<>]*?)/>",
+                candidate,
+                flags=re.IGNORECASE,
+            ):
                 tool = str(match.group("tool") or "").strip().lower()
                 attrs_raw = str(match.group("attrs") or "")
                 attrs = {
@@ -2568,88 +3214,27 @@ class WorkflowOrchestrator:
                         attrs_raw,
                     )
                 }
-                payload: dict[str, Any] = {"tool": tool}
-                if tool == "read_file" and attrs.get("path"):
-                    payload["path"] = attrs["path"]
-                elif tool == "read_files":
-                    raw_paths = attrs.get("paths", "")
-                    if raw_paths:
-                        payload["paths"] = [part.strip() for part in re.split(r"[,;\n]+", raw_paths) if part.strip()]
-                elif tool == "search_text" and attrs.get("pattern"):
-                    payload["pattern"] = attrs["pattern"]
-                    if attrs.get("limit"):
-                        payload["limit"] = attrs["limit"]
-                elif tool == "list_files":
-                    if attrs.get("directory"):
-                        payload["directory"] = attrs["directory"]
-                    if attrs.get("max_depth"):
-                        payload["max_depth"] = attrs["max_depth"]
-                elif tool == "write_file" and attrs.get("path"):
-                    payload["path"] = attrs["path"]
-                    if attrs.get("content") is not None:
-                        payload["content"] = attrs["content"]
-                elif tool == "apply_patch" and attrs.get("path"):
-                    payload["path"] = attrs["path"]
-                    if attrs.get("search") is not None:
-                        payload["search"] = attrs["search"]
-                    if attrs.get("replace") is not None:
-                        payload["replace"] = attrs["replace"]
-                else:
-                    continue
-                xml_payloads.append(payload)
-            if xml_payloads:
-                if all(payload.get("tool") == "read_file" and payload.get("path") for payload in xml_payloads):
-                    return {
-                        "tool": "read_files",
-                        "paths": [str(payload["path"]) for payload in xml_payloads],
-                    }
-                return xml_payloads[0]
-            call_matches = list(
-                re.finditer(
-                    r"(?P<tool>read_file|read_files|search_text|list_files|write_file|apply_patch)\s*\(\s*(?P<args>\{[\s\S]*?\})\s*\)",
-                    stripped,
-                    flags=re.IGNORECASE,
-                )
-            )
-            call_payloads: list[dict[str, Any]] = []
-            for match in call_matches:
+                append_payload({"tool": tool, **attrs})
+
+            for match in re.finditer(
+                r"(?P<tool>read_file|read_files|search_text|list_files|write_file|apply_patch)\s*\(\s*(?P<args>\{[\s\S]*?\})\s*\)",
+                candidate,
+                flags=re.IGNORECASE,
+            ):
                 tool = str(match.group("tool") or "").strip().lower()
                 args_text = str(match.group("args") or "").strip()
                 try:
                     args_payload = json.loads(args_text)
                 except json.JSONDecodeError:
                     continue
-                if not isinstance(args_payload, dict):
-                    continue
-                payload = {"tool": tool, **args_payload}
-                call_payloads.append(payload)
-            if call_payloads:
-                if all(payload.get("tool") == "read_file" and payload.get("path") for payload in call_payloads):
-                    return {
-                        "tool": "read_files",
-                        "paths": [str(payload["path"]) for payload in call_payloads],
-                    }
-                leading_read_files: list[str] = []
-                for payload in call_payloads:
-                    if payload.get("tool") == "read_file" and payload.get("path"):
-                        leading_read_files.append(str(payload["path"]))
-                        continue
-                    break
-                if len(leading_read_files) >= 2:
-                    return {
-                        "tool": "read_files",
-                        "paths": leading_read_files,
-                    }
-                return call_payloads[0]
-            tool_call_matches = list(
-                re.finditer(
-                    r"(?:<tool_call>\s*)?(?P<tool>read_file|read_files|search_text|list_files|write_file|apply_patch)\s*\(\s*(?P<args>[^()]*)\s*\)",
-                    stripped,
-                    flags=re.IGNORECASE,
-                )
-            )
-            tool_call_payloads: list[dict[str, Any]] = []
-            for match in tool_call_matches:
+                if isinstance(args_payload, dict):
+                    append_payload({"tool": tool, **args_payload})
+
+            for match in re.finditer(
+                r"(?:<tool_call>\s*)?(?P<tool>read_file|read_files|search_text|list_files|write_file|apply_patch)\s*\(\s*(?P<args>[^()]*)\s*\)",
+                candidate,
+                flags=re.IGNORECASE,
+            ):
                 tool = str(match.group("tool") or "").strip().lower()
                 args_text = str(match.group("args") or "").strip()
                 attrs = {
@@ -2659,70 +3244,58 @@ class WorkflowOrchestrator:
                         args_text,
                     )
                 }
-                payload: dict[str, Any] = {"tool": tool}
-                if tool == "read_file" and attrs.get("path"):
-                    payload["path"] = attrs["path"]
-                elif tool == "read_files":
-                    raw_paths = attrs.get("paths", "")
-                    if raw_paths:
-                        payload["paths"] = [part.strip() for part in re.split(r"[,;\n]+", raw_paths) if part.strip()]
-                elif tool == "search_text" and attrs.get("pattern"):
-                    payload["pattern"] = attrs["pattern"]
-                    if attrs.get("limit"):
-                        payload["limit"] = attrs["limit"]
-                elif tool == "list_files":
-                    if attrs.get("directory"):
-                        payload["directory"] = attrs["directory"]
-                    if attrs.get("max_depth"):
-                        payload["max_depth"] = attrs["max_depth"]
-                elif tool == "write_file" and attrs.get("path"):
-                    payload["path"] = attrs["path"]
-                    if attrs.get("content") is not None:
-                        payload["content"] = attrs["content"]
-                elif tool == "apply_patch" and attrs.get("path"):
-                    payload["path"] = attrs["path"]
-                    if attrs.get("search") is not None:
-                        payload["search"] = attrs["search"]
-                    if attrs.get("replace") is not None:
-                        payload["replace"] = attrs["replace"]
-                else:
-                    continue
-                tool_call_payloads.append(payload)
-            if tool_call_payloads:
-                if all(payload.get("tool") == "read_file" and payload.get("path") for payload in tool_call_payloads):
-                    return {
-                        "tool": "read_files",
-                        "paths": [str(payload["path"]) for payload in tool_call_payloads],
-                    }
-                leading_read_files = []
-                for payload in tool_call_payloads:
-                    if payload.get("tool") == "read_file" and payload.get("path"):
-                        leading_read_files.append(str(payload["path"]))
-                        continue
-                    break
-                if len(leading_read_files) >= 2:
-                    return {
-                        "tool": "read_files",
-                        "paths": leading_read_files,
-                    }
-                return tool_call_payloads[0]
-            object_matches = re.findall(r"(\{[\s\S]*\})", stripped)
-            object_candidates = [match.strip() for match in object_matches if match.strip()]
-            seen_objects: set[str] = set()
-            for candidate in object_candidates:
-                if candidate in seen_objects:
-                    continue
-                seen_objects.add(candidate)
+                append_payload({"tool": tool, **attrs})
+
+            for raw_object in re.findall(r"(\{[\s\S]*?\})", candidate):
                 try:
-                    payload = json.loads(candidate)
+                    append_payload(json.loads(raw_object))
                 except json.JSONDecodeError:
                     continue
-                if not isinstance(payload, dict):
-                    continue
-                tool = payload.get("tool")
-                if isinstance(tool, str):
-                    return payload
-        return None
+        return operations
+
+    @staticmethod
+    def _extract_write_operations(text: str) -> list[dict[str, Any]]:
+        write_operations: list[dict[str, Any]] = []
+        for payload in WorkflowOrchestrator._extract_tool_operations(text):
+            tool = payload.get("tool")
+            if tool in {"write_file", "apply_patch"}:
+                write_operations.append(payload)
+                continue
+            if tool == "tool_batch":
+                for request in payload.get("requests") or []:
+                    if not isinstance(request, dict):
+                        continue
+                    request_tool = request.get("tool")
+                    if request_tool in {"write_file", "apply_patch"}:
+                        write_operations.append(request)
+        return write_operations
+
+    @staticmethod
+    def _parse_direct_api_retrieval_request(text: str) -> dict[str, Any] | None:
+        operations = WorkflowOrchestrator._extract_tool_operations(text)
+        if not operations:
+            return None
+        if len(operations) == 1:
+            return operations[0]
+        if all(payload.get("tool") == "read_file" and payload.get("path") for payload in operations):
+            return {
+                "tool": "read_files",
+                "paths": [str(payload["path"]) for payload in operations],
+            }
+        if any(payload.get("tool") in {"write_file", "apply_patch"} for payload in operations):
+            return {"tool": "tool_batch", "requests": operations}
+        leading_read_files: list[str] = []
+        for payload in operations:
+            if payload.get("tool") == "read_file" and payload.get("path"):
+                leading_read_files.append(str(payload["path"]))
+                continue
+            break
+        if len(leading_read_files) >= 2:
+            return {
+                "tool": "read_files",
+                "paths": leading_read_files,
+            }
+        return {"tool": "tool_batch", "requests": operations}
 
     @staticmethod
     def _extract_json_tool_sequence(text: str) -> list[dict[str, Any]]:
@@ -2773,7 +3346,7 @@ class WorkflowOrchestrator:
             limit = self._coerce_int(payload.get("limit")) or 20
             if not pattern:
                 return "Invalid search_text request."
-            if phase == "implementation" and agent_name == "developer":
+            if phase == "implementation" and (agent_name == "developer" or self._is_multi_developer_edit_agent(agent_name)):
                 return (
                     "search_text is disabled for developer in implementation mode. "
                     "Use read_file/read_files for the exact contract paths, then either write the scoped change or return status=no_changes."
@@ -2782,14 +3355,14 @@ class WorkflowOrchestrator:
         if tool == "list_files":
             directory = str(payload.get("directory") or ".").strip() or "."
             max_depth = self._coerce_int(payload.get("max_depth")) or 3
-            if phase == "implementation" and agent_name == "developer":
+            if phase == "implementation" and (agent_name == "developer" or self._is_multi_developer_edit_agent(agent_name)):
                 return (
                     "list_files is disabled for developer in implementation mode. "
                     "Use read_file/read_files for the exact contract paths, then either write the scoped change or return status=no_changes."
                 )
             return self._direct_api_list_files(directory, max_depth=max(1, min(max_depth, 6)))
         if tool == "write_file":
-            if not (phase == "implementation" and agent_name == "developer"):
+            if not (phase == "implementation" and (agent_name == "developer" or self._is_multi_developer_edit_agent(agent_name))):
                 return "write_file is not allowed for this agent."
             path = str(payload.get("path") or "").strip()
             content = payload.get("content")
@@ -2797,7 +3370,7 @@ class WorkflowOrchestrator:
                 return "Invalid write_file request."
             return self._direct_api_write_file(path, content)
         if tool == "apply_patch":
-            if not (phase == "implementation" and agent_name == "developer"):
+            if not (phase == "implementation" and (agent_name == "developer" or self._is_multi_developer_edit_agent(agent_name))):
                 return "apply_patch is not allowed for this agent."
             path = str(payload.get("path") or "").strip()
             search = payload.get("search")
@@ -2875,9 +3448,7 @@ class WorkflowOrchestrator:
         filtered = [str(line).strip() for line in lines if str(line).strip()]
         if not filtered:
             return
-        self.logger.info(title)
-        for line in filtered:
-            self.logger.info(f"  - {line}")
+        self.logger.operator_box(title, [f"- {line}" for line in filtered], color="cyan")
 
     def _build_prompt_brief_lines(self, agent_name: str, phase: str, message_bundle: dict[str, Any]) -> list[str]:
         lines = [
@@ -2887,6 +3458,10 @@ class WorkflowOrchestrator:
         user_task = str(message_bundle.get("user_message") or "").strip()
         if user_task:
             lines.append(f"задача={user_task}")
+        lines = [
+            line.replace("С„Р°Р·Р°", "фаза").replace("Р°РіРµРЅС‚", "агент").replace("Р·Р°РґР°С‡Р°", "задача")
+            for line in lines
+        ]
         selected_task_id = str(message_bundle.get("selected_task_id") or "").strip()
         if selected_task_id:
             lines.append(f"implementation_task={selected_task_id}")
@@ -2903,6 +3478,9 @@ class WorkflowOrchestrator:
             lines.append("retrieval=enabled")
         else:
             lines.append("retrieval=disabled")
+        lines.append(f"execution_mode={message_bundle.get('execution_mode') or 'balanced'}")
+        if message_bundle.get("strict_execution_mode"):
+            lines.append(f"retrieval_budget={message_bundle.get('retrieval_budget')}")
         developer_feedback_source = str(message_bundle.get("developer_feedback_source") or "").strip()
         developer_feedback_chars = int(message_bundle.get("developer_feedback_chars") or 0)
         if developer_feedback_source:
@@ -2929,7 +3507,14 @@ class WorkflowOrchestrator:
 
     @staticmethod
     def _is_compact_console_prompt_mode(agent_name: str, phase: str) -> bool:
-        return phase == "implementation" and agent_name == "developer"
+        return phase == "implementation" and agent_name in {
+            "developer",
+            "code-developer",
+            "infra-developer",
+            "test-developer",
+            "qa",
+            "template-validator",
+        }
 
     @staticmethod
     def _build_prompt_preview_lines(text: str, limit: int = 24) -> list[str]:
@@ -3018,7 +3603,7 @@ class WorkflowOrchestrator:
         return "\n".join(lines)
 
     def _resolve_target_relative_file(self, raw_path: str) -> tuple[Path | None, str]:
-        relative_path = self._normalize_repo_relative_path(raw_path)
+        relative_path = self._normalize_target_relative_path(raw_path)
         if not relative_path:
             return None, ""
         candidate = (self.target_workspace / relative_path).resolve()
@@ -3062,6 +3647,14 @@ class WorkflowOrchestrator:
             normalized = self._normalize_repo_relative_path(test_file.get("path"))
             if normalized:
                 contract_paths.add(normalized)
+        if self._get_implementation_execution_mode() == "multi_developer_json":
+            scoped_allowed_paths = {
+                self._normalize_repo_relative_path(path)
+                for path in (selected_item.get("allowed_paths") or [])
+                if self._normalize_repo_relative_path(path)
+            }
+            if scoped_allowed_paths:
+                contract_paths = scoped_allowed_paths
         repo_map = self._load_repo_map()
         repo_file_paths = {
             str(item.get("path") or "").strip()
@@ -3103,25 +3696,36 @@ class WorkflowOrchestrator:
             return False, "Write request contains forbidden keywords: " + ", ".join(sorted(set(hits))), None
         return True, relative_path, candidate
 
-    def _record_write_tool_usage(self, tool_name: str) -> None:
-        current = self._get_agent_report_extras("implementation", "developer")
+    def _active_write_agent_name(self) -> str:
+        agent_name = str(getattr(self, "_active_direct_api_agent_name", "") or "").strip()
+        return agent_name or "developer"
+
+    def _record_write_tool_usage(self, tool_name: str, path: str = "") -> None:
+        agent_name = self._active_write_agent_name()
+        current = self._get_agent_report_extras("implementation", agent_name)
         used = list(current.get("write_tools_used") or [])
         used.append(tool_name)
+        write_paths = list(current.get("write_paths") or [])
+        normalized_path = self._normalize_target_relative_path(path)
+        if normalized_path:
+            write_paths.append(normalized_path)
         self._set_agent_report_extras(
             "implementation",
-            "developer",
+            agent_name,
             {
                 "write_tools_used": used,
+                "write_paths": write_paths,
                 "last_write_error": "",
             },
         )
 
     def _record_failed_write_attempt(self, tool_name: str, error_text: str) -> None:
-        current = self._get_agent_report_extras("implementation", "developer")
+        agent_name = self._active_write_agent_name()
+        current = self._get_agent_report_extras("implementation", agent_name)
         failed_attempts = int(current.get("failed_write_attempts") or 0) + 1
         self._set_agent_report_extras(
             "implementation",
-            "developer",
+            agent_name,
             {
                 "last_write_tool": tool_name,
                 "last_write_error": error_text,
@@ -3136,7 +3740,7 @@ class WorkflowOrchestrator:
             return detail
         candidate.parent.mkdir(parents=True, exist_ok=True)
         candidate.write_text(content, encoding="utf-8")
-        self._record_write_tool_usage("write_file")
+        self._record_write_tool_usage("write_file", detail)
         return f"Wrote file: {detail}"
 
     def _direct_api_apply_patch(self, path: str, search: str, replace: str) -> str:
@@ -3157,7 +3761,7 @@ class WorkflowOrchestrator:
             return f"Search block not found in {detail}"
         updated = original.replace(search, replace, 1)
         candidate.write_text(updated, encoding="utf-8")
-        self._record_write_tool_usage("apply_patch")
+        self._record_write_tool_usage("apply_patch", detail)
         return f"Patched file: {detail}"
 
     def _run_direct_api_agent(
@@ -3196,12 +3800,14 @@ class WorkflowOrchestrator:
         ]
         max_turns = 1
         if message_bundle.get("retrieval_enabled"):
-            if phase == "implementation" and agent_name == "developer":
+            if phase == "implementation" and (agent_name == "developer" or self._is_multi_developer_edit_agent(agent_name)):
                 max_turns = 6
             elif phase == "implementation" and agent_name == "qa":
                 max_turns = 2
             else:
                 max_turns = 3
+        if message_bundle.get("strict_execution_mode"):
+            max_turns = min(max_turns, 3)
 
         self.logger.agent_progress(agent_name, "Executor command:")
         self.logger.agent_progress(agent_name, command)
@@ -3220,37 +3826,61 @@ class WorkflowOrchestrator:
         developer_feedback_text = str(message_bundle.get("developer_feedback_text") or "").strip()
         compact_console_prompt = self._is_compact_console_prompt_mode(agent_name, phase)
         if developer_feedback_text:
-            self.logger.agent_progress(agent_name, "Developer repair feedback:")
             feedback_lines = self._build_prompt_preview_lines(developer_feedback_text, limit=18) if compact_console_prompt else developer_feedback_text.splitlines()
-            for line in feedback_lines:
-                self.logger.agent_progress(agent_name, line)
-            self.logger.agent_progress(agent_name, "")
+            if compact_console_prompt:
+                self.logger.operator_box(f"Feedback для retry -> {agent_name}", feedback_lines, color="magenta")
+            else:
+                self.logger.agent_progress(agent_name, "Developer repair feedback:")
+                for line in feedback_lines:
+                    self.logger.agent_progress(agent_name, line)
+                self.logger.agent_progress(agent_name, "")
         if compact_console_prompt:
-            self.logger.agent_progress(agent_name, "System prompt (raw) saved in agent report file.")
+            report_path = self.logger.run_dir / "agents" / phase / f"{self.logger._safe_name(agent_name)}.md"
+            self.logger.operator_box(
+                f"Prompt сохранён -> {agent_name}",
+                [
+                    "Полный system prompt сохранён в agent report file.",
+                    f"Файл: {report_path}",
+                ],
+                color="cyan",
+            )
         else:
             self.logger.agent_progress(agent_name, "System prompt (raw):")
             for line in str(message_bundle["system_message"]).splitlines():
                 self.logger.agent_progress(agent_name, line)
             self.logger.agent_progress(agent_name, "")
-        self.logger.agent_progress(agent_name, "User task (raw):")
-        for line in str(message_bundle["user_message"]).splitlines():
-            self.logger.agent_progress(agent_name, line)
-        self.logger.agent_progress(agent_name, "")
-        self.logger.agent_progress(agent_name, "Waiting for direct_api response...")
+        user_task_lines = str(message_bundle["user_message"]).splitlines() or [""]
+        if compact_console_prompt:
+            self.logger.operator_box(f"User task -> {agent_name}", user_task_lines, color="cyan")
+            self.logger.operator_box(
+                f"Ожидание ответа -> {agent_name}",
+                ["direct_api запрос отправлен, ждём ответ модели."],
+                color="yellow",
+            )
+        else:
+            self.logger.agent_progress(agent_name, "User task (raw):")
+            for line in user_task_lines:
+                self.logger.agent_progress(agent_name, line)
+            self.logger.agent_progress(agent_name, "")
+            self.logger.agent_progress(agent_name, "Waiting for direct_api response...")
 
         started_at = time.monotonic()
         last_raw_body = ""
         response_payload: dict[str, Any] | None = None
         retrieval_rounds = 0
+        retrieval_operations_used = 0
+        read_file_operations_used = 0
         blocked_retrieval_count = 0
         developer_performed_write = False
         developer_base_retrieval_limit = 4
-        if phase == "implementation" and agent_name == "developer":
+        self._active_direct_api_agent_name = agent_name
+        if phase == "implementation" and (agent_name == "developer" or self._is_multi_developer_edit_agent(agent_name)):
             self._set_agent_report_extras(
                 "implementation",
-                "developer",
+                agent_name,
                 {
                     "write_tools_used": [],
+                    "write_paths": [],
                     "developer_changed_files": [],
                     "developer_diff_lines": 0,
                     "no_changes_detected": False,
@@ -3276,11 +3906,61 @@ class WorkflowOrchestrator:
                 retrieval_request = self._parse_direct_api_retrieval_request(output_text)
                 if not retrieval_request:
                     break
+                tool_name = str(retrieval_request.get("tool") or "")
+                retrieval_budget_check = self._evaluate_retrieval_budget(
+                    message_bundle,
+                    tool_name,
+                    retrieval_operations_used,
+                    read_file_operations_used,
+                )
+                message_bundle["retrieval_budget_remaining"] = retrieval_budget_check["remaining"]
+                if not retrieval_budget_check["allowed"]:
+                    reason = str(retrieval_budget_check["reason"])
+                    message_bundle["retrieval_limit_reason"] = reason
+                    message_bundle["retrieval_hard_stop_triggered"] = True
+                    self._set_agent_report_extras(
+                        phase,
+                        agent_name,
+                        {
+                            "retrieval_budget_remaining": retrieval_budget_check["remaining"],
+                            "retrieval_limit_reason": reason,
+                            "retrieval_hard_stop_triggered": True,
+                            "blocked_retrieval_tool": tool_name,
+                        },
+                    )
+                    feedback = self._build_strict_retrieval_feedback(agent_name, tool_name, reason, message_bundle)
+                    if phase == "implementation":
+                        self._save_feedback(self.task_counter, agent_name, feedback)
+                        self._save_feedback(self.task_counter, "developer", feedback)
+                        self._phase_failure_status = "strict_retrieval_blocked"
+                    elapsed = time.monotonic() - started_at
+                    stdout_payload = {
+                        "output_text": feedback,
+                        "model": str(response_payload.get("model") or normalized_model),
+                        "provider": "openrouter",
+                    }
+                    stdout = json.dumps(stdout_payload, ensure_ascii=False)
+                    self.logger.error(
+                        f"Strict execution blocked retrieval: {agent_name}",
+                        f"tool={tool_name} | reason={reason}",
+                    )
+                    save_agent_report("strict_retrieval_blocked", reason, elapsed, stdout, "", feedback, command, 0)
+                    self.logger.agent_end(agent_name, "strict_retrieval_blocked", reason)
+                    return False
                 retrieval_output = self._execute_direct_api_retrieval_request(retrieval_request, phase=phase, agent_name=agent_name)
+                if tool_name in {"read_file", "read_files", "search_text", "list_files"}:
+                    retrieval_operations_used += 1
+                    if tool_name in {"read_file", "read_files"}:
+                        read_file_operations_used += 1
+                if message_bundle.get("retrieval_budget") is not None:
+                    message_bundle["retrieval_budget_remaining"] = max(
+                        0,
+                        int(message_bundle.get("retrieval_budget") or 0) - retrieval_operations_used,
+                    )
                 if (
                     phase == "implementation"
                     and agent_name == "developer"
-                    and str(retrieval_request.get("tool") or "") in {"write_file", "apply_patch", "tool_batch"}
+                    and tool_name in {"write_file", "apply_patch", "tool_batch"}
                 ):
                     current_write_tools = self._get_agent_report_extras("implementation", "developer").get("write_tools_used") or []
                     if current_write_tools or str(retrieval_output or "").startswith(("Wrote file:", "Patched file:")):
@@ -3291,6 +3971,17 @@ class WorkflowOrchestrator:
                     agent_name,
                     f"Direct API retrieval turn {turn}: {retrieval_request.get('tool')}",
                 )
+                if (
+                    phase == "implementation"
+                    and self._is_multi_developer_edit_agent(agent_name)
+                    and str(retrieval_request.get("tool") or "") in {"write_file", "apply_patch", "tool_batch"}
+                    and ("Wrote file:" in str(retrieval_output or "") or "Patched file:" in str(retrieval_output or ""))
+                ):
+                    response_payload = {
+                        "choices": [{"message": {"content": "status=implemented"}}],
+                        "model": normalized_model,
+                    }
+                    break
                 if (
                     phase == "implementation"
                     and agent_name == "developer"
@@ -3456,10 +4147,17 @@ class WorkflowOrchestrator:
         stdout = json.dumps(stdout_payload, ensure_ascii=False)
         parsed_output = self._extract_agent_output(stdout)
         if parsed_output:
-            self.logger.agent_progress(agent_name, "")
-            self.logger.agent_progress(agent_name, "Agent response:")
-            for line in parsed_output.splitlines():
-                self.logger.agent_progress(agent_name, line)
+            if compact_console_prompt:
+                self.logger.operator_box(
+                    f"Ответ агента -> {agent_name}",
+                    self._build_prompt_preview_lines(parsed_output, limit=24),
+                    color="white",
+                )
+            else:
+                self.logger.agent_progress(agent_name, "")
+                self.logger.agent_progress(agent_name, "Agent response:")
+                for line in parsed_output.splitlines():
+                    self.logger.agent_progress(agent_name, line)
 
         failure_reason = self._detect_agent_failure(stdout, "", parsed_output, require_translation=False)
         if failure_reason:
@@ -3759,6 +4457,19 @@ class WorkflowOrchestrator:
             cleaned = cleaned[2:]
         return cleaned.strip("/")
 
+    def _normalize_target_relative_path(self, value: str) -> str:
+        normalized = self._normalize_repo_relative_path(value)
+        if not normalized:
+            return ""
+        workspace = self._normalize_repo_relative_path(str(self.target_workspace))
+        normalized_lower = normalized.lower()
+        workspace_lower = workspace.lower()
+        if normalized_lower == workspace_lower:
+            return ""
+        if workspace_lower and normalized_lower.startswith(workspace_lower + "/"):
+            return normalized[len(workspace) + 1 :].strip("/")
+        return normalized
+
     @staticmethod
     def _path_matches_any(path: str, patterns: list[str]) -> bool:
         normalized = WorkflowOrchestrator._normalize_repo_relative_path(path)
@@ -4011,6 +4722,8 @@ class WorkflowOrchestrator:
             "already satisfies",
             "no changes needed",
             "nothing to change",
+            "already valid",
+            "no-op, already valid",
         ]
         return any(marker in lowered for marker in completion_markers)
 
@@ -4064,14 +4777,24 @@ class WorkflowOrchestrator:
             if not candidate.exists() or not candidate.is_file():
                 findings.append(f"selected test_file is missing: {selected_test_path}")
             elif selected_test_path.endswith(".py"):
-                returncode, stdout, stderr = self._run_local_command(
-                    [sys.executable, "-m", "pytest", selected_test_path],
-                    timeout=60,
-                    cwd=self.target_workspace,
-                )
-                if returncode != 0:
-                    findings.append(f"pytest failed for selected test file: {selected_test_path}")
-                    findings.append(stderr or stdout or "unknown pytest failure")
+                selected_python, selected_python_source, pytest_available = self.resolve_python_executable()
+                self.logger.info(f"selected_python={selected_python}")
+                self.logger.info(f"selected_python_source={selected_python_source}")
+                self.logger.info(f"pytest_available={pytest_available}")
+                if not pytest_available:
+                    findings.append("pytest is not available in the resolved Python environment")
+                    findings.append(f"selected_python={selected_python}")
+                    findings.append(f"selected_python_source={selected_python_source}")
+                    selected_test_path = ""
+                else:
+                    returncode, stdout, stderr = self._run_local_command(
+                        [selected_python, "-m", "pytest", selected_test_path],
+                        timeout=60,
+                        cwd=self.target_workspace,
+                    )
+                    if returncode != 0:
+                        findings.append(f"pytest failed for selected test file: {selected_test_path}")
+                        findings.append(stderr or stdout or "unknown pytest failure")
 
         findings.extend(self._validate_changed_migration_files(python_paths))
 
@@ -4117,6 +4840,18 @@ class WorkflowOrchestrator:
 
     def _enforce_implementation_scope_diff(self) -> bool:
         diagnostics = self._collect_scope_watchdog_diff_diagnostics()
+        existing_developer = self._load_saved_agent_report("implementation", "developer") or {}
+        if self._get_implementation_execution_mode() == "multi_developer_json":
+            synthetic_changed_files = [
+                self._normalize_repo_relative_path(path)
+                for path in (existing_developer.get("developer_changed_files") or [])
+                if self._normalize_repo_relative_path(path)
+            ]
+            synthetic_write_tools = list(existing_developer.get("write_tools_used") or [])
+            if synthetic_changed_files or synthetic_write_tools:
+                diagnostics["changed_files"] = sorted(dict.fromkeys([*diagnostics.get("changed_files", []), *synthetic_changed_files]))
+                diagnostics["changed_files_count"] = len(diagnostics["changed_files"])
+                diagnostics["write_tools_used"] = synthetic_write_tools
         diagnostics["developer_changed_files"] = diagnostics["changed_files"]
         diagnostics["developer_diff_lines"] = diagnostics["diff_lines_count"]
         diagnostics["no_changes_detected"] = diagnostics["changed_files_count"] == 0
@@ -4130,7 +4865,6 @@ class WorkflowOrchestrator:
         self.logger.agent_progress("developer", f"Diagnostic developer_diff_lines={diagnostics['developer_diff_lines']}")
         self.logger.agent_progress("developer", f"Diagnostic write_tools_used={diagnostics.get('write_tools_used', self._get_agent_report_extras('implementation', 'developer').get('write_tools_used', []))}")
         self.logger.agent_progress("developer", f"Diagnostic no_changes_detected={diagnostics['no_changes_detected']}")
-        existing_developer = self._load_saved_agent_report("implementation", "developer")
         if existing_developer:
             self._overwrite_agent_report("implementation", "developer", {**existing_developer, **diagnostics})
         if diagnostics["changed_files_count"] == 0:
@@ -4386,8 +5120,134 @@ class WorkflowOrchestrator:
             return self._build_selected_task_contract_context(limit=limit)
         return self._build_previous_agent_context("implementation", agent_name, limit=limit)
 
-    def _evaluate_selected_task_contract_compliance(self) -> dict[str, Any]:
+    @staticmethod
+    def _contract_requirement_present(text: str, requirement: str) -> bool:
+        if requirement == 'revision = "<non-empty string>"':
+            return bool(re.search(r'^revision\s*=\s*[\'"][^\'"]+[\'"]', text, re.MULTILINE))
+        return requirement in text
+
+    def _configured_alembic_down_revision(self) -> str:
+        implementation = self.config.get("phases", {}).get("implementation", {})
+        value = str(implementation.get("default_alembic_down_revision") or DEFAULT_ALEMBIC_DOWN_REVISION).strip()
+        return value or DEFAULT_ALEMBIC_DOWN_REVISION
+
+    def _validate_test_developer_static_constraints(self, relative_paths: list[str]) -> list[str]:
+        findings: list[str] = []
+        for relative_path in relative_paths:
+            if not relative_path.endswith(".py"):
+                continue
+            candidate = self.target_workspace / relative_path
+            if not candidate.exists() or not candidate.is_file():
+                continue
+            try:
+                text = candidate.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                findings.append(f"{relative_path}: unable to read file: {exc}")
+                continue
+            try:
+                tree = ast.parse(text)
+            except SyntaxError as exc:
+                findings.append(f"{relative_path}: ast parse failed: {exc}")
+                continue
+            imported_modules: set[str] = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imported_modules.update(alias.name for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    imported_modules.add(node.module)
+            for module in sorted(imported_modules):
+                root = module.split(".", 1)[0]
+                if module in TEST_DEVELOPER_FORBIDDEN_IMPORTS or root in TEST_DEVELOPER_FORBIDDEN_IMPORTS:
+                    findings.append(f"{relative_path}: forbidden import: {module}")
+                elif module not in TEST_DEVELOPER_ALLOWED_IMPORTS and root not in TEST_DEVELOPER_ALLOWED_IMPORTS:
+                    findings.append(f"{relative_path}: import outside must_use_only: {module}")
+            for marker in ("pytest.main(", "alembic.command.", "command.upgrade(", "command.downgrade(", "create_engine("):
+                if marker in text:
+                    findings.append(f"{relative_path}: validation_style requires static_text_and_ast only")
+                    break
+        return findings
+
+    def _prevalidate_current_scope(self, agent_name: str) -> tuple[bool, str]:
         item = self._selected_implementation_item or {}
+        if not item or not bool(item.get("contract_completeness")):
+            return False, ""
+        findings: list[str] = []
+        contract_diag = self._evaluate_selected_task_contract_compliance(item)
+        if not contract_diag.get("contract_compliance", False):
+            findings.extend(
+                f"missing_must_contain: {value}"
+                for value in (contract_diag.get("missing_must_contain") or [])
+            )
+            if contract_diag.get("missing_test_file", False):
+                findings.append("missing_test_file: selected test_file is missing")
+            findings.extend(
+                f"forbidden_contract_hits: {value}"
+                for value in (contract_diag.get("forbidden_contract_hits") or [])
+            )
+        relevant_paths: list[str] = []
+        target_file = item.get("target_file") or {}
+        test_file = item.get("test_file") or {}
+        if isinstance(target_file, dict):
+            normalized = self._normalize_repo_relative_path(target_file.get("path"))
+            if normalized:
+                relevant_paths.append(normalized)
+        if isinstance(test_file, dict):
+            normalized = self._normalize_repo_relative_path(test_file.get("path"))
+            if normalized:
+                relevant_paths.append(normalized)
+        python_paths = [path for path in sorted(set(relevant_paths)) if path.endswith(".py")]
+        if python_paths:
+            returncode, stdout, stderr = self._run_local_command(
+                [sys.executable, "-m", "py_compile", *python_paths],
+                timeout=30,
+                cwd=self.target_workspace,
+            )
+            if returncode != 0:
+                findings.append(stderr or stdout or "py_compile failed")
+        if isinstance(target_file, dict):
+            target_path = self._normalize_repo_relative_path(target_file.get("path"))
+            if target_path and self._is_alembic_migration_path(target_path):
+                findings.extend(self._validate_changed_migration_files([target_path]))
+        if agent_name == "test-developer":
+            findings.extend(self._validate_test_developer_static_constraints(python_paths))
+        if findings:
+            return False, "\n".join(findings)
+        return True, "no-op, already valid"
+
+    def _maybe_skip_already_valid_scope(self, agent_name: str, agent_runtime: dict[str, str]) -> bool:
+        already_valid, detail = self._prevalidate_current_scope(agent_name)
+        if not already_valid:
+            return False
+        self.logger.save_agent_report(
+            "implementation",
+            agent_name,
+            {
+                "phase": "implementation",
+                "agent": agent_name,
+                "agent_name": agent_name,
+                "status": "no_changes",
+                "result": detail,
+                "elapsed_s": 0.0,
+                "returncode": 0,
+                "runtime": agent_runtime,
+                "command": "",
+                "message": "",
+                "prompt_stats": {},
+                "stdout": "",
+                "stderr": "",
+                "parsed_output": f"status=no_changes: {detail}",
+                "usage": {},
+                "developer_changed_files": [],
+                "developer_diff_lines": 0,
+                "write_tools_used": [],
+                "no_changes_detected": True,
+            },
+        )
+        self.logger.agent_end(agent_name, "no_changes", detail)
+        return True
+
+    def _evaluate_selected_task_contract_compliance(self, item: dict[str, Any] | None = None) -> dict[str, Any]:
+        item = item or self._selected_implementation_item or {}
         target_file = self._normalize_repo_relative_path((item.get("target_file") or {}).get("path")) if isinstance(item.get("target_file"), dict) else ""
         test_file = self._normalize_repo_relative_path((item.get("test_file") or {}).get("path")) if isinstance(item.get("test_file"), dict) else ""
         must_contain = [str(value).strip() for value in (item.get("must_contain") or []) if str(value).strip()]
@@ -4412,7 +5272,7 @@ class WorkflowOrchestrator:
                     test_text = candidate.read_text(encoding="utf-8", errors="replace")
                 except OSError:
                     test_text = ""
-        missing_must_contain = [value for value in must_contain if value not in target_text]
+        missing_must_contain = [value for value in must_contain if not self._contract_requirement_present(target_text, value)]
         forbidden_hits = [value for value in forbidden if value and (value in target_text or value in test_text)]
         return {
             "contract_completeness": bool(item.get("contract_completeness", False)),
@@ -5572,6 +6432,16 @@ class WorkflowOrchestrator:
             target_file_action = "create" if target_file_path in new_files else "update"
         if not target_file_purpose:
             target_file_purpose = scope
+        if target_file_path and self._is_alembic_migration_path(target_file_path):
+            must_contain = list(
+                dict.fromkeys(
+                    [
+                        *must_contain,
+                        'revision = "<non-empty string>"',
+                        f'down_revision = "{self._configured_alembic_down_revision()}"',
+                    ]
+                )
+            )
         if not test_file_path:
             test_file_path = (required_test_paths or [""])[0]
         if not test_file_action:
@@ -6530,10 +7400,11 @@ class WorkflowOrchestrator:
         self.logger.info(f"Diagnostic feedback_file={feedback_file}")
         preview_lines = self._build_feedback_preview_lines(feedback)
         if preview_lines:
-            self.logger.info(f"Feedback preview ({agent}):")
-            for line in preview_lines:
-                self.logger.info(f"  {line}")
-        self.logger.info(f"Р¤Р°Р№Р» РѕР±СЂР°С‚РЅРѕР№ СЃРІСЏР·Рё СЃРѕС…СЂР°РЅРµРЅ: {feedback_file}")
+            self.logger.operator_box(
+                f"Обратная связь сохранена -> {agent}",
+                [f"Файл: {feedback_file}", "", *preview_lines],
+                color="magenta",
+            )
         return feedback_file
 
     def _developer_feedback_path_for_current_attempt(self) -> Path:
@@ -6608,8 +7479,30 @@ class WorkflowOrchestrator:
         if deterministic_output:
             sections.append("\n".join(["Deterministic checks to repair", deterministic_output]))
 
+        feedback_root = self._engine_path(self.config.get("paths", {}).get("feedback_dir", ".openclaw/feedback"))
+        attempt = self._implementation_attempt if self._implementation_attempt > 0 else max(int(task_id or 0), 1)
+        run_feedback_dir = feedback_root / self.project_id / self.logger.run_dir.name / f"attempt_{attempt}"
+        for sub_agent in ("code-developer", "infra-developer", "test-developer"):
+            sub_feedback_file = run_feedback_dir / f"{sub_agent}.md"
+            try:
+                sub_feedback = sub_feedback_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                sub_feedback = ""
+            if sub_feedback:
+                sections.append("\n".join([f"{sub_agent} feedback to repair", sub_feedback]))
+
         if not sections:
-            return
+            fallback_status = str(self._phase_failure_status or "").strip() or "unknown_failure"
+            sections.append(
+                "\n".join(
+                    [
+                        "Pipeline failure summary",
+                        f"Failure status: {fallback_status}",
+                        "No detailed QA or deterministic findings were captured for this attempt.",
+                        "Inspect the latest agent reports for the failing sub-agent and the implementation developer report.",
+                    ]
+                )
+            )
         feedback = "\n\n".join(
             [
                 "Implementation repair feedback",
@@ -6716,15 +7609,24 @@ class WorkflowOrchestrator:
             candidate = self.target_workspace / test_file_path
             if not candidate.exists() or not candidate.is_file():
                 findings.append(f"selected test_file is missing: {test_file_path}")
-            elif test_file_path.endswith(".py"):
-                returncode, stdout, stderr = self._run_local_command(
-                    [sys.executable, "-m", "pytest", test_file_path],
-                    timeout=60,
-                    cwd=self.target_workspace,
-                )
-                if returncode != 0:
-                    findings.append(f"pytest failed for selected test file: {test_file_path}")
-                    findings.append(stderr or stdout or "unknown pytest failure")
+            elif test_file_path.endswith(".py") and Path(test_file_path).name != "__init__.py":
+                selected_python, selected_python_source, pytest_available = self.resolve_python_executable()
+                self.logger.info(f"selected_python={selected_python}")
+                self.logger.info(f"selected_python_source={selected_python_source}")
+                self.logger.info(f"pytest_available={pytest_available}")
+                if not pytest_available:
+                    findings.append("pytest is not available in the resolved Python environment")
+                    findings.append(f"selected_python={selected_python}")
+                    findings.append(f"selected_python_source={selected_python_source}")
+                else:
+                    returncode, stdout, stderr = self._run_local_command(
+                        [selected_python, "-m", "pytest", test_file_path],
+                        timeout=60,
+                        cwd=self.target_workspace,
+                    )
+                    if returncode != 0:
+                        findings.append(f"pytest failed for selected test file: {test_file_path}")
+                        findings.append(stderr or stdout or "unknown pytest failure")
 
         findings.extend(self._validate_changed_migration_files(changed_python_files))
 

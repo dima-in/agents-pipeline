@@ -35,3 +35,11 @@ def route_paths(paths: list[str]) -> list[AgentName]:
             ordered.append(agent)
     return ordered
 
+
+def filter_paths_for_agent(paths: list[str], agent_name: AgentName) -> list[str]:
+    filtered: list[str] = []
+    for path in paths:
+        normalized = str(path or "").strip()
+        if normalized and classify_path(normalized) == agent_name:
+            filtered.append(normalized)
+    return filtered

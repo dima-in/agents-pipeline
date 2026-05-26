@@ -9,6 +9,24 @@ from workflow.multi_developer_dispatcher import classify_path
 REQUIRED_FIELDS = ("agent", "task_id", "reasoning", "operations")
 
 
+def _extract_json_object(raw_output: str) -> str:
+    cleaned = str(raw_output or "").strip()
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    if cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+    cleaned = cleaned.strip()
+    if cleaned.startswith("{") and cleaned.endswith("}"):
+        return cleaned
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return cleaned[start : end + 1].strip()
+    return cleaned
+
+
 def validate_operation(op: dict[str, Any], allowed_files: list[str], agent_name: str, index: int) -> list[str]:
     errors: list[str] = []
     prefix = f"operation[{index}]"
@@ -51,14 +69,7 @@ def validate_agent_output(agent_output: dict[str, Any], allowed_files: list[str]
 
 
 def parse_and_validate(raw_output: str, allowed_files: list[str], agent_name: str) -> tuple[dict[str, Any] | None, list[str]]:
-    cleaned = str(raw_output or "").strip()
-    if cleaned.startswith("```json"):
-        cleaned = cleaned[7:]
-    if cleaned.startswith("```"):
-        cleaned = cleaned[3:]
-    if cleaned.endswith("```"):
-        cleaned = cleaned[:-3]
-    cleaned = cleaned.strip()
+    cleaned = _extract_json_object(raw_output)
     try:
         payload = json.loads(cleaned)
     except json.JSONDecodeError as exc:
@@ -67,4 +78,3 @@ def parse_and_validate(raw_output: str, allowed_files: list[str], agent_name: st
         return None, ["agent output must be a JSON object"]
     errors = validate_agent_output(payload, allowed_files, agent_name)
     return payload, errors
-

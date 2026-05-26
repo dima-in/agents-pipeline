@@ -110,7 +110,8 @@ phases:
 
   implementation:
     name: "Implementation"
-    execution_mode: single_developer
+    execution_mode: multi_developer_json
+    default_alembic_down_revision: "0005"
     multi_developer_agents:
       - name: code-developer
         description: "Write application code only"
@@ -122,14 +123,14 @@ phases:
         description: "Write migrations and config only"
         timeout: 1800
         provider: openrouter
-        model: openrouter/anthropic/claude-sonnet-4.5
-        thinking: low
+        model: gpt-5.4
+        thinking: medium
       - name: test-developer
         description: "Write pytest tests only"
         timeout: 1200
         provider: openrouter
-        model: openrouter/anthropic/claude-3.5-haiku
-        thinking: low
+        model: gpt-5.4
+        thinking: medium
     agents:
       - name: architect
         description: "Prepare technical plan"
@@ -154,13 +155,13 @@ phases:
         timeout: 2400
         max_retries: 3
         provider: openrouter
-        model: openrouter/anthropic/claude-sonnet-4.5
+        model: gpt-5.4
         thinking: low
       - name: qa
         description: "Run checks and report regressions"
         timeout: 900
         provider: openrouter
-        model: openrouter/deepseek/deepseek-v4-pro
+        model: gpt-5.4
         thinking: low
       - name: template-validator
         description: "Validate output against template"
@@ -192,6 +193,7 @@ git:
   strategy: feature-branch
   branch_prefix: feature/
   auto_rollback: true
+  rollback_dirty_strategy: fail
 
 logging:
   level: INFO
