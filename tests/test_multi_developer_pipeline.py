@@ -31,6 +31,70 @@ def test_filter_paths_for_agent_keeps_only_matching_scope() -> None:
     assert filter_paths_for_agent(paths, "test-developer") == ["gateway-v4/tests/test_provider_metrics_migration.py"]
 
 
+def test_multi_developer_editable_paths_include_existing_allowed_paths(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator._selected_implementation_item = {
+        "allowed_paths": [
+            "gateway-v4/app/database.py",
+            "gateway-v4/app/models.py",
+            "gateway-v4/alembic/versions/20240801_add_provider_metrics.py",
+            "gateway-v4/tests/__init__.py",
+            "gateway-v4/tests/test_provider_metrics_migration.py",
+        ],
+        "existing_paths": ["gateway-v4/app/database.py", "gateway-v4/app/models.py"],
+        "new_files": [
+            "gateway-v4/alembic/versions/20240801_add_provider_metrics.py",
+            "gateway-v4/tests/__init__.py",
+            "gateway-v4/tests/test_provider_metrics_migration.py",
+        ],
+        "required_test_paths": ["gateway-v4/tests/test_provider_metrics_migration.py"],
+    }
+
+    editable_paths = orchestrator._build_multi_developer_editable_paths()
+
+    assert "gateway-v4/app/models.py" in editable_paths
+    assert route_paths(editable_paths) == ["code-developer", "infra-developer", "test-developer"]
+
+
+def test_multi_developer_agents_receive_selected_task_contract_context(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator._selected_implementation_item = {
+        "id": "TASK-001",
+        "title": "Add provider metrics migration",
+        "scope": "backend-only",
+        "allowed_paths": ["gateway-v4/tests/test_provider_metrics_migration.py"],
+        "target_file": {"path": "gateway-v4/alembic/versions/20240801_add_provider_metrics.py", "action": "create"},
+        "test_file": {"path": "gateway-v4/tests/test_provider_metrics_migration.py", "action": "create"},
+        "must_contain": ["def upgrade():", "def downgrade():"],
+        "must_test": ["test_provider_metrics_migration_upgrade: assert migration columns"],
+        "contract_completeness": True,
+    }
+
+    context = orchestrator._build_implementation_same_phase_context("test-developer")
+
+    assert "[selected-task-contract]" in context
+    assert "developer_contract:" in context
+    assert "target_file.path: gateway-v4/alembic/versions/20240801_add_provider_metrics.py" in context
+    assert "test_file.path: gateway-v4/tests/test_provider_metrics_migration.py" in context
+
+
+def test_multi_developer_scope_instruction_marks_other_context_read_only(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator._selected_implementation_item = {
+        "allowed_paths": ["gateway-v4/tests/test_provider_metrics_migration.py"],
+    }
+    orchestrator.user_goal = ""
+    orchestrator.context_mode = ""
+    orchestrator.config = {"project": {"name": "ai-getaway"}}
+    orchestrator.project_id = "github.com-dima-in-ai_getaway"
+
+    instruction = orchestrator._build_implementation_scope_instruction("backend-only", agent_name="test-developer")
+
+    assert "Agent-scoped allowed files for this invocation:" in instruction
+    assert "Write only the files listed directly above." in instruction
+    assert "sibling agent reports as read-only context" in instruction
+
+
 def test_parse_and_validate_accepts_allowed_agent_output() -> None:
     payload, errors = parse_and_validate(
         """

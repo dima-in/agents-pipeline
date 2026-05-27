@@ -1495,7 +1495,10 @@ def test_planner_task_normalization_populates_developer_contract() -> None:
     assert normalized is not None
     assert normalized["target_file"]["path"] == "gateway-v4/alembic/versions/001_add_provider_metrics.py"
     assert normalized["test_file"]["path"] == "gateway-v4/tests/test_provider_metrics_model.py"
-    assert normalized["must_contain"] == ["def upgrade()", "def downgrade()"]
+    assert "def upgrade()" in normalized["must_contain"]
+    assert "def downgrade()" in normalized["must_contain"]
+    assert 'revision = "<non-empty string>"' in normalized["must_contain"]
+    assert 'down_revision = "0005"' in normalized["must_contain"]
     assert normalized["contract_completeness"] is True
 
 

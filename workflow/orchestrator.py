@@ -506,7 +506,7 @@ class WorkflowOrchestrator:
     def _build_multi_developer_editable_paths(self) -> list[str]:
         item = self._selected_implementation_item or {}
         paths: list[str] = []
-        for key in ("new_files", "required_test_paths"):
+        for key in ("allowed_paths", "new_files", "required_test_paths"):
             for path in item.get(key, []) or []:
                 normalized = self._normalize_repo_relative_path(path)
                 if normalized:
@@ -1921,7 +1921,7 @@ class WorkflowOrchestrator:
         if developer_feedback_text:
             combined_parts.append(f"Previous validation feedback to repair:\n{developer_feedback_text}")
         if phase == "implementation":
-            combined_parts.append(self._build_implementation_scope_instruction(selected_task_scope))
+            combined_parts.append(self._build_implementation_scope_instruction(selected_task_scope, agent_name=agent_name))
         combined_parts.append(translation_instruction)
         combined_message = "\n\n".join(combined_parts)
 
@@ -1937,7 +1937,7 @@ class WorkflowOrchestrator:
         if developer_feedback_text:
             system_parts.append(f"Previous validation feedback to repair:\n{developer_feedback_text}")
         if phase == "implementation":
-            system_parts.append(self._build_implementation_scope_instruction(selected_task_scope))
+            system_parts.append(self._build_implementation_scope_instruction(selected_task_scope, agent_name=agent_name))
         system_parts.append(translation_instruction)
         system_message = "\n\n".join(part for part in system_parts if part)
         user_message = task or "Follow the system instructions and produce the requested output format."
@@ -4387,7 +4387,7 @@ class WorkflowOrchestrator:
         text = "\n\n".join(part.strip() for part in parts if part.strip())
         return text[:2000]
 
-    def _build_implementation_scope_instruction(self, selected_scope: str) -> str:
+    def _build_implementation_scope_instruction(self, selected_scope: str, agent_name: str = "") -> str:
         lines = [
             "User goal:",
             str(self.user_goal or "not specified"),
@@ -4396,10 +4396,24 @@ class WorkflowOrchestrator:
             selected_scope,
             "",
         ]
+        multi_developer_agent = self._is_multi_developer_edit_agent(agent_name)
         if self._selected_implementation_item and self._selected_implementation_item.get("allowed_paths"):
-            lines.append("Allowed files for the selected task:")
+            if multi_developer_agent:
+                lines.append("Agent-scoped allowed files for this invocation:")
+            else:
+                lines.append("Allowed files for the selected task:")
             lines.extend(f"- {path}" for path in self._selected_implementation_item["allowed_paths"])
             lines.append("")
+            if multi_developer_agent:
+                lines.extend(
+                    [
+                        "Agent-scoped write boundary:",
+                        "- Write only the files listed directly above.",
+                        "- Treat every other path mentioned in repository context, resume handoff, planner output, or sibling agent reports as read-only context.",
+                        "- If another file is needed, leave it for the matching multi-developer agent and return status=no_changes with the missing-path reason.",
+                        "",
+                    ]
+                )
         lines.extend(
             [
             "Implementation guardrails:",
@@ -4952,7 +4966,10 @@ class WorkflowOrchestrator:
                 ("Target dependency and config files", self._build_target_dependency_context(limit=2200)),
                 ("Target top-level tree up to depth 4", self._build_top_level_tree(root=self.target_workspace, depth=4)),
             ]
-        if agent_name in {"task-designer", "developer", "qa", "template-validator"}:
+        if (
+            agent_name in {"task-designer", "developer", "qa", "template-validator"}
+            or self._is_multi_developer_edit_agent(agent_name)
+        ):
             scoped_excerpts = self._build_selected_task_file_excerpts(limit=4200)
             if scoped_excerpts:
                 sections.append(("Selected task file excerpts", scoped_excerpts))
@@ -5116,7 +5133,7 @@ class WorkflowOrchestrator:
     def _build_implementation_same_phase_context(self, agent_name: str, limit: int = 4000) -> str:
         if agent_name == "task-designer":
             return self._build_selected_task_outline_context(limit=limit)
-        if agent_name in {"developer", "qa", "template-validator"}:
+        if agent_name in {"developer", "qa", "template-validator"} or self._is_multi_developer_edit_agent(agent_name):
             return self._build_selected_task_contract_context(limit=limit)
         return self._build_previous_agent_context("implementation", agent_name, limit=limit)
 
@@ -7699,7 +7716,13 @@ class WorkflowOrchestrator:
         files = repo_map.get("files") or []
         directories = [str(path) for path in (repo_map.get("directories") or []) if str(path).strip()]
         relevant_files = [str(path) for path in (repo_map.get("agent_relevant_files") or []) if str(path).strip()]
-        if agent_name in {"task-designer", "developer", "qa", "template-validator"} and self._selected_implementation_item:
+        if (
+            self._selected_implementation_item
+            and (
+                agent_name in {"task-designer", "developer", "qa", "template-validator"}
+                or self._is_multi_developer_edit_agent(agent_name)
+            )
+        ):
             relevant_files = [str(path) for path in (self._selected_implementation_item.get("allowed_paths") or []) if str(path).strip()]
         lines = [
             f"repo_map_path: {self.repo_map_path}",
