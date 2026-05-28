@@ -5324,6 +5324,32 @@ def test_cached_completed_selection_refreshes_to_first_incomplete(tmp_path: Path
     assert second._skipped_completed_task_ids == ["TASK-001"]
 
 
+def test_task_designer_contract_is_not_cleared_by_legacy_completed_task_id(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    _prepare_backlog_target_workspace(target_workspace)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    backlog = _canonical_backlog_fixture("Fresh planner")
+    _save_planner_backlog(orchestrator, backlog)
+    selected_contract = dict(backlog[0])
+    selected_contract["contract_source"] = "task-designer"
+    orchestrator.project_settings["completed_implementation_tasks"] = ["TASK-001"]
+    orchestrator._selected_implementation_item = selected_contract
+    orchestrator._implementation_backlog_cache = backlog
+    orchestrator._implementation_backlog_source = "implementation-planner"
+    orchestrator._selected_task_source = "new_planner_output"
+
+    selection = orchestrator._prepare_implementation_backlog_selection(require_backlog=True)
+
+    assert selection["error"] == ""
+    assert selection["selected_item"]["id"] == "TASK-001"
+    assert selection["selected_item"]["contract_source"] == "task-designer"
+    assert orchestrator._selected_implementation_item["contract_source"] == "task-designer"
+
+
 def test_resume_selected_completed_task_falls_back_to_first_incomplete(tmp_path: Path) -> None:
     engine_root = tmp_path / "engine"
     target_workspace = tmp_path / "target"

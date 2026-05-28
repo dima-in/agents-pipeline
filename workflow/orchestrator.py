@@ -5913,6 +5913,7 @@ class WorkflowOrchestrator:
             and not force_refresh
             and not self._selected_task_from_explicit_cli
             and not self.rerun_completed
+            and str(self._selected_implementation_item.get("contract_source") or "") != "task-designer"
             and str(self._selected_implementation_item.get("id") or "").strip() in set(self._completed_implementation_task_ids())
         ):
             self._selected_implementation_item = None
