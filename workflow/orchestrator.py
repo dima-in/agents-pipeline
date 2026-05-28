@@ -2432,6 +2432,24 @@ class WorkflowOrchestrator:
             "to write/apply_patch directly from injected context."
         )
 
+    def _should_force_final_after_retrieval_limit(self, phase: str, agent_name: str) -> bool:
+        if phase != "implementation":
+            return False
+        if agent_name == "qa":
+            return False
+        if agent_name == "developer" or self._is_multi_developer_edit_agent(agent_name):
+            return False
+        return True
+
+    @staticmethod
+    def _build_retrieval_limit_final_instruction(phase: str, agent_name: str) -> str:
+        return (
+            "Retrieval budget is now exhausted. Do not request any more tools. "
+            "Use the repository context and local retrieval results already provided to produce your final answer now. "
+            "If information is incomplete, state the assumptions and concrete gaps in the final answer instead of asking for more retrieval. "
+            f"Phase: {phase}. Agent: {agent_name}."
+        )
+
     @staticmethod
     def _default_implementation_scope_policy() -> dict[str, Any]:
         return {
@@ -4264,6 +4282,32 @@ class WorkflowOrchestrator:
                         "content": "Local retrieval result:\n" + (retrieval_output or "No matching local results."),
                     }
                 )
+                if turn >= max_turns and self._should_force_final_after_retrieval_limit(phase, agent_name):
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": self._build_retrieval_limit_final_instruction(phase, agent_name),
+                        }
+                    )
+                    final_payload = {
+                        "model": normalized_model,
+                        "messages": messages,
+                        "temperature": 0.2,
+                    }
+                    final_max_tokens = self._direct_api_max_tokens(phase, agent_name)
+                    if final_max_tokens is not None:
+                        final_payload["max_tokens"] = final_max_tokens
+                    _status_code, final_raw_body = self._perform_direct_api_request(final_payload, api_key, timeout)
+                    last_raw_body = final_raw_body
+                    response_payload = json.loads(final_raw_body)
+                    final_output_text = self._extract_direct_api_text(response_payload)
+                    if self._parse_direct_api_retrieval_request(final_output_text):
+                        response_payload = {
+                            "choices": [{"message": {"content": "Exceeded retrieval rounds.\n\nRussian translation\nПревышен лимит раундов retrieval."}}],
+                            "model": normalized_model,
+                        }
+                        message_bundle["retrieval_rounds"] = max_turns
+                    break
                 developer_extras = self._get_agent_report_extras("implementation", "developer")
                 write_tools_used = developer_extras.get("write_tools_used") or []
                 failed_write_attempts = int(developer_extras.get("failed_write_attempts") or 0)

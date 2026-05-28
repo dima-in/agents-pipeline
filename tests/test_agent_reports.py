@@ -2104,6 +2104,83 @@ def test_direct_api_retrieval_reads_local_file_and_requeries(monkeypatch, tmp_pa
     assert payload["project_id"] == orchestrator.project_id
 
 
+def test_implementation_planning_agent_finalizes_after_retrieval_limit(monkeypatch, tmp_path: Path) -> None:
+    orchestrator = WorkflowOrchestrator("workflow/config.yaml")
+    orchestrator.logger = WorkflowLogger(log_dir=str(tmp_path / "logs"))
+    requests: list[dict[str, object]] = []
+    responses = [
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"tool":"read_files","paths":["workflow/config.yaml"]}'
+                    }
+                }
+            ],
+            "model": "anthropic/claude-sonnet-4.5",
+        },
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"tool":"read_files","paths":["workflow/orchestrator.py"]}'
+                    }
+                }
+            ],
+            "model": "anthropic/claude-sonnet-4.5",
+        },
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"tool":"read_files","paths":["tests/test_agent_reports.py"]}'
+                    }
+                }
+            ],
+            "model": "anthropic/claude-sonnet-4.5",
+        },
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": "Финальный технический план без дополнительных запросов."
+                    }
+                }
+            ],
+            "model": "anthropic/claude-sonnet-4.5",
+        },
+    ]
+
+    def fake_urlopen(request, timeout=0):
+        requests.append(json.loads(request.data.decode("utf-8")))
+        return _FakeHTTPResponse(responses[len(requests) - 1])
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.setattr(orchestrator_module.urllib_request, "urlopen", fake_urlopen)
+
+    ok = orchestrator._run_agent(
+        {
+            "name": "architect",
+            "description": "Prepare technical plan",
+            "timeout": 5,
+            "provider": "openrouter",
+            "model": "openrouter/anthropic/claude-sonnet-4.5",
+        },
+        "implementation",
+    )
+
+    report = json.loads(
+        (orchestrator.logger.run_dir / "agents" / "implementation" / "architect.json").read_text(encoding="utf-8")
+    )
+
+    assert ok is True
+    assert len(requests) == 4
+    assert "Retrieval budget is now exhausted" in requests[-1]["messages"][-1]["content"]
+    assert report["status"] == "success"
+    assert report["retrieval_rounds"] == 3
+    assert report["parsed_output"] == "Финальный технический план без дополнительных запросов."
+
+
 def test_direct_api_retrieval_parses_fenced_json_with_preface() -> None:
     orchestrator = WorkflowOrchestrator("workflow/config.yaml")
 
