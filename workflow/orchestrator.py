@@ -506,7 +506,7 @@ class WorkflowOrchestrator:
     def _build_multi_developer_editable_paths(self) -> list[str]:
         item = self._selected_implementation_item or {}
         paths: list[str] = []
-        for key in ("allowed_paths", "new_files", "required_test_paths"):
+        for key in ("new_files", "required_test_paths"):
             for path in item.get(key, []) or []:
                 normalized = self._normalize_repo_relative_path(path)
                 if normalized:
@@ -523,18 +523,41 @@ class WorkflowOrchestrator:
     def _build_multi_developer_task_override(self, agent_name: str, editable_paths: list[str]) -> dict[str, Any]:
         item = dict(self._selected_implementation_item or {})
         allowed_paths = filter_paths_for_agent(editable_paths, agent_name)
+        allowed_path_set = set(allowed_paths)
         item["allowed_paths"] = list(allowed_paths)
         for key in ("new_files", "existing_paths", "required_test_paths"):
             item[key] = [
                 path
                 for path in (item.get(key) or [])
-                if self._normalize_repo_relative_path(path) in allowed_paths
+                if self._normalize_repo_relative_path(path) in allowed_path_set
             ]
+        raw_reasons = item.get("reason_each_path_is_needed") or {}
+        if isinstance(raw_reasons, dict):
+            item["reason_each_path_is_needed"] = {
+                path: reason
+                for path, reason in raw_reasons.items()
+                if self._normalize_repo_relative_path(path) in allowed_path_set
+            }
+        target_file_in_scope = False
+        test_file_in_scope = False
         for key in ("target_file", "test_file"):
             candidate = item.get(key)
             if isinstance(candidate, dict):
                 normalized = self._normalize_repo_relative_path(candidate.get("path"))
-                item[key] = dict(candidate) if normalized in allowed_paths else {}
+                keep_as_read_only_test_subject = key == "target_file" and agent_name == "test-developer" and bool(normalized)
+                if normalized in allowed_path_set or keep_as_read_only_test_subject:
+                    item[key] = dict(candidate)
+                    if key == "target_file" and normalized in allowed_path_set:
+                        target_file_in_scope = True
+                    if key == "test_file" and normalized in allowed_path_set:
+                        test_file_in_scope = True
+                else:
+                    item[key] = {}
+        if not target_file_in_scope and agent_name != "test-developer":
+            item["must_contain"] = []
+            item["must_import"] = []
+        if not test_file_in_scope and agent_name != "test-developer":
+            item["must_test"] = []
         return item
 
     def _save_multi_developer_synthetic_report(self, applied_agents: list[str], changed_paths: list[str], warnings: list[str]) -> None:
@@ -693,6 +716,11 @@ class WorkflowOrchestrator:
 
         target_file = scoped_item.get("target_file") or {}
         target_path = self._normalize_repo_relative_path(target_file.get("path")) if isinstance(target_file, dict) else ""
+        if agent_name == "code-developer" and allowed_paths and not target_path:
+            findings.append(
+                "code-developer has editable application paths but no scoped target_file contract; "
+                "status=no_changes would mask missing code work"
+            )
         if target_path:
             target_candidate = self.target_workspace / target_path
             try:
@@ -717,6 +745,92 @@ class WorkflowOrchestrator:
         if findings:
             return False, "; ".join(findings)
         return True, "status=no_changes accepted after scoped deterministic validation"
+
+    def _validate_multi_developer_changed_scope(
+        self,
+        agent_name: str,
+        scoped_item: dict[str, Any],
+        changed_paths: list[str],
+    ) -> tuple[bool, str]:
+        findings: list[str] = []
+        normalized_paths = sorted(
+            {
+                self._normalize_repo_relative_path(path)
+                for path in changed_paths
+                if self._normalize_repo_relative_path(path)
+            }
+        )
+        existing_paths: list[str] = []
+        for path in normalized_paths:
+            candidate = self.target_workspace / path
+            if not candidate.exists() or not candidate.is_file():
+                findings.append(f"{path}: scoped changed file is missing")
+            else:
+                existing_paths.append(path)
+
+        py_paths = [path for path in existing_paths if path.endswith(".py")]
+        if py_paths:
+            returncode, stdout, stderr = self._run_local_command(
+                [sys.executable, "-m", "py_compile", *py_paths],
+                timeout=30,
+                cwd=self.target_workspace,
+            )
+            if returncode != 0:
+                findings.append("py_compile failed for scoped changed files")
+                findings.append(stderr or stdout or "unknown py_compile failure")
+
+        if agent_name == "infra-developer":
+            findings.extend(self._validate_changed_migration_files(existing_paths))
+        if agent_name == "test-developer":
+            findings.extend(self._validate_test_developer_static_constraints(py_paths))
+
+        forbidden = [str(item).strip() for item in (scoped_item.get("forbidden") or []) if str(item).strip()]
+        if forbidden:
+            for path in existing_paths:
+                try:
+                    text = (self.target_workspace / path).read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    text = ""
+                for value in forbidden:
+                    if value in text:
+                        findings.append(f"{path}: forbidden content present: {value}")
+
+        if findings:
+            return False, "; ".join(findings)
+        return True, "scoped changed files passed deterministic validation"
+
+    @staticmethod
+    def _build_multi_developer_validation_feedback(
+        agent_name: str,
+        agent_allowed_paths: list[str],
+        detection: dict[str, Any],
+        detail: str,
+    ) -> str:
+        return "\n".join(
+            [
+                "# Multi Developer Validation Feedback",
+                "",
+                f"- agent: {agent_name}",
+                "- result: scoped deterministic validation failed",
+                "- editable_paths: " + ", ".join(agent_allowed_paths),
+                "",
+                "Diagnostics:",
+                "- actual_changed_files: " + ", ".join(detection.get("actual_changed_files") or []),
+                "- detected_git_diff_files: " + ", ".join(detection.get("detected_git_diff_files") or []),
+                "- normalized_allowed_paths: " + ", ".join(detection.get("normalized_allowed_paths") or []),
+                "- normalized_written_paths: " + ", ".join(detection.get("normalized_written_paths") or []),
+                f"- scoped_path_match_result: {detection.get('scoped_path_match_result')}",
+                f"- diff_detection_stage: {detection.get('diff_detection_stage')}",
+                f"- write_operation_detected: {detection.get('write_operation_detected')}",
+                "",
+                "Errors:",
+                "- " + detail,
+                "",
+                "Required next action:",
+                "- fix only this agent's scoped files",
+                "- do not continue to sibling agents until this scoped validation passes",
+            ]
+        )
 
     def _run_multi_developer_json_flow(self, phase: dict[str, Any], *, index: int, total: int) -> bool:
         agent_configs = self._get_multi_developer_agent_configs()
@@ -832,6 +946,24 @@ class WorkflowOrchestrator:
                 self.logger.error(f"Constraint validation failed for {routed_name}", "agent completed without modifying scoped editable paths")
                 self._phase_failure_status = "invalid_output"
                 return False
+            if effective_changed:
+                changed_ok, changed_detail = self._validate_multi_developer_changed_scope(
+                    routed_name,
+                    scoped_item,
+                    effective_changed,
+                )
+                if not changed_ok:
+                    feedback = self._build_multi_developer_validation_feedback(
+                        routed_name,
+                        agent_allowed_paths,
+                        detection,
+                        changed_detail,
+                    )
+                    self._save_feedback(self.task_counter, routed_name, feedback)
+                    self._save_feedback(self.task_counter, "developer", feedback)
+                    self.logger.error(f"Constraint validation failed for {routed_name}", changed_detail)
+                    self._phase_failure_status = "invalid_output"
+                    return False
             applied_agents.append(routed_name)
             changed_paths.extend(effective_changed or agent_allowed_paths)
         self._save_multi_developer_synthetic_report(applied_agents, sorted(dict.fromkeys(changed_paths)), warnings)
@@ -2128,7 +2260,7 @@ class WorkflowOrchestrator:
             return "config"
         if agent_name == "test-developer":
             return "tests"
-        if agent_name == "code-developer" and len(allowed_paths) <= 2:
+        if agent_name == "code-developer" and len(allowed_paths) == 1:
             return "isolated_file_patch"
         return "other"
 
@@ -3335,12 +3467,12 @@ class WorkflowOrchestrator:
             path = str(payload.get("path") or "").strip()
             if not path:
                 return "Invalid read_file request."
-            return self._direct_api_read_files([path], limit=8000)
+            return self._direct_api_read_files([path], limit=self._direct_api_read_limit_for_agent(phase, agent_name))
         if tool == "read_files":
             paths = payload.get("paths")
             if not isinstance(paths, list):
                 return "Invalid read_files request."
-            return self._direct_api_read_files([str(path) for path in paths], limit=8000)
+            return self._direct_api_read_files([str(path) for path in paths], limit=self._direct_api_read_limit_for_agent(phase, agent_name))
         if tool == "search_text":
             pattern = str(payload.get("pattern") or "").strip()
             limit = self._coerce_int(payload.get("limit")) or 20
@@ -3379,6 +3511,12 @@ class WorkflowOrchestrator:
                 return "Invalid apply_patch request."
             return self._direct_api_apply_patch(path, search, replace)
         return f"Unsupported retrieval tool: {tool}"
+
+    @staticmethod
+    def _direct_api_read_limit_for_agent(phase: str, agent_name: str) -> int:
+        if phase == "implementation" and agent_name in {"qa", "template-validator"}:
+            return 40000
+        return 8000
 
     def _build_developer_force_write_instruction(self) -> str:
         item = self._selected_implementation_item or {}
@@ -3538,7 +3676,11 @@ class WorkflowOrchestrator:
         chunks: list[str] = []
         total = 0
         workspace_root = self.target_workspace.resolve()
-        for raw_path in paths[:12]:
+        selected_paths = paths[:12]
+        per_file_limit = 2500
+        if limit > 8000:
+            per_file_limit = max(2500, min(20000, limit // max(1, min(len(selected_paths), 5))))
+        for raw_path in selected_paths:
             candidate = (workspace_root / raw_path).resolve()
             try:
                 candidate.relative_to(workspace_root)
@@ -3550,12 +3692,23 @@ class WorkflowOrchestrator:
                 text = candidate.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            chunk = f"## {raw_path}\n{text[:2500]}"
+            excerpt = text
+            if len(excerpt) > per_file_limit:
+                omitted = len(excerpt) - per_file_limit
+                excerpt = (
+                    excerpt[:per_file_limit]
+                    + f"\n... [file truncated: {omitted} chars omitted from {raw_path}; request this file alone if needed]"
+                )
+            chunk = f"## {raw_path}\n{excerpt}"
             remaining = limit - total
             if remaining <= 0:
                 break
             if len(chunk) > remaining:
-                chunk = chunk[:remaining]
+                marker = "\n... [retrieval truncated by total limit]"
+                if remaining > len(marker):
+                    chunk = chunk[: remaining - len(marker)] + marker
+                else:
+                    chunk = chunk[:remaining]
             chunks.append(chunk)
             total += len(chunk) + 2
         return "\n\n".join(chunks)
@@ -5139,9 +5292,111 @@ class WorkflowOrchestrator:
 
     @staticmethod
     def _contract_requirement_present(text: str, requirement: str) -> bool:
+        requirement = str(requirement or "").strip()
+        if not requirement:
+            return True
+        if requirement in text:
+            return True
         if requirement == 'revision = "<non-empty string>"':
             return bool(re.search(r'^revision\s*=\s*[\'"][^\'"]+[\'"]', text, re.MULTILINE))
-        return requirement in text
+        assignment_match = re.fullmatch(r"(revision|down_revision)\s*=\s*['\"]([^'\"]+)['\"]", requirement)
+        if assignment_match:
+            name, expected = assignment_match.groups()
+            return bool(
+                re.search(
+                    rf"^{re.escape(name)}\s*=\s*['\"]{re.escape(expected)}['\"]",
+                    text,
+                    re.MULTILINE,
+                )
+            )
+        if requirement == "op.create_index(":
+            return WorkflowOrchestrator._contract_has_ast_call(text, "op.create_index")
+
+        op_match = re.match(r"op\.(create_table|drop_table)\(\s*['\"]([^'\"]+)['\"]", requirement)
+        if op_match:
+            function_name, first_arg = op_match.groups()
+            return WorkflowOrchestrator._contract_has_ast_call(
+                text,
+                f"op.{function_name}",
+                first_arg=first_arg,
+            )
+
+        column_match = re.match(
+            r"sa\.Column\(\s*['\"]([^'\"]+)['\"]\s*,\s*sa\.([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+            requirement,
+        )
+        if column_match:
+            column_name, type_name = column_match.groups()
+            nullable: bool | None = None
+            if "nullable=False" in requirement.replace(" ", ""):
+                nullable = False
+            elif "nullable=True" in requirement.replace(" ", ""):
+                nullable = True
+            return WorkflowOrchestrator._contract_has_sqlalchemy_column(
+                text,
+                column_name=column_name,
+                type_name=type_name,
+                nullable=nullable,
+            )
+        return False
+
+    @staticmethod
+    def _contract_ast_call_name(node: ast.AST) -> str | None:
+        if isinstance(node, ast.Call):
+            return WorkflowOrchestrator._contract_ast_call_name(node.func)
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            base = WorkflowOrchestrator._contract_ast_call_name(node.value)
+            return f"{base}.{node.attr}" if base else node.attr
+        return None
+
+    @staticmethod
+    def _contract_ast_literal(node: ast.AST | None) -> Any:
+        if isinstance(node, ast.Constant):
+            return node.value
+        return None
+
+    @staticmethod
+    def _contract_has_ast_call(text: str, call_name: str, first_arg: str | None = None) -> bool:
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            return False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if WorkflowOrchestrator._contract_ast_call_name(node.func) != call_name:
+                continue
+            if first_arg is None:
+                return True
+            if node.args and WorkflowOrchestrator._contract_ast_literal(node.args[0]) == first_arg:
+                return True
+        return False
+
+    @staticmethod
+    def _contract_has_sqlalchemy_column(text: str, column_name: str, type_name: str, nullable: bool | None = None) -> bool:
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            return False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if WorkflowOrchestrator._contract_ast_call_name(node.func) != "sa.Column":
+                continue
+            if len(node.args) < 2:
+                continue
+            if WorkflowOrchestrator._contract_ast_literal(node.args[0]) != column_name:
+                continue
+            if WorkflowOrchestrator._contract_ast_call_name(node.args[1]) != f"sa.{type_name}":
+                continue
+            if nullable is None:
+                return True
+            for keyword in node.keywords:
+                if keyword.arg == "nullable" and WorkflowOrchestrator._contract_ast_literal(keyword.value) is nullable:
+                    return True
+        return False
 
     def _configured_alembic_down_revision(self) -> str:
         implementation = self.config.get("phases", {}).get("implementation", {})
@@ -5182,6 +5437,20 @@ class WorkflowOrchestrator:
                 if marker in text:
                     findings.append(f"{relative_path}: validation_style requires static_text_and_ast only")
                     break
+            format_sensitive_patterns = [
+                r"""["']op\.(?:create_table|drop_table|create_index|drop_index)\(\s*["']""",
+                r"""["']sa\.Column\(\s*["']""",
+            ]
+            for pattern in format_sensitive_patterns:
+                if re.search(pattern, text):
+                    findings.append(
+                        f"{relative_path}: avoid format-sensitive raw string assertions for Alembic/SQLAlchemy calls; inspect AST calls and literal args instead"
+                    )
+                    break
+            if "revision\\s*=" in text or "down_revision\\s*=" in text:
+                findings.append(
+                    f"{relative_path}: avoid format-sensitive raw regex assertions for migration revision assignments; inspect AST assignment values instead"
+                )
         return findings
 
     def _prevalidate_current_scope(self, agent_name: str) -> tuple[bool, str]:
@@ -7571,14 +7840,23 @@ class WorkflowOrchestrator:
             revision = revision_match.group(1).strip() if revision_match else ""
             raw_down_revision = down_revision_match.group(1).strip() if down_revision_match else ""
             if not revision:
-                issues.append(f"{relative_path}: missing revision identifier")
+                issues.append(
+                    f'{relative_path}: missing module-level revision assignment; add revision = "{candidate.stem}" after imports '
+                    "(docstring Revision ID is not enough)"
+                )
             if not raw_down_revision:
-                issues.append(f"{relative_path}: missing down_revision")
+                issues.append(
+                    f'{relative_path}: missing module-level down_revision assignment; add down_revision = "{self._configured_alembic_down_revision()}" '
+                    "(docstring Revises is not enough)"
+                )
                 continue
             normalized_down_revision = raw_down_revision.split("#", 1)[0].strip().rstrip(",")
             normalized_down_revision = normalized_down_revision.strip()
             if normalized_down_revision.lower() == "none":
-                issues.append(f"{relative_path}: down_revision must not be None")
+                issues.append(
+                    f'{relative_path}: down_revision must not be None; use down_revision = "{self._configured_alembic_down_revision()}" '
+                    "unless the task contract specifies another parent revision"
+                )
                 continue
             if normalized_down_revision.startswith(("'", '"')) and normalized_down_revision.endswith(("'", '"')):
                 normalized_down_revision = normalized_down_revision[1:-1].strip()

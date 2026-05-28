@@ -193,7 +193,7 @@ git:
   strategy: feature-branch
   branch_prefix: feature/
   auto_rollback: true
-  rollback_dirty_strategy: fail
+  rollback_dirty_strategy: stash
 
 logging:
   level: INFO

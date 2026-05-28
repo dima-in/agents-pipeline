@@ -31,7 +31,7 @@ def test_filter_paths_for_agent_keeps_only_matching_scope() -> None:
     assert filter_paths_for_agent(paths, "test-developer") == ["gateway-v4/tests/test_provider_metrics_migration.py"]
 
 
-def test_multi_developer_editable_paths_include_existing_allowed_paths(tmp_path) -> None:
+def test_multi_developer_editable_paths_exclude_reference_only_allowed_paths(tmp_path) -> None:
     orchestrator = make_orchestrator_with_workspace(tmp_path)
     orchestrator._selected_implementation_item = {
         "allowed_paths": [
@@ -52,8 +52,31 @@ def test_multi_developer_editable_paths_include_existing_allowed_paths(tmp_path)
 
     editable_paths = orchestrator._build_multi_developer_editable_paths()
 
+    assert "gateway-v4/app/database.py" not in editable_paths
+    assert "gateway-v4/app/models.py" not in editable_paths
+    assert route_paths(editable_paths) == ["infra-developer", "test-developer"]
+
+
+def test_multi_developer_editable_paths_include_code_target_file(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator._selected_implementation_item = {
+        "allowed_paths": [
+            "gateway-v4/app/database.py",
+            "gateway-v4/app/models.py",
+            "gateway-v4/tests/test_provider_metrics_model.py",
+        ],
+        "existing_paths": ["gateway-v4/app/database.py", "gateway-v4/app/models.py"],
+        "new_files": ["gateway-v4/tests/test_provider_metrics_model.py"],
+        "required_test_paths": ["gateway-v4/tests/test_provider_metrics_model.py"],
+        "target_file": {"path": "gateway-v4/app/models.py", "action": "update"},
+        "test_file": {"path": "gateway-v4/tests/test_provider_metrics_model.py", "action": "create"},
+    }
+
+    editable_paths = orchestrator._build_multi_developer_editable_paths()
+
+    assert "gateway-v4/app/database.py" not in editable_paths
     assert "gateway-v4/app/models.py" in editable_paths
-    assert route_paths(editable_paths) == ["code-developer", "infra-developer", "test-developer"]
+    assert route_paths(editable_paths) == ["code-developer", "test-developer"]
 
 
 def test_multi_developer_agents_receive_selected_task_contract_context(tmp_path) -> None:
@@ -93,6 +116,57 @@ def test_multi_developer_scope_instruction_marks_other_context_read_only(tmp_pat
     assert "Agent-scoped allowed files for this invocation:" in instruction
     assert "Write only the files listed directly above." in instruction
     assert "sibling agent reports as read-only context" in instruction
+
+
+def test_multi_developer_task_override_scopes_reasons_and_contract_fields(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator._selected_implementation_item = {
+        "id": "TASK-001",
+        "allowed_paths": [
+            "gateway-v4/app/models.py",
+            "gateway-v4/alembic/versions/20240801_add_provider_metrics.py",
+            "gateway-v4/tests/test_provider_metrics_migration.py",
+        ],
+        "existing_paths": ["gateway-v4/app/models.py"],
+        "new_files": ["gateway-v4/alembic/versions/20240801_add_provider_metrics.py"],
+        "required_test_paths": ["gateway-v4/tests/test_provider_metrics_migration.py"],
+        "reason_each_path_is_needed": {
+            "gateway-v4/app/models.py": "Add the application model.",
+            "gateway-v4/alembic/versions/20240801_add_provider_metrics.py": "Create the migration.",
+            "gateway-v4/tests/test_provider_metrics_migration.py": "Cover the migration statically.",
+        },
+        "target_file": {"path": "gateway-v4/alembic/versions/20240801_add_provider_metrics.py", "action": "create"},
+        "test_file": {"path": "gateway-v4/tests/test_provider_metrics_migration.py", "action": "create"},
+        "must_contain": ["def upgrade():", "def downgrade():"],
+        "must_import": ["sqlalchemy as sa"],
+        "must_test": ["assert migration columns"],
+        "contract_completeness": True,
+    }
+    editable_paths = orchestrator._build_multi_developer_editable_paths()
+
+    code_item = orchestrator._build_multi_developer_task_override("code-developer", editable_paths)
+    test_item = orchestrator._build_multi_developer_task_override("test-developer", editable_paths)
+
+    assert code_item["allowed_paths"] == []
+    assert code_item["target_file"] == {}
+    assert code_item["test_file"] == {}
+    assert code_item["must_contain"] == []
+    assert code_item["must_import"] == []
+    assert code_item["must_test"] == []
+    assert code_item["reason_each_path_is_needed"] == {}
+
+    assert test_item["allowed_paths"] == ["gateway-v4/tests/test_provider_metrics_migration.py"]
+    assert test_item["target_file"]["path"] == "gateway-v4/alembic/versions/20240801_add_provider_metrics.py"
+    assert test_item["test_file"]["path"] == "gateway-v4/tests/test_provider_metrics_migration.py"
+    assert test_item["reason_each_path_is_needed"] == {
+        "gateway-v4/tests/test_provider_metrics_migration.py": "Cover the migration statically.",
+    }
+
+    orchestrator._selected_implementation_item = test_item
+    context = orchestrator._build_selected_task_contract_context()
+
+    assert "gateway-v4/app/models.py" not in context
+    assert "target_file.path: gateway-v4/alembic/versions/20240801_add_provider_metrics.py" in context
 
 
 def test_parse_and_validate_accepts_allowed_agent_output() -> None:
@@ -292,6 +366,102 @@ def test_recover_multi_developer_write_metadata_normalizes_backslash_paths(tmp_p
     assert paths == ["gateway-v4/tests/test_provider_metrics_migration.py"]
 
 
+def test_multi_developer_no_changes_rejects_code_scope_without_target_contract(tmp_path) -> None:
+    models_path = tmp_path / "gateway-v4" / "app" / "models.py"
+    models_path.parent.mkdir(parents=True)
+    models_path.write_text("class ExistingModel:\n    pass\n", encoding="utf-8")
+
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+
+    ok, detail = orchestrator._validate_multi_developer_no_changes(
+        "code-developer",
+        {
+            "allowed_paths": ["gateway-v4/app/models.py"],
+            "target_file": {},
+            "test_file": {},
+            "must_contain": [],
+        },
+        ["gateway-v4/app/models.py"],
+        "status=no_changes: already valid",
+    )
+
+    assert ok is False
+    assert "no scoped target_file contract" in detail
+
+
+def test_test_developer_static_constraints_reject_format_sensitive_migration_assertions(tmp_path) -> None:
+    test_path = tmp_path / "gateway-v4" / "tests" / "test_provider_metrics_migration.py"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "def test_brittle_formatting():\n"
+        "    text = read_text()\n"
+        "    assert \"op.create_table('provider_metrics'\" in text\n"
+        "    assert 'sa.Column(\"id\", sa.Integer(), nullable=False)' in text\n",
+        encoding="utf-8",
+    )
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+
+    findings = orchestrator._validate_test_developer_static_constraints(
+        ["gateway-v4/tests/test_provider_metrics_migration.py"]
+    )
+
+    assert any("format-sensitive raw string assertions" in finding for finding in findings)
+
+
+def test_test_developer_static_constraints_reject_revision_regex_assertions(tmp_path) -> None:
+    test_path = tmp_path / "gateway-v4" / "tests" / "test_provider_metrics_migration.py"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "import re\n\n"
+        "def test_brittle_down_revision(source):\n"
+        "    assert re.search(r\"down_revision\\s*=\\s*\\\"0005\\\"\", source)\n",
+        encoding="utf-8",
+    )
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+
+    findings = orchestrator._validate_test_developer_static_constraints(
+        ["gateway-v4/tests/test_provider_metrics_migration.py"]
+    )
+
+    assert any("migration revision assignments" in finding for finding in findings)
+
+
+def test_multi_developer_changed_scope_rejects_code_syntax_error(tmp_path) -> None:
+    models_path = tmp_path / "gateway-v4" / "app" / "models.py"
+    models_path.parent.mkdir(parents=True)
+    models_path.write_text("class ProviderMetrics:\n    broken = )\n", encoding="utf-8")
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+
+    ok, detail = orchestrator._validate_multi_developer_changed_scope(
+        "code-developer",
+        {"forbidden": []},
+        ["gateway-v4/app/models.py"],
+    )
+
+    assert ok is False
+    assert "py_compile failed for scoped changed files" in detail
+
+
+def test_multi_developer_changed_scope_rejects_brittle_test_file(tmp_path) -> None:
+    test_path = tmp_path / "gateway-v4" / "tests" / "test_provider_metrics_migration.py"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "def test_brittle_formatting():\n"
+        "    assert \"op.create_table('provider_metrics'\" in source\n",
+        encoding="utf-8",
+    )
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+
+    ok, detail = orchestrator._validate_multi_developer_changed_scope(
+        "test-developer",
+        {"forbidden": []},
+        ["gateway-v4/tests/test_provider_metrics_migration.py"],
+    )
+
+    assert ok is False
+    assert "format-sensitive raw string assertions" in detail
+
+
 def strict_message_bundle(paths=None, agent_scope="backend-only"):
     return {
         "selected_task_scope": agent_scope,
@@ -316,6 +486,37 @@ def test_strict_mode_auto_activation_for_migration_task(tmp_path) -> None:
     assert orchestrator.should_enable_strict_mode("infra-developer", "implementation", bundle) is True
 
     orchestrator._apply_execution_policy("infra-developer", "implementation", bundle)
+
+    assert bundle["execution_mode"] == "strict"
+    assert bundle["strict_execution_mode"] is True
+    assert bundle["retrieval_budget"] == 2
+
+
+def test_strict_mode_not_auto_enabled_for_code_agent_with_two_files(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    bundle = strict_message_bundle(
+        paths=[
+            "gateway-v4/app/database.py",
+            "gateway-v4/app/models.py",
+        ]
+    )
+
+    assert orchestrator.should_enable_strict_mode("code-developer", "implementation", bundle) is False
+
+    orchestrator._apply_execution_policy("code-developer", "implementation", bundle)
+
+    assert bundle["execution_mode"] == "balanced"
+    assert bundle["strict_execution_mode"] is False
+    assert bundle["retrieval_budget"] == 6
+
+
+def test_strict_mode_still_auto_enabled_for_single_code_file(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    bundle = strict_message_bundle(paths=["gateway-v4/app/models.py"])
+
+    assert orchestrator.should_enable_strict_mode("code-developer", "implementation", bundle) is True
+
+    orchestrator._apply_execution_policy("code-developer", "implementation", bundle)
 
     assert bundle["execution_mode"] == "strict"
     assert bundle["strict_execution_mode"] is True

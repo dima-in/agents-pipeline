@@ -135,6 +135,7 @@ def test_config_loads() -> None:
     assert orchestrator.runtime.executor == "direct_api"
     assert orchestrator.runtime.require_registry_preflight is False
     assert orchestrator.runtime.require_model_list_preflight is False
+    assert orchestrator.config["git"]["rollback_dirty_strategy"] == "stash"
 
 
 def test_start_parser_accepts_retry_resume_flags() -> None:
@@ -3744,7 +3745,46 @@ def test_validate_changed_migration_files_rejects_none_down_revision(tmp_path: P
 
     issues = orchestrator._validate_changed_migration_files(["gateway-v4/alembic/versions/20240801_add_provider_metrics.py"])
 
-    assert issues == ["gateway-v4/alembic/versions/20240801_add_provider_metrics.py: down_revision must not be None"]
+    assert issues == [
+        'gateway-v4/alembic/versions/20240801_add_provider_metrics.py: down_revision must not be None; use down_revision = "0005" unless the task contract specifies another parent revision'
+    ]
+
+
+def test_validate_changed_migration_files_explains_module_level_revision_metadata(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    versions_dir = target_workspace / "gateway-v4" / "alembic" / "versions"
+    versions_dir.mkdir(parents=True, exist_ok=True)
+    (versions_dir / "20240801_add_provider_metrics.py").write_text(
+        '''"""add provider metrics
+
+Revision ID: 20240801_add_provider_metrics
+Revises: 0005
+"""
+
+from alembic import op
+import sqlalchemy as sa
+
+
+def upgrade():
+    pass
+
+
+def downgrade():
+    pass
+''',
+        encoding="utf-8",
+    )
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+
+    issues = orchestrator._validate_changed_migration_files(["gateway-v4/alembic/versions/20240801_add_provider_metrics.py"])
+
+    assert issues == [
+        'gateway-v4/alembic/versions/20240801_add_provider_metrics.py: missing module-level revision assignment; add revision = "20240801_add_provider_metrics" after imports (docstring Revision ID is not enough)',
+        'gateway-v4/alembic/versions/20240801_add_provider_metrics.py: missing module-level down_revision assignment; add down_revision = "0005" (docstring Revises is not enough)',
+    ]
 
 
 def test_no_changes_completion_claim_triggers_deterministic_validation(tmp_path: Path, monkeypatch) -> None:
@@ -4745,6 +4785,101 @@ def test_contract_compliance_detects_missing_test_file_and_missing_must_contain(
     assert diagnostics["contract_compliance"] is False
     assert diagnostics["missing_test_file"] is True
     assert diagnostics["missing_must_contain"] == ["MUST_INCLUDE"]
+
+
+def test_contract_compliance_accepts_semantic_alembic_requirements(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    migration_file = target_workspace / "gateway-v4" / "alembic" / "versions" / "20240801_add_provider_metrics.py"
+    migration_file.parent.mkdir(parents=True, exist_ok=True)
+    migration_file.write_text(
+        '''"""add provider metrics"""
+
+from alembic import op
+import sqlalchemy as sa
+
+revision = "20240801_add_provider_metrics"
+down_revision = "0005"
+
+
+def upgrade():
+    op.create_table(
+        "provider_metrics",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("provider_name", sa.String(), nullable=False),
+        sa.Column("timestamp", sa.DateTime(), nullable=False),
+    )
+    op.create_index("ix_provider_metrics_provider_name", "provider_metrics", ["provider_name"])
+
+
+def downgrade():
+    op.drop_table("provider_metrics")
+''',
+        encoding="utf-8",
+    )
+    test_file = target_workspace / "gateway-v4" / "tests" / "test_provider_metrics_migration.py"
+    test_file.parent.mkdir(parents=True, exist_ok=True)
+    test_file.write_text("def test_provider_metrics_migration():\n    assert True\n", encoding="utf-8")
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    orchestrator._selected_implementation_item = {
+        "id": "migration-task",
+        "title": "Add provider metrics migration",
+        "target_file": {"path": "gateway-v4/alembic/versions/20240801_add_provider_metrics.py"},
+        "test_file": {"path": "gateway-v4/tests/test_provider_metrics_migration.py"},
+        "must_contain": [
+            "def upgrade():",
+            "op.create_table('provider_metrics'",
+            "sa.Column('id', sa.Integer(), nullable=False)",
+            "sa.Column('provider_name', sa.String(), nullable=False)",
+            "sa.Column('timestamp', sa.DateTime(), nullable=False)",
+            "op.create_index(",
+            "def downgrade():",
+            "op.drop_table('provider_metrics')",
+            'down_revision = "0005"',
+        ],
+        "forbidden": [],
+        "contract_completeness": True,
+    }
+
+    diagnostics = orchestrator._evaluate_selected_task_contract_compliance()
+
+    assert diagnostics["contract_compliance"] is True
+    assert diagnostics["missing_must_contain"] == []
+
+
+def test_qa_retrieval_gets_larger_file_excerpt_than_developer(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    long_file = target_workspace / "gateway-v4" / "tests" / "test_provider_metrics_migration.py"
+    long_file.parent.mkdir(parents=True, exist_ok=True)
+    long_file.write_text("a" * 3500 + "QA_VISIBLE_SENTINEL\n", encoding="utf-8")
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+
+    developer_result = orchestrator._execute_direct_api_retrieval_request(
+        {"tool": "read_files", "paths": ["gateway-v4/tests/test_provider_metrics_migration.py"]},
+        phase="implementation",
+        agent_name="developer",
+    )
+    qa_result = orchestrator._execute_direct_api_retrieval_request(
+        {"tool": "read_files", "paths": ["gateway-v4/tests/test_provider_metrics_migration.py"]},
+        phase="implementation",
+        agent_name="qa",
+    )
+
+    assert "QA_VISIBLE_SENTINEL" not in developer_result
+    assert "QA_VISIBLE_SENTINEL" in qa_result
 
 
 def test_planner_backend_task_contract_requires_executable_fields(tmp_path: Path) -> None:
