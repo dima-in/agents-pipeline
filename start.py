@@ -81,6 +81,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Select the next uncompleted implementation backlog item",
     )
     parser.add_argument(
+        "--rerun-completed",
+        action="store_true",
+        help="Allow --task-id to select an implementation task already recorded as completed",
+    )
+    parser.add_argument(
+        "--mark-selected-complete",
+        action="store_true",
+        help="Mark the current selected implementation task complete without running agents",
+    )
+    parser.add_argument(
         "--research-run",
         default=None,
         help="Specific research run id to use for implementation context",
@@ -152,6 +162,7 @@ def main(argv: list[str] | None = None) -> int:
         retry_agent=args.retry_agent,
         from_agent=args.from_agent,
         reuse_architect=args.reuse_architect,
+        rerun_completed=args.rerun_completed,
     )
     orchestrator.config["workflow"]["mode"] = args.mode
     orchestrator.config["git"]["enabled"] = not args.skip_git
@@ -159,6 +170,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.list_tasks:
         return orchestrator.print_implementation_backlog()
+
+    if args.mark_selected_complete:
+        return orchestrator.mark_selected_implementation_task_complete()
 
     if args.preflight_only:
         return 0 if orchestrator._preflight_runtime() else 1

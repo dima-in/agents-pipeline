@@ -65,6 +65,7 @@ class WorkflowOrchestrator:
         retry_agent: str | None = None,
         from_agent: str | None = None,
         reuse_architect: bool = False,
+        rerun_completed: bool = False,
     ) -> None:
         self.engine_root = Path(engine_root).resolve() if engine_root else Path(__file__).resolve().parent.parent
         self.launch_cwd = Path(launch_cwd).resolve() if launch_cwd else Path(os.environ.get("AGENTS_PIPELINE_LAUNCH_CWD") or os.getcwd()).resolve()
@@ -108,12 +109,15 @@ class WorkflowOrchestrator:
         self.task_scope_override = str(task_scope or "").strip()
         self.user_goal_override = str(user_goal or "").strip()
         self.selected_task_ref = str(selected_task_ref or "").strip()
+        self._selected_task_from_explicit_cli = bool(self.selected_task_ref)
+        self._selected_task_from_resume = False
         self.next_task_requested = next_task
         self.research_run_id = str(research_run or "").strip()
         self.allow_scope_expansion = allow_scope_expansion
         self.retry_agent_name = str(retry_agent or "").strip()
         self.from_agent_name = str(from_agent or "").strip()
         self.reuse_architect = reuse_architect
+        self.rerun_completed = rerun_completed
         self.implementation_scope_policy = self._get_implementation_scope_policy()
         self.current_branch: str | None = None
         self.task_counter = 0
@@ -130,6 +134,10 @@ class WorkflowOrchestrator:
         self._canonical_backlog_loaded = False
         self._canonical_backlog_payload: dict[str, Any] = {}
         self._selected_task_source = ""
+        self._backlog_selected_task_id = ""
+        self._skipped_completed_task_ids: list[str] = []
+        self._completed_task_recorded = False
+        self._completed_task_record_error = ""
         self._selected_implementation_item: dict[str, Any] | None = None
         self._implementation_planner_output_chars = 0
         self._planner_invalid_paths: list[str] = []
@@ -256,6 +264,10 @@ class WorkflowOrchestrator:
         self._selected_implementation_item = None
         self._implementation_backlog_cache = None
         self._implementation_backlog_source = ""
+        self._selected_task_source = ""
+        self._skipped_completed_task_ids = []
+        self._completed_task_recorded = False
+        self._completed_task_record_error = ""
         self._implementation_planner_output_chars = 0
         self._planner_invalid_paths = []
         self._planner_repair_attempted = False
@@ -331,6 +343,17 @@ class WorkflowOrchestrator:
         for attempt in range(1, max_retries + 1):
             self._implementation_attempt = attempt
             self._phase_failure_status = None
+            cached_selected_task_id = str((self._selected_implementation_item or {}).get("id") or "").strip()
+            if (
+                attempt > 1
+                and cached_selected_task_id
+                and cached_selected_task_id in set(self._completed_implementation_task_ids())
+                and not self._selected_task_from_explicit_cli
+                and not self.rerun_completed
+            ):
+                self._selected_implementation_item = None
+                self._selected_task_source = ""
+                self._skipped_completed_task_ids = []
             self.logger.info(f"Попытка реализации {attempt}/{max_retries}")
             ok = self._run_phase_agents(phase, "implementation")
             if not ok and self._phase_failure_status in {"scope_violation", "no_changes", "planner_invalid", "task_designer_invalid", "strict_retrieval_blocked"}:
@@ -354,13 +377,21 @@ class WorkflowOrchestrator:
                     self.logger.save_phase_summary("implementation", phase["name"])
                     self.logger.phase_end(phase["name"], "failed")
                     return False
-                self._mark_implementation_task_completed(changed_files=completion_changed_files)
+                if not self._mark_implementation_task_completed(changed_files=completion_changed_files):
+                    self.logger.error("Completed task registry was not updated", self._completed_task_record_error)
+                    self.logger.save_phase_summary("implementation", phase["name"])
+                    self.logger.phase_end(phase["name"], "completed_task_record_failed")
+                    return False
+                self.logger.info(f"Diagnostic completed_task_recorded={self._completed_task_recorded}")
+                self.logger.info(f"Diagnostic completed_task_record_error={self._completed_task_record_error}")
                 self.logger.save_phase_summary("implementation", phase["name"])
                 self.logger.phase_end(phase["name"], "success")
                 next_action = self._prompt_post_implementation_action()
                 if next_action == "next":
                     self.next_task_requested = True
                     self.selected_task_ref = ""
+                    self._selected_task_from_explicit_cli = False
+                    self._selected_task_from_resume = False
                     self._selected_implementation_item = None
                     self._selected_task_source = ""
                     return self._run_implementation_phase()
@@ -1096,6 +1127,7 @@ class WorkflowOrchestrator:
         self.logger.agent_progress(agent_name, f"Diagnostic repo_map_directory_count={message_bundle['repo_map_directory_count']}")
         self.logger.agent_progress(agent_name, f"Diagnostic canonical_backlog_loaded={message_bundle['canonical_backlog_loaded']}")
         self.logger.agent_progress(agent_name, f"Diagnostic canonical_backlog_path={message_bundle['canonical_backlog_path']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic completed_task_registry_path={message_bundle['completed_task_registry_path']}")
         self.logger.agent_progress(agent_name, f"Diagnostic completed_task_count={message_bundle['completed_task_count']}")
         self.logger.agent_progress(agent_name, f"Diagnostic completed_task_ids={message_bundle['completed_task_ids']}")
         self.logger.agent_progress(agent_name, f"Diagnostic developer_feedback_source={message_bundle['developer_feedback_source']}")
@@ -1103,6 +1135,11 @@ class WorkflowOrchestrator:
         self.logger.agent_progress(agent_name, f"Diagnostic backlog_source={message_bundle['backlog_source']}")
         self.logger.agent_progress(agent_name, f"Diagnostic selected_task_id={message_bundle['selected_task_id']}")
         self.logger.agent_progress(agent_name, f"Diagnostic selected_task_source={message_bundle['selected_task_source']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic selected_task_from_explicit_cli={message_bundle['selected_task_from_explicit_cli']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic backlog_selected_task_id={message_bundle['backlog_selected_task_id']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic skipped_completed_task_ids={message_bundle['skipped_completed_task_ids']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic completed_task_recorded={message_bundle['completed_task_recorded']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic completed_task_record_error={message_bundle['completed_task_record_error']}")
         self.logger.agent_progress(agent_name, f"Diagnostic research_handoff_sources={', '.join(message_bundle['research_handoff_sources'])}")
         self.logger.agent_progress(agent_name, f"Diagnostic selected_task_scope={message_bundle['selected_task_scope']}")
         self.logger.agent_progress(agent_name, f"Diagnostic selected_task_allowed_paths={message_bundle['selected_task_allowed_paths']}")
@@ -1187,9 +1224,15 @@ class WorkflowOrchestrator:
                     "repo_map_directory_count": message_bundle["repo_map_directory_count"],
                     "canonical_backlog_loaded": message_bundle["canonical_backlog_loaded"],
                     "canonical_backlog_path": message_bundle["canonical_backlog_path"],
+                    "completed_task_registry_path": message_bundle["completed_task_registry_path"],
                     "completed_task_count": message_bundle["completed_task_count"],
                     "completed_task_ids": message_bundle["completed_task_ids"],
                     "selected_task_source": message_bundle["selected_task_source"],
+                    "selected_task_from_explicit_cli": message_bundle["selected_task_from_explicit_cli"],
+                    "backlog_selected_task_id": message_bundle["backlog_selected_task_id"],
+                    "skipped_completed_task_ids": message_bundle["skipped_completed_task_ids"],
+                    "completed_task_recorded": message_bundle["completed_task_recorded"],
+                    "completed_task_record_error": message_bundle["completed_task_record_error"],
                     "developer_feedback_source": message_bundle["developer_feedback_source"],
                     "developer_feedback_chars": message_bundle["developer_feedback_chars"],
                     "research_handoff_sources": message_bundle["research_handoff_sources"],
@@ -1994,9 +2037,15 @@ class WorkflowOrchestrator:
         developer_feedback_chars = 0
         canonical_backlog_loaded = False
         canonical_backlog_path = ""
+        completed_task_registry_path = ""
         completed_task_count = 0
         completed_task_ids: list[str] = []
         selected_task_source = ""
+        selected_task_from_explicit_cli = False
+        backlog_selected_task_id = ""
+        skipped_completed_task_ids: list[str] = []
+        completed_task_recorded = False
+        completed_task_record_error = ""
         contract_completeness = False
         contract_compliance = False
         missing_must_contain: list[str] = []
@@ -2050,9 +2099,15 @@ class WorkflowOrchestrator:
             repo_map_directory_count = implementation_context["repo_map_directory_count"]
             canonical_backlog_loaded = implementation_context["canonical_backlog_loaded"]
             canonical_backlog_path = implementation_context["canonical_backlog_path"]
+            completed_task_registry_path = implementation_context["completed_task_registry_path"]
             completed_task_count = implementation_context["completed_task_count"]
             completed_task_ids = implementation_context["completed_task_ids"]
             selected_task_source = implementation_context["selected_task_source"]
+            selected_task_from_explicit_cli = implementation_context["selected_task_from_explicit_cli"]
+            backlog_selected_task_id = implementation_context["backlog_selected_task_id"]
+            skipped_completed_task_ids = implementation_context["skipped_completed_task_ids"]
+            completed_task_recorded = implementation_context["completed_task_recorded"]
+            completed_task_record_error = implementation_context["completed_task_record_error"]
             if self._implementation_retry_from_agent == "developer" and (agent_name == "developer" or self._is_multi_developer_edit_agent(agent_name)):
                 developer_feedback_text, developer_feedback_source = self._load_developer_feedback_for_retry()
                 developer_feedback_chars = len(developer_feedback_text)
@@ -2151,9 +2206,15 @@ class WorkflowOrchestrator:
             "repo_map_directory_count": repo_map_directory_count if phase == "implementation" else 0,
             "canonical_backlog_loaded": canonical_backlog_loaded if phase == "implementation" else False,
             "canonical_backlog_path": canonical_backlog_path if phase == "implementation" else "",
+            "completed_task_registry_path": completed_task_registry_path if phase == "implementation" else "",
             "completed_task_count": completed_task_count if phase == "implementation" else 0,
             "completed_task_ids": completed_task_ids if phase == "implementation" else [],
             "selected_task_source": selected_task_source if phase == "implementation" else "",
+            "selected_task_from_explicit_cli": selected_task_from_explicit_cli if phase == "implementation" else False,
+            "backlog_selected_task_id": backlog_selected_task_id if phase == "implementation" else "",
+            "skipped_completed_task_ids": skipped_completed_task_ids if phase == "implementation" else [],
+            "completed_task_recorded": completed_task_recorded if phase == "implementation" else False,
+            "completed_task_record_error": completed_task_record_error if phase == "implementation" else "",
             "developer_feedback_source": developer_feedback_source if phase == "implementation" else "",
             "developer_feedback_text": developer_feedback_text if phase == "implementation" else "",
             "developer_feedback_chars": developer_feedback_chars if phase == "implementation" else 0,
@@ -3639,6 +3700,9 @@ class WorkflowOrchestrator:
         selected_task_source = str(message_bundle.get("selected_task_source") or "").strip()
         if selected_task_source:
             lines.append(f"selected_task_source={selected_task_source}")
+        backlog_selected_task_id = str(message_bundle.get("backlog_selected_task_id") or "").strip()
+        if backlog_selected_task_id:
+            lines.append(f"backlog_selected_task_id={backlog_selected_task_id}")
         selected_task_scope = str(message_bundle.get("selected_task_scope") or "").strip()
         if selected_task_scope:
             lines.append(f"scope={selected_task_scope}")
@@ -5225,9 +5289,15 @@ class WorkflowOrchestrator:
             "repo_map_directory_count": len(repo_map.get("directories") or []),
             "canonical_backlog_loaded": self._canonical_backlog_loaded,
             "canonical_backlog_path": str(self.canonical_backlog_path),
+            "completed_task_registry_path": str(self.completed_tasks_path),
             "completed_task_count": len(completed_task_ids),
             "completed_task_ids": completed_task_ids,
             "selected_task_source": self._selected_task_source,
+            "selected_task_from_explicit_cli": self._selected_task_from_explicit_cli,
+            "backlog_selected_task_id": self._backlog_selected_task_id,
+            "skipped_completed_task_ids": list(self._skipped_completed_task_ids),
+            "completed_task_recorded": self._completed_task_recorded,
+            "completed_task_record_error": self._completed_task_record_error,
             "backlog_source": selection["backlog_source"],
             "contract_completeness": bool(selected_item.get("contract_completeness", False)),
             "contract_compliance": bool(contract_diag.get("contract_compliance", False)),
@@ -5731,6 +5801,7 @@ class WorkflowOrchestrator:
             return {}
         self._canonical_backlog_payload = dict(payload)
         self._canonical_backlog_loaded = True
+        self._backlog_selected_task_id = str(payload.get("selected_task_id") or "").strip()
         return dict(payload)
 
     def _load_canonical_implementation_backlog(self) -> list[dict[str, Any]]:
@@ -5757,6 +5828,7 @@ class WorkflowOrchestrator:
         self.canonical_backlog_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         self._canonical_backlog_payload = dict(payload)
         self._canonical_backlog_loaded = True
+        self._backlog_selected_task_id = str(selected_task_id or "").strip()
 
     def _update_canonical_backlog_selected_task(self, task_id: str) -> None:
         task_id = str(task_id or "").strip()
@@ -5786,14 +5858,31 @@ class WorkflowOrchestrator:
         *,
         require_backlog: bool,
         allow_research_fallback: bool = False,
+        force_refresh: bool = False,
     ) -> dict[str, Any]:
-        if self._selected_implementation_item is not None:
+        if (
+            self._selected_implementation_item is not None
+            and not force_refresh
+            and not self._selected_task_from_explicit_cli
+            and not self.rerun_completed
+            and str(self._selected_implementation_item.get("id") or "").strip() in set(self._completed_implementation_task_ids())
+        ):
+            self._selected_implementation_item = None
+            self._selected_task_source = ""
+            force_refresh = True
+        if self._selected_implementation_item is not None and not force_refresh:
             return {
                 "selected_item": self._selected_implementation_item,
                 "backlog": self._implementation_backlog_cache or [],
                 "backlog_source": self._implementation_backlog_source,
                 "error": "",
             }
+        if force_refresh:
+            self._selected_implementation_item = None
+            self._implementation_backlog_cache = []
+            self._implementation_backlog_source = ""
+            self._selected_task_source = ""
+            self._skipped_completed_task_ids = []
         available_reports = reports if reports is not None else self._load_latest_project_research_reports()[0]
         backlog, backlog_source = self._build_implementation_backlog(
             available_reports,
@@ -5816,14 +5905,38 @@ class WorkflowOrchestrator:
             }
         selected_item = self._resolve_selected_implementation_item(backlog)
         if selected_item is None and require_backlog:
+            completed_ids = set(self._completed_implementation_task_ids())
+            backlog_ids = [str(item.get("id") or "").strip() for item in backlog if str(item.get("id") or "").strip()]
+            if backlog_ids and all(task_id in completed_ids for task_id in backlog_ids):
+                return {
+                    "selected_item": None,
+                    "backlog": backlog,
+                    "backlog_source": backlog_source,
+                    "error": (
+                        "All implementation backlog tasks are completed. "
+                        "Use --fresh-run to regenerate the backlog, or pass --task-id TASK-XXX --rerun-completed to rerun one task."
+                    ),
+                }
             return {
                 "selected_item": None,
                 "backlog": backlog,
                 "backlog_source": backlog_source,
                 "error": "Selected implementation task was not found in the planner backlog.",
             }
+        completed_ids = set(self._completed_implementation_task_ids())
+        selected_task_id = str((selected_item or {}).get("id") or "").strip()
+        if self._selected_task_from_explicit_cli and selected_task_id in completed_ids and not self.rerun_completed:
+            return {
+                "selected_item": None,
+                "backlog": backlog,
+                "backlog_source": backlog_source,
+                "error": (
+                    f"Selected implementation task {selected_task_id} is already completed. "
+                    "Pass --rerun-completed with --task-id to run it again."
+                ),
+            }
         self._selected_implementation_item = selected_item
-        self._selected_task_source = "canonical_backlog" if backlog_source == "canonical_backlog" else "new_planner_output"
+        self._selected_task_source = self._selected_task_source_for(backlog_source)
         if selected_item:
             self._update_canonical_backlog_selected_task(str(selected_item.get("id") or ""))
         return {
@@ -5838,6 +5951,14 @@ class WorkflowOrchestrator:
         self._implementation_backlog_cache = []
         self._implementation_backlog_source = ""
         self._selected_task_source = ""
+        self._skipped_completed_task_ids = []
+
+    def _selected_task_source_for(self, backlog_source: str) -> str:
+        if self._selected_task_from_explicit_cli:
+            return "explicit_task_id"
+        if backlog_source == "canonical_backlog":
+            return "canonical_backlog"
+        return "new_planner_output"
 
     def _build_implementation_backlog(
         self,
@@ -7470,6 +7591,7 @@ class WorkflowOrchestrator:
                 selected_task_id = str(selected_task_report.get("selected_task_id") or "").strip()
         if selected_task_id and not self.selected_task_ref:
             self.selected_task_ref = selected_task_id
+            self._selected_task_from_resume = True
         self._set_agent_report_extras(
             "implementation",
             "implementation-planner",
@@ -7511,6 +7633,7 @@ class WorkflowOrchestrator:
         selected_task_id = str(report.get("selected_task_id") or "").strip()
         if selected_task_id and not self.selected_task_ref:
             self.selected_task_ref = selected_task_id
+            self._selected_task_from_resume = True
         if not self._apply_task_designer_contract_from_report(report):
             return False
         self.logger.info(f"Reusing task-designer output from {source_path}")
@@ -7540,15 +7663,34 @@ class WorkflowOrchestrator:
             return None
         completed = set(self._completed_implementation_task_ids())
         first_incomplete = next((item for item in backlog if str(item.get("id")) not in completed), None)
-        if self.selected_task_ref:
+        self._skipped_completed_task_ids = [
+            str(item.get("id") or "").strip()
+            for item in backlog
+            if str(item.get("id") or "").strip() in completed
+        ]
+        if (self._selected_task_from_explicit_cli or self._selected_task_from_resume) and self.selected_task_ref:
             ref = self.selected_task_ref.strip()
+            selected_by_ref: dict[str, Any] | None = None
             if ref.isdigit():
                 index = int(ref) - 1
                 if 0 <= index < len(backlog):
-                    return backlog[index]
-            for item in backlog:
-                if str(item.get("id")) == ref:
-                    return item
+                    selected_by_ref = backlog[index]
+            else:
+                for item in backlog:
+                    if str(item.get("id")) == ref:
+                        selected_by_ref = item
+                        break
+            if selected_by_ref is None:
+                return None
+            selected_by_ref_id = str(selected_by_ref.get("id") or "").strip()
+            if self._selected_task_from_explicit_cli:
+                return selected_by_ref
+            if selected_by_ref_id not in completed or self.rerun_completed:
+                return selected_by_ref
+            if selected_by_ref_id and selected_by_ref_id not in self._skipped_completed_task_ids:
+                self._skipped_completed_task_ids.append(selected_by_ref_id)
+            return first_incomplete
+        if first_incomplete is None:
             return None
         if self.next_task_requested:
             return first_incomplete
@@ -7557,7 +7699,7 @@ class WorkflowOrchestrator:
             return first_incomplete
         if self.config["workflow"]["mode"] == "auto":
             print(self._format_implementation_backlog(backlog, self._implementation_backlog_source or "research"))
-            return first_incomplete or backlog[0]
+            return first_incomplete
         print(self._format_implementation_backlog(backlog, self._implementation_backlog_source or "research"))
         while True:
             answer = input(self._console_text("choose_task_number")).strip()
@@ -8299,12 +8441,39 @@ class WorkflowOrchestrator:
         except Exception:
             return ""
 
-    def _mark_implementation_task_completed(self, *, changed_files: list[str] | None = None) -> None:
-        if not self._selected_implementation_item:
-            return
-        task_id = str(self._selected_implementation_item.get("id") or "").strip()
+    def _completion_selected_implementation_item(self) -> dict[str, Any]:
+        if self._selected_implementation_item:
+            return dict(self._selected_implementation_item)
+        payload = self._load_canonical_implementation_backlog_payload()
+        selected_task_id = str(payload.get("selected_task_id") or "").strip()
+        backlog = self._implementation_backlog_cache or self._load_canonical_implementation_backlog()
+        if selected_task_id:
+            for item in backlog:
+                if str(item.get("id") or "").strip() == selected_task_id:
+                    self._selected_implementation_item = dict(item)
+                    return dict(item)
+        if self.selected_task_ref and not self.selected_task_ref.isdigit():
+            for item in backlog:
+                if str(item.get("id") or "").strip() == self.selected_task_ref:
+                    self._selected_implementation_item = dict(item)
+                    return dict(item)
+        return {}
+
+    def _mark_implementation_task_completed(self, *, changed_files: list[str] | None = None) -> bool:
+        self._completed_task_recorded = False
+        self._completed_task_record_error = ""
+        selected_item = self._completion_selected_implementation_item()
+        if not selected_item:
+            self._completed_task_record_error = (
+                "selected implementation task is unavailable; cannot update completed task registry. "
+                f"Manual recovery: create {self.completed_tasks_path} with "
+                '{"completed_tasks":[{"task_id":"TASK-XXX","title":"...","completed_at":"...","run_id":"...","commit":null,"changed_files":[]}]}'
+            )
+            return False
+        task_id = str(selected_item.get("id") or "").strip()
         if not task_id:
-            return
+            self._completed_task_record_error = "selected implementation task has no id"
+            return False
         records = self._load_completed_implementation_task_records()
         existing_index = next(
             (index for index, record in enumerate(records) if str(record.get("task_id") or "").strip() == task_id),
@@ -8312,9 +8481,9 @@ class WorkflowOrchestrator:
         )
         record = {
             "task_id": task_id,
-            "title": str(self._selected_implementation_item.get("title") or ""),
+            "title": str(selected_item.get("title") or ""),
             "completed_at": datetime.now().isoformat(),
-            "commit": self._current_head_commit(),
+            "commit": self._current_head_commit() or None,
             "run_id": self.logger.run_dir.name,
             "changed_files": sorted(dict.fromkeys(changed_files or [])),
         }
@@ -8322,13 +8491,44 @@ class WorkflowOrchestrator:
             records.append(record)
         else:
             records[existing_index] = {**records[existing_index], **record}
-        self._save_completed_implementation_task_records(records)
+        try:
+            self._save_completed_implementation_task_records(records)
+        except Exception as exc:
+            self._completed_task_record_error = f"failed to write {self.completed_tasks_path}: {exc}"
+            return False
 
         completed = self._completed_implementation_task_ids()
         if task_id not in completed:
             completed.append(task_id)
         self.project_settings["completed_implementation_tasks"] = completed
         self._save_project_settings()
+        self._completed_task_recorded = True
+        return True
+
+    def mark_selected_implementation_task_complete(self) -> int:
+        if not self.selected_task_ref:
+            payload = self._load_canonical_implementation_backlog_payload()
+            selected_task_id = str(payload.get("selected_task_id") or "").strip()
+            if selected_task_id:
+                self.selected_task_ref = selected_task_id
+                self._selected_task_from_explicit_cli = True
+        original_rerun_completed = self.rerun_completed
+        self.rerun_completed = True
+        try:
+            selection = self._prepare_implementation_backlog_selection(require_backlog=True)
+            if selection["error"]:
+                print(selection["error"])
+                return 1
+            if not self._mark_implementation_task_completed(changed_files=[]):
+                print(self._completed_task_record_error)
+                return 1
+        finally:
+            self.rerun_completed = original_rerun_completed
+            self._selected_task_from_explicit_cli = bool(self.selected_task_ref)
+        task_id = str((self._selected_implementation_item or {}).get("id") or "").strip()
+        print(f"Marked implementation task complete: {task_id}")
+        print(f"completed_task_registry_path={self.completed_tasks_path}")
+        return 0
 
     def _prompt_post_implementation_action(self) -> str:
         if self.config["workflow"]["mode"] == "auto":

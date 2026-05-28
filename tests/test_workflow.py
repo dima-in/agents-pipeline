@@ -253,6 +253,23 @@ def test_start_parser_accepts_from_agent_developer() -> None:
     assert args.from_agent == "developer"
 
 
+def test_start_parser_accepts_rerun_completed_and_mark_selected_complete() -> None:
+    args = build_parser().parse_args(
+        [
+            "--phase",
+            "implementation",
+            "--task-id",
+            "TASK-001",
+            "--rerun-completed",
+            "--mark-selected-complete",
+        ]
+    )
+
+    assert args.task_id == "TASK-001"
+    assert args.rerun_completed is True
+    assert args.mark_selected_complete is True
+
+
 def test_start_parser_accepts_goal() -> None:
     args = build_parser().parse_args(
         [
@@ -3579,9 +3596,15 @@ def test_developer_bundle_includes_retry_feedback(tmp_path: Path, monkeypatch) -
             "repo_map_directory_count": 0,
             "canonical_backlog_loaded": False,
             "canonical_backlog_path": "",
+            "completed_task_registry_path": "",
             "completed_task_count": 0,
             "completed_task_ids": [],
             "selected_task_source": "",
+            "selected_task_from_explicit_cli": False,
+            "backlog_selected_task_id": "",
+            "skipped_completed_task_ids": [],
+            "completed_task_recorded": False,
+            "completed_task_record_error": "",
             "backlog_source": "test",
             "contract_completeness": True,
             "contract_compliance": True,
@@ -5087,6 +5110,7 @@ def test_completed_task_selects_next_canonical_task(tmp_path: Path) -> None:
     first = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
     _save_planner_backlog(first, _canonical_backlog_fixture())
     assert first._validate_implementation_planner_output()["valid"] is True
+    first._update_canonical_backlog_selected_task("TASK-001")
 
     first._save_completed_implementation_task_records(
         [
@@ -5107,6 +5131,230 @@ def test_completed_task_selects_next_canonical_task(tmp_path: Path) -> None:
     assert selection["selected_item"]["id"] == "TASK-002"
     assert selection["backlog_source"] == "canonical_backlog"
     assert second._selected_task_source == "canonical_backlog"
+    assert second._selected_task_from_explicit_cli is False
+    assert second._backlog_selected_task_id == "TASK-001"
+    assert second._skipped_completed_task_ids == ["TASK-001"]
+
+
+def test_missing_completed_registry_selects_first_canonical_task(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    _prepare_backlog_target_workspace(target_workspace)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    first = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    _save_planner_backlog(first, _canonical_backlog_fixture())
+    assert first._validate_implementation_planner_output()["valid"] is True
+    assert not first.completed_tasks_path.exists()
+
+    second = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    selection = second._prepare_implementation_backlog_selection(require_backlog=True)
+
+    assert selection["selected_item"]["id"] == "TASK-001"
+    assert selection["backlog_source"] == "canonical_backlog"
+    assert second._skipped_completed_task_ids == []
+
+
+def test_explicit_task_id_selects_requested_task_from_canonical_backlog(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    _prepare_backlog_target_workspace(target_workspace)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    first = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    _save_planner_backlog(first, _canonical_backlog_fixture())
+    assert first._validate_implementation_planner_output()["valid"] is True
+
+    second = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+        selected_task_ref="TASK-002",
+    )
+    selection = second._prepare_implementation_backlog_selection(require_backlog=True)
+
+    assert selection["selected_item"]["id"] == "TASK-002"
+    assert second._selected_task_source == "explicit_task_id"
+
+
+def test_explicit_completed_task_without_rerun_completed_fails_clearly(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    _prepare_backlog_target_workspace(target_workspace)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    first = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    _save_planner_backlog(first, _canonical_backlog_fixture())
+    assert first._validate_implementation_planner_output()["valid"] is True
+    first._save_completed_implementation_task_records(
+        [
+            {
+                "task_id": "TASK-001",
+                "title": "Canonical models task",
+                "completed_at": "2026-05-28T10:00:00",
+                "commit": None,
+                "run_id": "run_previous",
+                "changed_files": [],
+            }
+        ]
+    )
+
+    second = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+        selected_task_ref="TASK-001",
+    )
+    selection = second._prepare_implementation_backlog_selection(require_backlog=True)
+
+    assert selection["selected_item"] is None
+    assert "already completed" in selection["error"]
+    assert "--rerun-completed" in selection["error"]
+
+
+def test_explicit_completed_task_with_rerun_completed_selects_task(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    _prepare_backlog_target_workspace(target_workspace)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    first = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    _save_planner_backlog(first, _canonical_backlog_fixture())
+    assert first._validate_implementation_planner_output()["valid"] is True
+    first._save_completed_implementation_task_records(
+        [
+            {
+                "task_id": "TASK-001",
+                "title": "Canonical models task",
+                "completed_at": "2026-05-28T10:00:00",
+                "commit": None,
+                "run_id": "run_previous",
+                "changed_files": [],
+            }
+        ]
+    )
+
+    second = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+        selected_task_ref="TASK-001",
+        rerun_completed=True,
+    )
+    selection = second._prepare_implementation_backlog_selection(require_backlog=True)
+
+    assert selection["selected_item"]["id"] == "TASK-001"
+    assert selection["error"] == ""
+    assert second._selected_task_source == "explicit_task_id"
+    assert second._selected_task_from_explicit_cli is True
+
+
+def test_explicit_task_id_reaches_multi_developer_plan(tmp_path: Path, monkeypatch) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    _prepare_backlog_target_workspace(target_workspace)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    first = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    _save_planner_backlog(first, _canonical_backlog_fixture())
+    assert first._validate_implementation_planner_output()["valid"] is True
+
+    second = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+        selected_task_ref="TASK-002",
+    )
+    second.config["phases"]["implementation"] = {
+        "name": "Implementation",
+        "execution_mode": "multi_developer_json",
+        "multi_developer_agents": [
+            {"name": "code-developer", "description": "Write code"},
+            {"name": "test-developer", "description": "Write tests"},
+        ],
+    }
+    selection = second._prepare_implementation_backlog_selection(require_backlog=True)
+    summaries = []
+    monkeypatch.setattr(second, "_log_operator_summary", lambda title, lines: summaries.append((title, lines)))
+    monkeypatch.setattr(second, "_wait_for_user", lambda _prompt: False)
+
+    ok = second._run_multi_developer_json_flow(second.config["phases"]["implementation"], index=4, total=6)
+
+    assert ok is True
+    assert selection["selected_item"]["id"] == "TASK-002"
+    assert summaries
+    assert "task=TASK-002" in summaries[0][1]
+
+
+def test_cached_completed_selection_refreshes_to_first_incomplete(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    _prepare_backlog_target_workspace(target_workspace)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    first = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    _save_planner_backlog(first, _canonical_backlog_fixture())
+    assert first._validate_implementation_planner_output()["valid"] is True
+    first._save_completed_implementation_task_records(
+        [
+            {
+                "task_id": "TASK-001",
+                "title": "Canonical models task",
+                "completed_at": "2026-05-28T10:00:00",
+                "commit": None,
+                "run_id": "run_previous",
+                "changed_files": [],
+            }
+        ]
+    )
+
+    second = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    second._selected_implementation_item = _canonical_backlog_fixture()[0]
+    second._implementation_backlog_cache = _canonical_backlog_fixture()
+    second._implementation_backlog_source = "canonical_backlog"
+    selection = second._prepare_implementation_backlog_selection(require_backlog=True)
+
+    assert selection["selected_item"]["id"] == "TASK-002"
+    assert second._skipped_completed_task_ids == ["TASK-001"]
+
+
+def test_resume_selected_completed_task_falls_back_to_first_incomplete(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    _prepare_backlog_target_workspace(target_workspace)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    first = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    _save_planner_backlog(first, _canonical_backlog_fixture())
+    assert first._validate_implementation_planner_output()["valid"] is True
+    first._save_completed_implementation_task_records(
+        [
+            {
+                "task_id": "TASK-001",
+                "title": "Canonical models task",
+                "completed_at": "2026-05-28T10:00:00",
+                "commit": None,
+                "run_id": "run_previous",
+                "changed_files": [],
+            }
+        ]
+    )
+
+    second = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    second.selected_task_ref = "TASK-001"
+    second._selected_task_from_resume = True
+    selection = second._prepare_implementation_backlog_selection(require_backlog=True)
+
+    assert selection["selected_item"]["id"] == "TASK-002"
+    assert second._selected_task_source == "canonical_backlog"
+    assert second._skipped_completed_task_ids == ["TASK-001"]
 
 
 def test_planner_cannot_reset_task_ids_when_canonical_backlog_exists(tmp_path: Path) -> None:
@@ -5176,14 +5424,10 @@ def test_successful_implementation_updates_completed_task_registry(tmp_path: Pat
         "name": "Implementation",
         "agents": [{"name": "developer", "description": "Write code", "max_retries": 1}],
     }
-    selected_item = _canonical_backlog_fixture()[0]
-
-    def run_phase_agents(_phase, _phase_type):
-        orchestrator._selected_implementation_item = selected_item
-        return True
+    orchestrator._save_canonical_implementation_backlog(_canonical_backlog_fixture(), selected_task_id="TASK-001")
 
     monkeypatch.setattr(orchestrator, "_create_git_branch", lambda _attempt: True)
-    monkeypatch.setattr(orchestrator, "_run_phase_agents", run_phase_agents)
+    monkeypatch.setattr(orchestrator, "_run_phase_agents", lambda _phase, _phase_type: True)
     monkeypatch.setattr(orchestrator, "_merge_git", lambda: True)
     monkeypatch.setattr(orchestrator, "_prompt_post_implementation_action", lambda: "stop")
     monkeypatch.setattr(orchestrator, "_implementation_completion_changed_files", lambda: ["gateway-v4/app/models.py"])
@@ -5206,6 +5450,28 @@ def test_successful_implementation_updates_completed_task_registry(tmp_path: Pat
             "changed_files": ["gateway-v4/app/models.py"],
         }
     ]
+    assert orchestrator._completed_task_recorded is True
+    assert orchestrator._completed_task_record_error == ""
+
+
+def test_completed_task_registry_does_not_duplicate_task_ids(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    _prepare_backlog_target_workspace(target_workspace)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    orchestrator._selected_implementation_item = _canonical_backlog_fixture()[0]
+
+    assert orchestrator._mark_implementation_task_completed(changed_files=[]) is True
+    assert orchestrator._mark_implementation_task_completed(changed_files=["gateway-v4/app/models.py"]) is True
+
+    payload = json.loads(orchestrator.completed_tasks_path.read_text(encoding="utf-8"))
+    assert len(payload["completed_tasks"]) == 1
+    assert payload["completed_tasks"][0]["task_id"] == "TASK-001"
+    assert payload["completed_tasks"][0]["commit"] is None
+    assert payload["completed_tasks"][0]["changed_files"] == ["gateway-v4/app/models.py"]
 
 
 def test_validator_rejects_vague_backend_contract(tmp_path: Path) -> None:
