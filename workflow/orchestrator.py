@@ -2913,10 +2913,11 @@ class WorkflowOrchestrator:
     def _build_target_tests_file_list(self, limit: int = 2200) -> str:
         patterns = ("test", "spec")
         files = sorted(
-            str(path.relative_to(self.target_workspace)).replace("\\", "/")
+            relative_text
             for path in self.target_workspace.rglob("*")
+            for relative_text in [str(path.relative_to(self.target_workspace)).replace("\\", "/")]
             if path.is_file()
-            and ".git" not in path.parts
+            and not is_excluded_path(relative_text)
             and any(token in path.name.lower() for token in patterns)
         )
         return "\n".join(files)[:limit]
@@ -3038,9 +3039,10 @@ class WorkflowOrchestrator:
                 continue
             if len(relative.parts) > depth:
                 continue
-            if any(part.startswith(".git") for part in relative.parts):
+            relative_text = str(relative).replace("\\", "/")
+            if is_excluded_path(relative_text):
                 continue
-            lines.append(str(relative).replace("\\", "/"))
+            lines.append(relative_text)
         return "\n".join(lines)
 
     def _read_file_excerpt(self, path: Path, limit: int) -> str:

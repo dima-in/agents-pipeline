@@ -510,6 +510,10 @@ def test_external_project_analyst_excludes_engine_files(tmp_path: Path) -> None:
     )
     (target_workspace / "README.md").write_text("external product readme", encoding="utf-8")
     (target_workspace / "package.json").write_text('{"name":"external-app"}', encoding="utf-8")
+    (target_workspace / "frontend" / "src").mkdir(parents=True)
+    (target_workspace / "frontend" / "node_modules" / "pkg").mkdir(parents=True)
+    (target_workspace / "frontend" / "src" / "App.jsx").write_text("export default function App() {}", encoding="utf-8")
+    (target_workspace / "frontend" / "node_modules" / "pkg" / "index.js").write_text("vendor", encoding="utf-8")
 
     orchestrator = WorkflowOrchestrator(
         str(engine_root / "workflow" / "config.yaml"),
@@ -527,6 +531,8 @@ def test_external_project_analyst_excludes_engine_files(tmp_path: Path) -> None:
     assert "workflow/orchestrator.py outline" not in bundle["system_message"]
     assert "manage_agents.py outline" not in bundle["system_message"]
     assert "package.json" in bundle["system_message"]
+    assert "frontend/src/App.jsx" in bundle["system_message"]
+    assert "node_modules" not in bundle["system_message"]
 
 
 def test_competitor_analyst_does_not_receive_full_orchestrator_outline(tmp_path: Path) -> None:
