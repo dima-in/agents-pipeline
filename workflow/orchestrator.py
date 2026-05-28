@@ -23,7 +23,7 @@ from urllib.parse import urlparse
 import git
 import yaml
 
-from tools.repo_map import compare_repo_maps, generate_repo_map, validate_agent_paths
+from tools.repo_map import compare_repo_maps, generate_repo_map, is_excluded_path, validate_agent_paths
 from workflow.logger import WorkflowLogger
 from workflow.multi_developer_dispatcher import filter_paths_for_agent, route_paths
 from workflow.runtime import has_provider_credentials, load_runtime_config, required_key_env, resolve_runner_path
@@ -3819,11 +3819,11 @@ class WorkflowOrchestrator:
         for path in sorted(workspace_root.rglob("*")):
             if not path.is_file():
                 continue
-            if ".git" in path.parts or "__pycache__" in path.parts:
-                continue
             try:
                 relative = path.relative_to(workspace_root)
                 relative_text = str(relative).replace("\\", "/")
+                if is_excluded_path(relative_text):
+                    continue
                 text = path.read_text(encoding="utf-8", errors="replace")
             except (OSError, ValueError):
                 continue
@@ -3844,15 +3844,17 @@ class WorkflowOrchestrator:
             return ""
         lines: list[str] = []
         for path in sorted(base.rglob("*")):
-            if ".git" in path.parts:
-                continue
             try:
-                relative = path.relative_to(base)
+                workspace_relative = path.relative_to(self.target_workspace)
+                workspace_relative_text = str(workspace_relative).replace("\\", "/")
             except ValueError:
                 continue
+            if is_excluded_path(workspace_relative_text):
+                continue
+            relative = path.relative_to(base)
             if len(relative.parts) > max_depth:
                 continue
-            lines.append(str(path.relative_to(self.target_workspace)).replace("\\", "/"))
+            lines.append(workspace_relative_text)
         return "\n".join(lines)
 
     def _resolve_target_relative_file(self, raw_path: str) -> tuple[Path | None, str]:

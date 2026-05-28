@@ -2266,6 +2266,10 @@ def test_direct_api_retrieval_cannot_escape_target_workspace(tmp_path: Path) -> 
     target_workspace.mkdir(parents=True)
     outside_file.write_text("secret", encoding="utf-8")
     (target_workspace / "inside.txt").write_text("inside", encoding="utf-8")
+    (target_workspace / "frontend" / "src").mkdir(parents=True)
+    (target_workspace / "frontend" / "node_modules" / "pkg").mkdir(parents=True)
+    (target_workspace / "frontend" / "src" / "App.jsx").write_text("needle app", encoding="utf-8")
+    (target_workspace / "frontend" / "node_modules" / "pkg" / "index.js").write_text("needle vendor", encoding="utf-8")
     (engine_root / "workflow" / "config.yaml").write_text(
         yaml.safe_dump(
             {
@@ -2290,7 +2294,13 @@ def test_direct_api_retrieval_cannot_escape_target_workspace(tmp_path: Path) -> 
 
     assert orchestrator._direct_api_read_files(["../secret.txt"], limit=2000) == ""
     assert orchestrator._direct_api_list_files("..", max_depth=2) == ""
-    assert "inside.txt" in orchestrator._direct_api_list_files(".", max_depth=2)
+    listing = orchestrator._direct_api_list_files(".", max_depth=4)
+    assert "inside.txt" in listing
+    assert "frontend/src/App.jsx" in listing
+    assert "node_modules" not in listing
+    search_result = orchestrator._direct_api_search_text("needle", limit=20)
+    assert "frontend/src/App.jsx" in search_result
+    assert "node_modules" not in search_result
 
 
 def test_developer_search_text_is_blocked_when_exact_task_context_exists(tmp_path: Path) -> None:

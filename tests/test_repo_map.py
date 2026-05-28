@@ -9,6 +9,8 @@ def test_repo_map_excludes_runtime_and_detects_core_files(tmp_path: Path) -> Non
     (workspace / "tests").mkdir(parents=True, exist_ok=True)
     (workspace / ".git").mkdir(parents=True, exist_ok=True)
     (workspace / "node_modules" / "pkg").mkdir(parents=True, exist_ok=True)
+    (workspace / "frontend" / "node_modules" / "pkg").mkdir(parents=True, exist_ok=True)
+    (workspace / "frontend" / "src").mkdir(parents=True, exist_ok=True)
     (workspace / ".openclaw" / "logs").mkdir(parents=True, exist_ok=True)
 
     (workspace / "README.md").write_text("# Repo\n", encoding="utf-8")
@@ -20,6 +22,8 @@ def test_repo_map_excludes_runtime_and_detects_core_files(tmp_path: Path) -> Non
     (workspace / ".env").write_text("MODE=test\n", encoding="utf-8")
     (workspace / ".git" / "ignored.txt").write_text("ignore\n", encoding="utf-8")
     (workspace / "node_modules" / "pkg" / "index.js").write_text("console.log('x')\n", encoding="utf-8")
+    (workspace / "frontend" / "node_modules" / "pkg" / "index.js").write_text("console.log('nested')\n", encoding="utf-8")
+    (workspace / "frontend" / "src" / "App.jsx").write_text("export default function App() {}\n", encoding="utf-8")
     (workspace / ".openclaw" / "logs" / "run.log").write_text("log\n", encoding="utf-8")
 
     output_path = tmp_path / "repo_map.json"
@@ -33,7 +37,9 @@ def test_repo_map_excludes_runtime_and_detects_core_files(tmp_path: Path) -> Non
     assert "tests/test_example.py" in files
     assert all(not path.startswith(".git/") for path in files)
     assert all(not path.startswith("node_modules/") for path in files)
+    assert all("/node_modules/" not in path for path in files)
     assert all(not path.startswith(".openclaw/logs/") for path in files)
+    assert "frontend/src/App.jsx" in files
     assert files["README.md"]["kind"] == "docs"
     assert files["workflow/orchestrator.py"]["kind"] == "code"
     assert files["run.bat"]["kind"] == "script"

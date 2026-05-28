@@ -56,6 +56,10 @@ def _is_excluded(relative_path: str) -> bool:
     return False
 
 
+def is_excluded_path(relative_path: str) -> bool:
+    return _is_excluded(relative_path)
+
+
 def _run_git_capture(workspace: Path, args: list[str]) -> str:
     command = ["git", *args]
     try:
