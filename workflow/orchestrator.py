@@ -80,6 +80,9 @@ class WorkflowOrchestrator:
         self.project_local_settings_path = self.project_state_dir / "local.yaml"
         self.project_codex_context_path = self.project_state_dir / "codex.md"
         self.project_resume_context_path = self.project_state_dir / "resume.md"
+        self.project_implementation_state_dir = self.project_state_dir / "state"
+        self.canonical_backlog_path = self.project_implementation_state_dir / "implementation_backlog.json"
+        self.completed_tasks_path = self.project_implementation_state_dir / "completed_implementation_tasks.json"
         self.project_settings = self._load_project_settings()
         self.project_local_settings = self._load_project_local_settings()
         self.project_codex_context = self._load_project_codex_context()
@@ -124,6 +127,9 @@ class WorkflowOrchestrator:
         self._global_registry_models = self._load_global_registry_models()
         self._implementation_backlog_cache: list[dict[str, Any]] | None = None
         self._implementation_backlog_source = ""
+        self._canonical_backlog_loaded = False
+        self._canonical_backlog_payload: dict[str, Any] = {}
+        self._selected_task_source = ""
         self._selected_implementation_item: dict[str, Any] | None = None
         self._implementation_planner_output_chars = 0
         self._planner_invalid_paths: list[str] = []
@@ -343,11 +349,12 @@ class WorkflowOrchestrator:
                     self.logger.save_phase_summary("implementation", phase["name"])
                     self.logger.phase_end(phase["name"], "planner_ready")
                     return True
-                self._mark_implementation_task_completed()
+                completion_changed_files = self._implementation_completion_changed_files()
                 if self.config["git"]["enabled"] and not self._merge_git():
                     self.logger.save_phase_summary("implementation", phase["name"])
                     self.logger.phase_end(phase["name"], "failed")
                     return False
+                self._mark_implementation_task_completed(changed_files=completion_changed_files)
                 self.logger.save_phase_summary("implementation", phase["name"])
                 self.logger.phase_end(phase["name"], "success")
                 next_action = self._prompt_post_implementation_action()
@@ -355,6 +362,7 @@ class WorkflowOrchestrator:
                     self.next_task_requested = True
                     self.selected_task_ref = ""
                     self._selected_implementation_item = None
+                    self._selected_task_source = ""
                     return self._run_implementation_phase()
                 if next_action == "deployment":
                     return self.run_deployment_phase()
@@ -1086,10 +1094,15 @@ class WorkflowOrchestrator:
         self.logger.agent_progress(agent_name, f"Diagnostic repo_map_path={message_bundle['repo_map_path']}")
         self.logger.agent_progress(agent_name, f"Diagnostic repo_map_file_count={message_bundle['repo_map_file_count']}")
         self.logger.agent_progress(agent_name, f"Diagnostic repo_map_directory_count={message_bundle['repo_map_directory_count']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic canonical_backlog_loaded={message_bundle['canonical_backlog_loaded']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic canonical_backlog_path={message_bundle['canonical_backlog_path']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic completed_task_count={message_bundle['completed_task_count']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic completed_task_ids={message_bundle['completed_task_ids']}")
         self.logger.agent_progress(agent_name, f"Diagnostic developer_feedback_source={message_bundle['developer_feedback_source']}")
         self.logger.agent_progress(agent_name, f"Diagnostic developer_feedback_chars={message_bundle['developer_feedback_chars']}")
         self.logger.agent_progress(agent_name, f"Diagnostic backlog_source={message_bundle['backlog_source']}")
         self.logger.agent_progress(agent_name, f"Diagnostic selected_task_id={message_bundle['selected_task_id']}")
+        self.logger.agent_progress(agent_name, f"Diagnostic selected_task_source={message_bundle['selected_task_source']}")
         self.logger.agent_progress(agent_name, f"Diagnostic research_handoff_sources={', '.join(message_bundle['research_handoff_sources'])}")
         self.logger.agent_progress(agent_name, f"Diagnostic selected_task_scope={message_bundle['selected_task_scope']}")
         self.logger.agent_progress(agent_name, f"Diagnostic selected_task_allowed_paths={message_bundle['selected_task_allowed_paths']}")
@@ -1172,6 +1185,11 @@ class WorkflowOrchestrator:
                     "repo_map_path": message_bundle["repo_map_path"],
                     "repo_map_file_count": message_bundle["repo_map_file_count"],
                     "repo_map_directory_count": message_bundle["repo_map_directory_count"],
+                    "canonical_backlog_loaded": message_bundle["canonical_backlog_loaded"],
+                    "canonical_backlog_path": message_bundle["canonical_backlog_path"],
+                    "completed_task_count": message_bundle["completed_task_count"],
+                    "completed_task_ids": message_bundle["completed_task_ids"],
+                    "selected_task_source": message_bundle["selected_task_source"],
                     "developer_feedback_source": message_bundle["developer_feedback_source"],
                     "developer_feedback_chars": message_bundle["developer_feedback_chars"],
                     "research_handoff_sources": message_bundle["research_handoff_sources"],
@@ -1974,6 +1992,11 @@ class WorkflowOrchestrator:
         developer_feedback_text = ""
         developer_feedback_source = ""
         developer_feedback_chars = 0
+        canonical_backlog_loaded = False
+        canonical_backlog_path = ""
+        completed_task_count = 0
+        completed_task_ids: list[str] = []
+        selected_task_source = ""
         contract_completeness = False
         contract_compliance = False
         missing_must_contain: list[str] = []
@@ -2025,6 +2048,11 @@ class WorkflowOrchestrator:
             repo_map_path = implementation_context["repo_map_path"]
             repo_map_file_count = implementation_context["repo_map_file_count"]
             repo_map_directory_count = implementation_context["repo_map_directory_count"]
+            canonical_backlog_loaded = implementation_context["canonical_backlog_loaded"]
+            canonical_backlog_path = implementation_context["canonical_backlog_path"]
+            completed_task_count = implementation_context["completed_task_count"]
+            completed_task_ids = implementation_context["completed_task_ids"]
+            selected_task_source = implementation_context["selected_task_source"]
             if self._implementation_retry_from_agent == "developer" and (agent_name == "developer" or self._is_multi_developer_edit_agent(agent_name)):
                 developer_feedback_text, developer_feedback_source = self._load_developer_feedback_for_retry()
                 developer_feedback_chars = len(developer_feedback_text)
@@ -2121,6 +2149,11 @@ class WorkflowOrchestrator:
             "repo_map_path": repo_map_path if phase == "implementation" else "",
             "repo_map_file_count": repo_map_file_count if phase == "implementation" else 0,
             "repo_map_directory_count": repo_map_directory_count if phase == "implementation" else 0,
+            "canonical_backlog_loaded": canonical_backlog_loaded if phase == "implementation" else False,
+            "canonical_backlog_path": canonical_backlog_path if phase == "implementation" else "",
+            "completed_task_count": completed_task_count if phase == "implementation" else 0,
+            "completed_task_ids": completed_task_ids if phase == "implementation" else [],
+            "selected_task_source": selected_task_source if phase == "implementation" else "",
             "developer_feedback_source": developer_feedback_source if phase == "implementation" else "",
             "developer_feedback_text": developer_feedback_text if phase == "implementation" else "",
             "developer_feedback_chars": developer_feedback_chars if phase == "implementation" else 0,
@@ -3603,6 +3636,9 @@ class WorkflowOrchestrator:
         selected_task_id = str(message_bundle.get("selected_task_id") or "").strip()
         if selected_task_id:
             lines.append(f"implementation_task={selected_task_id}")
+        selected_task_source = str(message_bundle.get("selected_task_source") or "").strip()
+        if selected_task_source:
+            lines.append(f"selected_task_source={selected_task_source}")
         selected_task_scope = str(message_bundle.get("selected_task_scope") or "").strip()
         if selected_task_scope:
             lines.append(f"scope={selected_task_scope}")
@@ -5149,6 +5185,7 @@ class WorkflowOrchestrator:
             for report in research_reports
             if report.get("status") == "success"
         ]
+        completed_task_ids = self._completed_implementation_task_ids()
         return {
             "repository_context": repository_context,
             "previous_context": previous_context,
@@ -5186,6 +5223,11 @@ class WorkflowOrchestrator:
             "repo_map_path": str(self.repo_map_path),
             "repo_map_file_count": len(repo_map.get("files") or []),
             "repo_map_directory_count": len(repo_map.get("directories") or []),
+            "canonical_backlog_loaded": self._canonical_backlog_loaded,
+            "canonical_backlog_path": str(self.canonical_backlog_path),
+            "completed_task_count": len(completed_task_ids),
+            "completed_task_ids": completed_task_ids,
+            "selected_task_source": self._selected_task_source,
             "backlog_source": selection["backlog_source"],
             "contract_completeness": bool(selected_item.get("contract_completeness", False)),
             "contract_compliance": bool(contract_diag.get("contract_compliance", False)),
@@ -5660,6 +5702,75 @@ class WorkflowOrchestrator:
             )
         )
 
+    def _should_regenerate_implementation_backlog(self) -> bool:
+        implementation_config = self.config.get("phases", {}).get("implementation", {})
+        workflow_config = self.config.get("workflow", {})
+        return bool(
+            self.fresh_run
+            or implementation_config.get("regenerate_backlog")
+            or workflow_config.get("regenerate_backlog")
+        )
+
+    def _load_canonical_implementation_backlog_payload(self) -> dict[str, Any]:
+        if self._should_regenerate_implementation_backlog():
+            self._canonical_backlog_loaded = False
+            return {}
+        if self._canonical_backlog_payload:
+            return dict(self._canonical_backlog_payload)
+        if not self.canonical_backlog_path.exists():
+            self._canonical_backlog_loaded = False
+            return {}
+        try:
+            payload = json.loads(self.canonical_backlog_path.read_text(encoding="utf-8"))
+        except Exception:
+            self._canonical_backlog_loaded = False
+            return {}
+        tasks = payload.get("tasks")
+        if not isinstance(tasks, list) or not tasks:
+            self._canonical_backlog_loaded = False
+            return {}
+        self._canonical_backlog_payload = dict(payload)
+        self._canonical_backlog_loaded = True
+        return dict(payload)
+
+    def _load_canonical_implementation_backlog(self) -> list[dict[str, Any]]:
+        payload = self._load_canonical_implementation_backlog_payload()
+        tasks = payload.get("tasks") if payload else []
+        if not isinstance(tasks, list):
+            return []
+        return [dict(item) for item in tasks if isinstance(item, dict)]
+
+    def _save_canonical_implementation_backlog(self, tasks: list[dict[str, Any]], *, selected_task_id: str = "") -> None:
+        if not tasks:
+            return
+        if self.canonical_backlog_path.exists() and not self._should_regenerate_implementation_backlog():
+            return
+        now = datetime.now().isoformat()
+        payload = {
+            "backlog_id": f"{self.project_id}:{self.logger.run_dir.name}:{now}",
+            "created_at": now,
+            "source_run_id": self.logger.run_dir.name,
+            "tasks": [dict(item) for item in tasks],
+            "selected_task_id": str(selected_task_id or "").strip(),
+        }
+        self.canonical_backlog_path.parent.mkdir(parents=True, exist_ok=True)
+        self.canonical_backlog_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._canonical_backlog_payload = dict(payload)
+        self._canonical_backlog_loaded = True
+
+    def _update_canonical_backlog_selected_task(self, task_id: str) -> None:
+        task_id = str(task_id or "").strip()
+        if not task_id or not self.canonical_backlog_path.exists():
+            return
+        try:
+            payload = json.loads(self.canonical_backlog_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        payload["selected_task_id"] = task_id
+        self.canonical_backlog_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._canonical_backlog_payload = dict(payload)
+        self._canonical_backlog_loaded = True
+
     def print_implementation_backlog(self) -> int:
         reports, _run_dir = self._load_latest_project_research_reports()
         backlog, backlog_source = self._build_implementation_backlog(reports, allow_research_fallback=True)
@@ -5712,6 +5823,9 @@ class WorkflowOrchestrator:
                 "error": "Selected implementation task was not found in the planner backlog.",
             }
         self._selected_implementation_item = selected_item
+        self._selected_task_source = "canonical_backlog" if backlog_source == "canonical_backlog" else "new_planner_output"
+        if selected_item:
+            self._update_canonical_backlog_selected_task(str(selected_item.get("id") or ""))
         return {
             "selected_item": selected_item,
             "backlog": backlog,
@@ -5723,6 +5837,7 @@ class WorkflowOrchestrator:
         self._selected_implementation_item = None
         self._implementation_backlog_cache = []
         self._implementation_backlog_source = ""
+        self._selected_task_source = ""
 
     def _build_implementation_backlog(
         self,
@@ -5730,6 +5845,11 @@ class WorkflowOrchestrator:
         *,
         allow_research_fallback: bool = False,
     ) -> tuple[list[dict[str, Any]], str]:
+        canonical_backlog = self._load_canonical_implementation_backlog()
+        if canonical_backlog:
+            self._implementation_planner_output_chars = 0
+            return canonical_backlog, "canonical_backlog"
+
         planner_report = self._load_saved_agent_report("implementation", "implementation-planner")
         parsed_items: list[dict[str, Any]] = []
         sources: list[str] = []
@@ -6182,17 +6302,20 @@ class WorkflowOrchestrator:
                 "repo_map_directory_count": len(repo_map.get("directories") or []),
             },
         )
+        valid = not (
+            self._planner_invalid_paths
+            or self._planner_missing_directories
+            or self._planner_missing_tests
+            or self._planner_conflicting_forbidden_paths
+            or self._generic_root_dirs_rejected
+            or self._planner_dependency_validation_errors
+            or self._planner_parse_error
+            or self._planner_schema_errors
+        )
+        if valid:
+            self._save_canonical_implementation_backlog(items)
         return {
-            "valid": not (
-                self._planner_invalid_paths
-                or self._planner_missing_directories
-                or self._planner_missing_tests
-                or self._planner_conflicting_forbidden_paths
-                or self._generic_root_dirs_rejected
-                or self._planner_dependency_validation_errors
-                or self._planner_parse_error
-                or self._planner_schema_errors
-            ),
+            "valid": valid,
             "invalid_paths": list(self._planner_invalid_paths),
             "missing_directories": list(self._planner_missing_directories),
             "missing_tests": list(self._planner_missing_tests),
@@ -7252,6 +7375,15 @@ class WorkflowOrchestrator:
     def _should_skip_implementation_agent(self, agent_name: str) -> bool:
         if self._implementation_retry_from_agent == "developer":
             return agent_name in {"architect", "implementation-planner", "task-designer"}
+        if (
+            agent_name == "implementation-planner"
+            and not self._should_regenerate_implementation_backlog()
+            and not self.retry_agent_name
+            and self.from_agent_name != "implementation-planner"
+            and self._load_canonical_implementation_backlog()
+        ):
+            self.logger.info(f"Skipping implementation-planner because canonical backlog exists: {self.canonical_backlog_path}")
+            return True
         if self._should_reuse_architect_for_implementation() and agent_name == "architect":
             return True
         if self._should_reuse_planner_for_implementation() and agent_name == "implementation-planner":
@@ -7406,11 +7538,8 @@ class WorkflowOrchestrator:
     def _resolve_selected_implementation_item(self, backlog: list[dict[str, Any]]) -> dict[str, Any] | None:
         if not backlog:
             return None
-        if self.next_task_requested:
-            completed = set(self._completed_implementation_task_ids())
-            for item in backlog:
-                if str(item.get("id")) not in completed:
-                    return item
+        completed = set(self._completed_implementation_task_ids())
+        first_incomplete = next((item for item in backlog if str(item.get("id")) not in completed), None)
         if self.selected_task_ref:
             ref = self.selected_task_ref.strip()
             if ref.isdigit():
@@ -7421,9 +7550,14 @@ class WorkflowOrchestrator:
                 if str(item.get("id")) == ref:
                     return item
             return None
+        if self.next_task_requested:
+            return first_incomplete
+        if self._implementation_backlog_source == "canonical_backlog":
+            print(self._format_implementation_backlog(backlog, self._implementation_backlog_source))
+            return first_incomplete
         if self.config["workflow"]["mode"] == "auto":
             print(self._format_implementation_backlog(backlog, self._implementation_backlog_source or "research"))
-            return backlog[0]
+            return first_incomplete or backlog[0]
         print(self._format_implementation_backlog(backlog, self._implementation_backlog_source or "research"))
         while True:
             answer = input(self._console_text("choose_task_number")).strip()
@@ -8047,10 +8181,32 @@ class WorkflowOrchestrator:
         return "\n".join(lines)[:limit]
 
     def _completed_implementation_task_ids(self) -> list[str]:
+        ids: list[str] = []
+        for record in self._load_completed_implementation_task_records():
+            task_id = str(record.get("task_id") or "").strip()
+            if task_id:
+                ids.append(task_id)
         completed = self.project_settings.get("completed_implementation_tasks", [])
-        if not isinstance(completed, list):
+        if isinstance(completed, list):
+            ids.extend(str(item).strip() for item in completed if str(item).strip())
+        return list(dict.fromkeys(ids))
+
+    def _load_completed_implementation_task_records(self) -> list[dict[str, Any]]:
+        if not self.completed_tasks_path.exists():
             return []
-        return [str(item).strip() for item in completed if str(item).strip()]
+        try:
+            payload = json.loads(self.completed_tasks_path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        records = payload.get("completed_tasks")
+        if not isinstance(records, list):
+            return []
+        return [dict(item) for item in records if isinstance(item, dict)]
+
+    def _save_completed_implementation_task_records(self, records: list[dict[str, Any]]) -> None:
+        self.completed_tasks_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"completed_tasks": records}
+        self.completed_tasks_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _selected_task_dependency_error(self) -> str:
         item = self._selected_implementation_item or {}
@@ -8121,17 +8277,58 @@ class WorkflowOrchestrator:
         task_designer_report = self._load_saved_agent_report("implementation", "task-designer") or {}
         return self._apply_task_designer_contract_from_report(task_designer_report)
 
-    def _mark_implementation_task_completed(self) -> None:
+    def _implementation_completion_changed_files(self) -> list[str]:
+        diagnostics = self._collect_scope_watchdog_diff_diagnostics()
+        changed_files = [str(path).strip() for path in diagnostics.get("changed_files") or [] if str(path).strip()]
+        if changed_files:
+            return sorted(dict.fromkeys(changed_files))
+        developer_report = self._load_saved_agent_report("implementation", "developer") or {}
+        return sorted(
+            dict.fromkeys(
+                str(path).strip()
+                for path in (developer_report.get("developer_changed_files") or [])
+                if str(path).strip()
+            )
+        )
+
+    def _current_head_commit(self) -> str:
+        if self.repo is None:
+            return ""
+        try:
+            return str(self.repo.head.commit.hexsha)
+        except Exception:
+            return ""
+
+    def _mark_implementation_task_completed(self, *, changed_files: list[str] | None = None) -> None:
         if not self._selected_implementation_item:
             return
         task_id = str(self._selected_implementation_item.get("id") or "").strip()
         if not task_id:
             return
+        records = self._load_completed_implementation_task_records()
+        existing_index = next(
+            (index for index, record in enumerate(records) if str(record.get("task_id") or "").strip() == task_id),
+            None,
+        )
+        record = {
+            "task_id": task_id,
+            "title": str(self._selected_implementation_item.get("title") or ""),
+            "completed_at": datetime.now().isoformat(),
+            "commit": self._current_head_commit(),
+            "run_id": self.logger.run_dir.name,
+            "changed_files": sorted(dict.fromkeys(changed_files or [])),
+        }
+        if existing_index is None:
+            records.append(record)
+        else:
+            records[existing_index] = {**records[existing_index], **record}
+        self._save_completed_implementation_task_records(records)
+
         completed = self._completed_implementation_task_ids()
         if task_id not in completed:
             completed.append(task_id)
-            self.project_settings["completed_implementation_tasks"] = completed
-            self._save_project_settings()
+        self.project_settings["completed_implementation_tasks"] = completed
+        self._save_project_settings()
 
     def _prompt_post_implementation_action(self) -> str:
         if self.config["workflow"]["mode"] == "auto":
@@ -8249,7 +8446,7 @@ class WorkflowOrchestrator:
 
     def _ensure_project_state_dirs(self) -> Path:
         base = self.engine_root / ".agents-pipeline" / "projects" / self.project_id
-        for name in ("context", "memory", "logs", "summaries"):
+        for name in ("context", "memory", "logs", "summaries", "state"):
             (base / name).mkdir(parents=True, exist_ok=True)
         settings_path = base / "settings.yaml"
         local_settings_path = base / "local.yaml"

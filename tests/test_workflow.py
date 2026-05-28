@@ -107,6 +107,90 @@ def _seed_research_run(log_root: Path, run_id: str, reports: list[dict[str, obje
     return run_dir
 
 
+def _prepare_backlog_target_workspace(target_workspace: Path) -> None:
+    (target_workspace / "gateway-v4" / "app").mkdir(parents=True, exist_ok=True)
+    (target_workspace / "gateway-v4" / "tests").mkdir(parents=True, exist_ok=True)
+    (target_workspace / "gateway-v4" / "app" / "models.py").write_text("class ExistingModel:\n    pass\n", encoding="utf-8")
+    (target_workspace / "gateway-v4" / "app" / "database.py").write_text("def bootstrap_database():\n    pass\n", encoding="utf-8")
+    (target_workspace / "gateway-v4" / "tests" / "test_models.py").write_text("def test_models():\n    assert True\n", encoding="utf-8")
+    (target_workspace / "gateway-v4" / "tests" / "test_database.py").write_text("def test_database():\n    assert True\n", encoding="utf-8")
+
+
+def _canonical_backlog_fixture(title_prefix: str = "Canonical") -> list[dict[str, object]]:
+    return [
+        {
+            "id": "TASK-001",
+            "title": f"{title_prefix} models task",
+            "priority": "P0",
+            "scope": "backend-only",
+            "existing_paths": ["gateway-v4/app/models.py", "gateway-v4/tests/test_models.py"],
+            "new_directories": [],
+            "new_files": [],
+            "allowed_paths": ["gateway-v4/app/models.py", "gateway-v4/tests/test_models.py"],
+            "forbidden_paths": [],
+            "required_test_paths": ["gateway-v4/tests/test_models.py"],
+            "depends_on": [],
+            "acceptance_criteria": ["models task done"],
+            "reason_each_path_is_needed": {
+                "gateway-v4/app/models.py": "Implementation target.",
+                "gateway-v4/tests/test_models.py": "Regression test.",
+            },
+            "target_file": {"path": "gateway-v4/app/models.py", "action": "update", "purpose": "Update models."},
+            "test_file": {"path": "gateway-v4/tests/test_models.py", "action": "update"},
+            "must_contain": ["class ExistingModel"],
+            "must_import": ["from pathlib import Path"],
+            "integration": ["Use existing backend model conventions."],
+            "reference_files": ["gateway-v4/app/models.py"],
+            "reference_excerpts": {"gateway-v4/app/models.py": "class ExistingModel"},
+            "must_test": ["test_models: validates model behavior"],
+            "forbidden": ["Do not edit billing files."],
+            "risk_level": "low",
+            "estimated_effort": "S",
+        },
+        {
+            "id": "TASK-002",
+            "title": f"{title_prefix} database task",
+            "priority": "P1",
+            "scope": "backend-only",
+            "existing_paths": ["gateway-v4/app/database.py", "gateway-v4/tests/test_database.py"],
+            "new_directories": [],
+            "new_files": [],
+            "allowed_paths": ["gateway-v4/app/database.py", "gateway-v4/tests/test_database.py"],
+            "forbidden_paths": [],
+            "required_test_paths": ["gateway-v4/tests/test_database.py"],
+            "depends_on": [],
+            "acceptance_criteria": ["database task done"],
+            "reason_each_path_is_needed": {
+                "gateway-v4/app/database.py": "Implementation target.",
+                "gateway-v4/tests/test_database.py": "Regression test.",
+            },
+            "target_file": {"path": "gateway-v4/app/database.py", "action": "update", "purpose": "Update database bootstrap."},
+            "test_file": {"path": "gateway-v4/tests/test_database.py", "action": "update"},
+            "must_contain": ["def bootstrap_database"],
+            "must_import": ["from pathlib import Path"],
+            "integration": ["Use existing backend database conventions."],
+            "reference_files": ["gateway-v4/app/database.py"],
+            "reference_excerpts": {"gateway-v4/app/database.py": "def bootstrap_database"},
+            "must_test": ["test_database: validates database behavior"],
+            "forbidden": ["Do not edit billing files."],
+            "risk_level": "low",
+            "estimated_effort": "S",
+        },
+    ]
+
+
+def _save_planner_backlog(orchestrator: WorkflowOrchestrator, backlog: list[dict[str, object]]) -> None:
+    orchestrator.logger.save_agent_report(
+        "implementation",
+        "implementation-planner",
+        {
+            "status": "success",
+            "result": "completed",
+            "parsed_output": json.dumps(backlog, ensure_ascii=False),
+        },
+    )
+
+
 def _init_git_repo(workspace: Path, branch: str = "main") -> git.Repo:
     repo = git.Repo.init(workspace)
     with repo.config_writer() as writer:
@@ -651,6 +735,7 @@ def test_project_state_dirs_are_created_under_engine_root(tmp_path: Path) -> Non
     assert (base / "memory").exists()
     assert (base / "logs").exists()
     assert (base / "summaries").exists()
+    assert (base / "state").exists()
     assert (base / "settings.yaml").exists()
     assert (base / "local.yaml").exists()
     assert (base / "codex.md").exists()
@@ -3492,6 +3577,11 @@ def test_developer_bundle_includes_retry_feedback(tmp_path: Path, monkeypatch) -
             "repo_map_path": "",
             "repo_map_file_count": 0,
             "repo_map_directory_count": 0,
+            "canonical_backlog_loaded": False,
+            "canonical_backlog_path": "",
+            "completed_task_count": 0,
+            "completed_task_ids": [],
+            "selected_task_source": "",
             "backlog_source": "test",
             "contract_completeness": True,
             "contract_compliance": True,
@@ -4944,6 +5034,178 @@ def test_planner_backend_task_contract_requires_executable_fields(tmp_path: Path
     diagnostics = orchestrator._validate_implementation_planner_output()
 
     assert diagnostics["valid"] is True
+
+
+def test_first_valid_planner_run_saves_canonical_backlog(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    _prepare_backlog_target_workspace(target_workspace)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    _save_planner_backlog(orchestrator, _canonical_backlog_fixture())
+
+    diagnostics = orchestrator._validate_implementation_planner_output()
+
+    assert diagnostics["valid"] is True
+    payload = json.loads(orchestrator.canonical_backlog_path.read_text(encoding="utf-8"))
+    assert payload["source_run_id"] == orchestrator.logger.run_dir.name
+    assert payload["tasks"][0]["id"] == "TASK-001"
+    assert payload["tasks"][1]["id"] == "TASK-002"
+
+
+def test_second_run_reuses_canonical_backlog(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    _prepare_backlog_target_workspace(target_workspace)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    first = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    canonical = _canonical_backlog_fixture("Canonical")
+    _save_planner_backlog(first, canonical)
+    assert first._validate_implementation_planner_output()["valid"] is True
+
+    second = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    _save_planner_backlog(second, _canonical_backlog_fixture("Reset"))
+
+    backlog, source = second._build_implementation_backlog([], allow_research_fallback=False)
+
+    assert source == "canonical_backlog"
+    assert backlog[0]["title"] == canonical[0]["title"]
+    assert second._canonical_backlog_loaded is True
+
+
+def test_completed_task_selects_next_canonical_task(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    _prepare_backlog_target_workspace(target_workspace)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    first = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    _save_planner_backlog(first, _canonical_backlog_fixture())
+    assert first._validate_implementation_planner_output()["valid"] is True
+
+    first._save_completed_implementation_task_records(
+        [
+            {
+                "task_id": "TASK-001",
+                "title": "Canonical models task",
+                "completed_at": "2026-05-28T10:00:00",
+                "commit": "abc123",
+                "run_id": "run_previous",
+                "changed_files": ["gateway-v4/app/models.py"],
+            }
+        ]
+    )
+    second = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+
+    selection = second._prepare_implementation_backlog_selection(require_backlog=True)
+
+    assert selection["selected_item"]["id"] == "TASK-002"
+    assert selection["backlog_source"] == "canonical_backlog"
+    assert second._selected_task_source == "canonical_backlog"
+
+
+def test_planner_cannot_reset_task_ids_when_canonical_backlog_exists(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    _prepare_backlog_target_workspace(target_workspace)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    first = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    canonical = _canonical_backlog_fixture("Canonical")
+    _save_planner_backlog(first, canonical)
+    assert first._validate_implementation_planner_output()["valid"] is True
+
+    second = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    reset_backlog = _canonical_backlog_fixture("Reset")
+    reset_backlog[0]["title"] = "Reset TASK-001 from new planner"
+    _save_planner_backlog(second, reset_backlog)
+
+    selection = second._prepare_implementation_backlog_selection(require_backlog=True)
+    persisted = json.loads(second.canonical_backlog_path.read_text(encoding="utf-8"))
+
+    assert selection["selected_item"]["title"] == canonical[0]["title"]
+    assert persisted["tasks"][0]["title"] == canonical[0]["title"]
+    assert second._selected_task_source == "canonical_backlog"
+
+
+def test_fresh_run_regenerates_canonical_backlog(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    _prepare_backlog_target_workspace(target_workspace)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    first = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    _save_planner_backlog(first, _canonical_backlog_fixture("Canonical"))
+    assert first._validate_implementation_planner_output()["valid"] is True
+
+    fresh = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+        fresh_run=True,
+    )
+    regenerated = _canonical_backlog_fixture("Regenerated")
+    _save_planner_backlog(fresh, regenerated)
+
+    diagnostics = fresh._validate_implementation_planner_output()
+    backlog, source = fresh._build_implementation_backlog([], allow_research_fallback=False)
+    payload = json.loads(fresh.canonical_backlog_path.read_text(encoding="utf-8"))
+
+    assert diagnostics["valid"] is True
+    assert source == "implementation-planner"
+    assert backlog[0]["title"] == regenerated[0]["title"]
+    assert payload["tasks"][0]["title"] == regenerated[0]["title"]
+
+
+def test_successful_implementation_updates_completed_task_registry(tmp_path: Path, monkeypatch) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    _prepare_backlog_target_workspace(target_workspace)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    orchestrator.config["phases"]["implementation"] = {
+        "name": "Implementation",
+        "agents": [{"name": "developer", "description": "Write code", "max_retries": 1}],
+    }
+    selected_item = _canonical_backlog_fixture()[0]
+
+    def run_phase_agents(_phase, _phase_type):
+        orchestrator._selected_implementation_item = selected_item
+        return True
+
+    monkeypatch.setattr(orchestrator, "_create_git_branch", lambda _attempt: True)
+    monkeypatch.setattr(orchestrator, "_run_phase_agents", run_phase_agents)
+    monkeypatch.setattr(orchestrator, "_merge_git", lambda: True)
+    monkeypatch.setattr(orchestrator, "_prompt_post_implementation_action", lambda: "stop")
+    monkeypatch.setattr(orchestrator, "_implementation_completion_changed_files", lambda: ["gateway-v4/app/models.py"])
+    monkeypatch.setattr(orchestrator, "_current_head_commit", lambda: "abc123")
+    monkeypatch.setattr(orchestrator, "_load_latest_project_research_reports", lambda: ([{"agent_name": "project-analyst"}], None))
+    monkeypatch.setattr(orchestrator, "_refresh_repo_map", lambda snapshot_path=None: True)
+    monkeypatch.setattr(orchestrator, "_load_repo_map", lambda: {"files": [], "directories": []})
+
+    ok = orchestrator._run_implementation_phase()
+
+    payload = json.loads(orchestrator.completed_tasks_path.read_text(encoding="utf-8"))
+    assert ok is True
+    assert payload["completed_tasks"] == [
+        {
+            "task_id": "TASK-001",
+            "title": "Canonical models task",
+            "completed_at": payload["completed_tasks"][0]["completed_at"],
+            "commit": "abc123",
+            "run_id": orchestrator.logger.run_dir.name,
+            "changed_files": ["gateway-v4/app/models.py"],
+        }
+    ]
 
 
 def test_validator_rejects_vague_backend_contract(tmp_path: Path) -> None:
