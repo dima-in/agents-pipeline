@@ -1,3 +1,5 @@
+import types
+
 from workflow.multi_developer_constraints import parse_and_validate
 from workflow.multi_developer_dispatcher import classify_path, filter_paths_for_agent, route_paths
 from workflow.orchestrator import WorkflowOrchestrator
@@ -589,3 +591,195 @@ def test_write_file_allowed_without_spending_strict_retrieval_budget(tmp_path) -
     assert result["allowed"] is True
     assert result["hard_stop"] is False
     assert result["remaining"] == 0
+
+
+def test_selected_task_excerpts_inject_editable_target_file_in_full(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+
+    models_path = tmp_path / "gateway-v4" / "app" / "models.py"
+    models_path.parent.mkdir(parents=True, exist_ok=True)
+    # Large existing file whose final class sits well beyond the old shared excerpt budget
+    # (limit // 2 == 2100 chars), so the previous behaviour truncated it away.
+    head = "\n".join(
+        f"class Model{i}(Base):\n    __tablename__ = 'm{i}'\n    col = Column(String)\n"
+        for i in range(60)
+    )
+    sentinel = (
+        "class ChatMessageSentinel(Base):\n"
+        "    __tablename__ = 'chat_messages'\n"
+        "    keep_me = Column(String)\n"
+    )
+    models_path.write_text(head + "\n" + sentinel, encoding="utf-8")
+    assert len(models_path.read_text(encoding="utf-8")) > 2100
+
+    database_path = tmp_path / "gateway-v4" / "app" / "database.py"
+    database_path.write_text("Base = object()\n", encoding="utf-8")
+
+    # The contract redundantly lists the editable target file in reference_files too —
+    # this previously excluded it from the full-injection set and truncated it again.
+    orchestrator._selected_implementation_item = {
+        "allowed_paths": ["gateway-v4/app/models.py", "gateway-v4/app/database.py"],
+        "existing_paths": ["gateway-v4/app/models.py", "gateway-v4/app/database.py"],
+        "reference_files": ["gateway-v4/app/models.py", "gateway-v4/app/database.py"],
+        "new_files": [],
+        "required_test_paths": [],
+        "target_file": {"path": "gateway-v4/app/models.py", "action": "update"},
+    }
+
+    excerpts = orchestrator._build_selected_task_file_excerpts(limit=4200)
+
+    # The editable target file must reach the developer in full — including its final
+    # class — so a write_file developer never reconstructs unseen classes from memory.
+    assert "ChatMessageSentinel" in excerpts
+    models_portion = excerpts.split("gateway-v4/app/database.py")[0]
+    assert "[retrieval truncated by total limit]" not in models_portion
+    assert "[file truncated" not in models_portion
+    # Reference-only files are still surfaced under the remaining budget.
+    assert "gateway-v4/app/database.py" in excerpts
+
+
+def _write_provider_metrics_migration(tmp_path):
+    migration = tmp_path / "gateway-v4" / "alembic" / "versions" / "0006_provider_metrics.py"
+    migration.parent.mkdir(parents=True, exist_ok=True)
+    migration.write_text(
+        "from alembic import op\n"
+        "import sqlalchemy as sa\n\n"
+        "def upgrade():\n"
+        "    op.create_table('provider_metrics', sa.Column('id', sa.String()))\n\n"
+        "def downgrade():\n"
+        "    op.drop_table('provider_metrics')\n",
+        encoding="utf-8",
+    )
+
+
+def _provider_metrics_contract():
+    return {
+        "id": "TASK-001",
+        "_target_file_declared": True,
+        "_test_file_declared": True,
+        "_depends_on_declared": True,
+        "_must_contain_declared": True,
+        "_must_test_declared": True,
+        "allowed_paths": [
+            "gateway-v4/app/models.py",
+            "gateway-v4/alembic/versions/0006_provider_metrics.py",
+        ],
+        "existing_paths": [
+            "gateway-v4/app/models.py",
+            "gateway-v4/alembic/versions/0006_provider_metrics.py",
+        ],
+        "reference_files": ["gateway-v4/alembic/versions/0006_provider_metrics.py"],
+        "new_files": ["gateway-v4/tests/test_provider_metrics_migration.py"],
+        "required_test_paths": ["gateway-v4/tests/test_provider_metrics_migration.py"],
+        "target_file": {"path": "gateway-v4/app/models.py", "action": "update"},
+        "test_file": {"path": "gateway-v4/tests/test_provider_metrics_migration.py", "action": "create"},
+        "must_contain": [
+            "class ProviderMetrics(Base):",
+            '__tablename__ = "provider_metrics"',
+        ],
+        "must_test": [
+            "test_provider_metrics_table_exists: verify provider_metrics table is created by migration",
+            "test_provider_metrics_indexes: verify provider and model indexes exist",
+        ],
+    }
+
+
+def test_contract_rejects_migration_test_for_table_absent_from_migration(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    _write_provider_metrics_migration(tmp_path)
+
+    # The planning agents invented a provider_health model + a test asserting the
+    # migration creates that table, but migration 0006 only creates provider_metrics.
+    item = _provider_metrics_contract()
+    item["must_contain"] += ["class ProviderHealth(Base):", '__tablename__ = "provider_health"']
+    item["must_test"].append(
+        "test_provider_health_table_exists: verify provider_health table is created by migration"
+    )
+
+    errors = orchestrator._validate_backend_task_contract(item)
+
+    assert any("table 'provider_health' is created by the migration" in e for e in errors)
+    # The real table must not be flagged.
+    assert not any("table 'provider_metrics' is created by the migration" in e for e in errors)
+
+
+def test_contract_allows_migration_test_for_real_table(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    _write_provider_metrics_migration(tmp_path)
+
+    errors = orchestrator._validate_backend_task_contract(_provider_metrics_contract())
+
+    assert not any("created by the migration" in e for e in errors)
+
+
+def test_migration_ground_truth_note_lists_only_real_tables(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    _write_provider_metrics_migration(tmp_path)
+    orchestrator._selected_implementation_item = {
+        "existing_paths": ["gateway-v4/alembic/versions/0006_provider_metrics.py"],
+        "reference_files": ["gateway-v4/alembic/versions/0006_provider_metrics.py"],
+        "new_files": [],
+    }
+
+    note = orchestrator._build_migration_ground_truth_note()
+
+    assert "provider_metrics" in note
+    assert "provider_health" not in note
+
+
+def test_migration_ground_truth_note_empty_without_existing_migration(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator._selected_implementation_item = {
+        "existing_paths": ["gateway-v4/app/models.py"],
+        # The migration is declared as a new file (does not exist yet) → not ground truth.
+        "new_files": ["gateway-v4/alembic/versions/0007_new.py"],
+        "reference_files": ["gateway-v4/alembic/versions/0007_new.py"],
+    }
+
+    assert orchestrator._build_migration_ground_truth_note() == ""
+
+
+def test_task_designer_contract_retry_regenerates_on_invalid(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator.logger = types.SimpleNamespace(info=lambda *a, **k: None)
+    orchestrator._task_designer_feedback_for_prompt = False
+    calls = {"run": 0, "apply": 0, "flag_during_run": []}
+
+    def fake_run_agent(agent, phase, *, index, total):
+        calls["run"] += 1
+        calls["flag_during_run"].append(orchestrator._task_designer_feedback_for_prompt)
+        return True
+
+    def fake_apply(report):
+        calls["apply"] += 1
+        return calls["apply"] >= 2  # invalid first, valid on regeneration
+
+    orchestrator._run_agent = fake_run_agent
+    orchestrator._load_saved_agent_report = lambda phase, name, run_dir=None: {"agent_name": "task-designer"}
+    orchestrator._apply_task_designer_contract_from_report = fake_apply
+
+    ok = orchestrator._apply_task_designer_contract_with_retry(
+        {"name": "task-designer"}, index=3, total=6, max_retries=2
+    )
+
+    assert ok is True
+    assert calls["run"] == 1  # one regeneration after the initial apply failed
+    assert calls["apply"] == 2
+    assert calls["flag_during_run"] == [True]  # feedback injected on the regeneration run
+    assert orchestrator._task_designer_feedback_for_prompt is False  # reset afterwards
+
+
+def test_task_designer_contract_retry_gives_up_after_max(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator.logger = types.SimpleNamespace(info=lambda *a, **k: None)
+    orchestrator._task_designer_feedback_for_prompt = False
+    orchestrator._run_agent = lambda agent, phase, *, index, total: True
+    orchestrator._load_saved_agent_report = lambda phase, name, run_dir=None: {}
+    orchestrator._apply_task_designer_contract_from_report = lambda report: False
+
+    ok = orchestrator._apply_task_designer_contract_with_retry(
+        {"name": "task-designer"}, index=3, total=6, max_retries=2
+    )
+
+    assert ok is False
+    assert orchestrator._task_designer_feedback_for_prompt is False

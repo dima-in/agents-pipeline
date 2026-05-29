@@ -42,7 +42,7 @@ workflow:
       - checkout
       - marketplace
     max_changed_files: 8
-    max_diff_lines: 320
+    max_diff_lines: 500
   require_registry_preflight: false
   require_model_list_preflight: false
   phase_order:

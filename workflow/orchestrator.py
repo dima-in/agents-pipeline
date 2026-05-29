@@ -173,6 +173,7 @@ class WorkflowOrchestrator:
         self._task_designer_feedback_file = ""
         self._task_designer_feedback_source = ""
         self._task_designer_rejection_reason = ""
+        self._task_designer_feedback_for_prompt = False
         self._developer_feedback_file = ""
         self._developer_feedback_source = ""
         self._developer_feedback_chars = 0
@@ -304,6 +305,7 @@ class WorkflowOrchestrator:
         self._task_designer_feedback_file = ""
         self._task_designer_feedback_source = ""
         self._task_designer_rejection_reason = ""
+        self._task_designer_feedback_for_prompt = False
         self._developer_feedback_file = ""
         self._developer_feedback_source = ""
         self._developer_feedback_chars = 0
@@ -499,8 +501,7 @@ class WorkflowOrchestrator:
                     had_failures = True
                     return False
             if phase_key == "implementation" and agent["name"] == "task-designer":
-                task_designer_report = self._load_saved_agent_report("implementation", "task-designer") or {}
-                if not self._apply_task_designer_contract_from_report(task_designer_report):
+                if not self._apply_task_designer_contract_with_retry(agent, index=index, total=total):
                     had_failures = True
                     return False
             if phase_key == "implementation" and agent["name"] == "developer":
@@ -2104,6 +2105,10 @@ class WorkflowOrchestrator:
             completed_task_record_error = implementation_context["completed_task_record_error"]
             if self._implementation_retry_from_agent == "developer" and (agent_name == "developer" or self._is_multi_developer_edit_agent(agent_name)):
                 developer_feedback_text, developer_feedback_source = self._load_developer_feedback_for_retry()
+                developer_feedback_chars = len(developer_feedback_text)
+            elif agent_name == "task-designer" and self._task_designer_feedback_for_prompt and self._task_designer_rejection_reason:
+                developer_feedback_text = self._task_designer_rejection_reason
+                developer_feedback_source = self._task_designer_feedback_source or "task-designer"
                 developer_feedback_chars = len(developer_feedback_text)
             contract_completeness = implementation_context["contract_completeness"]
             contract_compliance = implementation_context["contract_compliance"]
@@ -5344,13 +5349,32 @@ class WorkflowOrchestrator:
                 ("Target dependency and config files", self._build_target_dependency_context(limit=2200)),
                 ("Target top-level tree up to depth 4", self._build_top_level_tree(root=self.target_workspace, depth=4)),
             ]
+        edit_agent = agent_name == "developer" or self._is_multi_developer_edit_agent(agent_name)
+        if agent_name == "task-designer" or edit_agent:
+            ground_truth = self._build_migration_ground_truth_note()
+            if ground_truth:
+                insert_at = next(
+                    (idx + 1 for idx, (title, _) in enumerate(sections) if title == "Selected implementation scope"),
+                    len(sections),
+                )
+                sections.insert(insert_at, ("Migration ground truth", ground_truth))
         if (
             agent_name in {"task-designer", "developer", "qa", "template-validator"}
             or self._is_multi_developer_edit_agent(agent_name)
         ):
             scoped_excerpts = self._build_selected_task_file_excerpts(limit=4200)
             if scoped_excerpts:
-                sections.append(("Selected task file excerpts", scoped_excerpts))
+                if edit_agent:
+                    # Place the file(s) under edit right after the scope so they are never
+                    # starved by lower-value sections (README, dependency files, directory
+                    # tree) when the joined context is capped.
+                    insert_at = next(
+                        (idx + 1 for idx, (title, _) in enumerate(sections) if title == "Selected implementation scope"),
+                        len(sections),
+                    )
+                    sections.insert(insert_at, ("Selected task file excerpts", scoped_excerpts))
+                else:
+                    sections.append(("Selected task file excerpts", scoped_excerpts))
         if agent_name == "implementation-planner":
             sections.extend(
                 [
@@ -5367,7 +5391,8 @@ class WorkflowOrchestrator:
                 sections.append(("Target git diff", diff_excerpt))
             sections.append(("Repo map before/after summary", self._build_repo_map_delta_summary(limit=2200)))
 
-        repository_context = self._join_context_sections(sections, limit=limit)
+        context_limit = max(limit, 20000) if edit_agent else limit
+        repository_context = self._join_context_sections(sections, limit=context_limit)
         contract_diag = self._evaluate_selected_task_contract_compliance() if agent_name in {"qa", "template-validator"} else {}
         sources = [
             f"{run_dir.name}:{report.get('agent_name') or report.get('agent')}"
@@ -5458,22 +5483,59 @@ class WorkflowOrchestrator:
     def _build_selected_task_file_excerpts(self, limit: int = 4200) -> str:
         item = self._selected_implementation_item or {}
         sections: list[str] = []
+
+        reference_set = {
+            self._normalize_repo_relative_path(path)
+            for path in item.get("reference_files") or []
+        }
+        new_file_set = {
+            self._normalize_repo_relative_path(path)
+            for path in item.get("new_files") or []
+        }
+
+        # Files the current agent must EDIT and that already exist are injected in full.
+        # If such a file is truncated, a developer using write_file rewrites it from a
+        # partial view and silently destroys the classes that were cut from the excerpt.
+        editable_existing: list[str] = []
+
+        def _add_editable(raw_path: str, *, allow_reference: bool) -> None:
+            normalized = self._normalize_repo_relative_path(raw_path)
+            if not normalized or normalized in new_file_set or normalized in editable_existing:
+                return
+            if not allow_reference and normalized in reference_set:
+                return
+            candidate = (self.target_workspace / normalized).resolve()
+            if candidate.exists() and candidate.is_file():
+                editable_existing.append(normalized)
+
+        # Declared write targets are always shown in full, even when the contract also
+        # (redundantly) lists them among reference_files — otherwise the file the agent
+        # edits would be truncated and rewritten from a partial view.
+        for key in ("target_file", "test_file"):
+            spec = item.get(key)
+            if isinstance(spec, dict):
+                _add_editable(spec.get("path") or "", allow_reference=True)
+        # Other allowed, non-reference, existing files are editable too.
+        for path in item.get("allowed_paths") or []:
+            _add_editable(path, allow_reference=False)
+
+        primary_excerpt = ""
+        if editable_existing:
+            # Generous budget so editable target files are never truncated by the shared limit.
+            primary_excerpt = self._direct_api_read_files(editable_existing, limit=20000)
+            if primary_excerpt:
+                sections.append(primary_excerpt)
+
         candidate_paths: list[str] = []
-        for path in item.get("existing_paths") or []:
-            normalized = self._normalize_repo_relative_path(path)
-            if normalized:
-                candidate_paths.append(normalized)
-        for path in item.get("required_test_paths") or []:
-            normalized = self._normalize_repo_relative_path(path)
-            if normalized:
-                candidate_paths.append(normalized)
-        for path in item.get("reference_files") or []:
-            normalized = self._normalize_repo_relative_path(path)
-            if normalized:
-                candidate_paths.append(normalized)
+        for key in ("existing_paths", "required_test_paths", "reference_files"):
+            for path in item.get(key) or []:
+                normalized = self._normalize_repo_relative_path(path)
+                if normalized and normalized not in editable_existing:
+                    candidate_paths.append(normalized)
         ordered_paths = list(dict.fromkeys(candidate_paths))
         if ordered_paths:
-            file_excerpt = self._direct_api_read_files(ordered_paths, limit=max(1200, limit // 2))
+            remaining = max(1200, limit - len(primary_excerpt))
+            file_excerpt = self._direct_api_read_files(ordered_paths, limit=remaining)
             if file_excerpt:
                 sections.append(file_excerpt)
 
@@ -5494,7 +5556,8 @@ class WorkflowOrchestrator:
                 sections.append(f"### reference file excerpts from {directory}\n{sibling_excerpt}")
 
         text = "\n\n".join(section for section in sections if section.strip())
-        return text[:limit]
+        # Preserve the full editable target file (placed first); only bound the remainder.
+        return text[: len(primary_excerpt) + max(limit, 1200)]
 
     def _build_directory_reference_file_excerpts(self, directory: str, limit: int = 1400) -> str:
         base = (self.target_workspace / directory).resolve()
@@ -5634,6 +5697,61 @@ class WorkflowOrchestrator:
                 if keyword.arg == "nullable" and WorkflowOrchestrator._contract_ast_literal(keyword.value) is nullable:
                     return True
         return False
+
+    def _in_scope_migration_tables(self, item: dict[str, Any]) -> tuple[bool, set[str]]:
+        """Tables actually created by existing migration files in the task scope.
+
+        Returns (found_existing_migration, created_table_names). Migrations that are
+        declared as new_files are excluded — they do not exist yet, so they are not
+        ground truth. This lets the contract validator reject claims that a migration
+        creates a table it does not, rather than trusting the planning agents.
+        """
+        new_files = {self._normalize_repo_relative_path(path) for path in item.get("new_files") or []}
+        scope_paths: list[str] = []
+        for key in ("allowed_paths", "existing_paths", "reference_files"):
+            for path in item.get(key) or []:
+                normalized = self._normalize_repo_relative_path(path)
+                if normalized:
+                    scope_paths.append(normalized)
+        tables: set[str] = set()
+        found = False
+        for rel in dict.fromkeys(scope_paths):
+            if "/alembic/versions/" not in rel or not rel.endswith(".py") or rel in new_files:
+                continue
+            candidate = (self.target_workspace / rel).resolve()
+            if not candidate.exists() or not candidate.is_file():
+                continue
+            try:
+                tree = ast.parse(candidate.read_text(encoding="utf-8", errors="replace"))
+            except (OSError, SyntaxError):
+                continue
+            found = True
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                if self._contract_ast_call_name(node.func) not in {"op.create_table", "create_table"}:
+                    continue
+                if node.args and isinstance(self._contract_ast_literal(node.args[0]), str):
+                    tables.add(self._contract_ast_literal(node.args[0]))
+        return found, tables
+
+    def _build_migration_ground_truth_note(self) -> str:
+        """Authoritative note about which tables the in-scope migrations actually create.
+
+        Grounds planning/edit agents so they do not invent tables (e.g. a health table)
+        that no migration creates. Empty when the task has no existing migration in scope.
+        """
+        found, tables = self._in_scope_migration_tables(self._selected_implementation_item or {})
+        if not found:
+            return ""
+        table_list = ", ".join(sorted(tables)) if tables else "(no tables created)"
+        return (
+            f"The in-scope Alembic migration file(s) create exactly these tables: {table_list}. "
+            "This is authoritative ground truth parsed from the real migration source. "
+            "Do NOT require models, columns, or migration tests for any table that is not in this list. "
+            "If the plan mentions another table that no in-scope migration creates, do not claim a "
+            "migration creates it and do not add a migration test for it."
+        )
 
     def _configured_alembic_down_revision(self) -> str:
         implementation = self.config.get("phases", {}).get("implementation", {})
@@ -7462,6 +7580,23 @@ class WorkflowOrchestrator:
             if self._is_vague_contract_item(value):
                 errors.append(f"{task_id}:vague_must_test:{value[:80]}")
 
+        # Ground migration-table claims in reality: the contract must not require a test
+        # asserting that an in-scope migration creates a table that migration never creates.
+        found_migration, migration_tables = self._in_scope_migration_tables(item)
+        if found_migration:
+            declared_model_tables = set(
+                re.findall(r'__tablename__\s*=\s*["\']([A-Za-z0-9_]+)["\']', "\n".join(must_contain))
+            )
+            for table in sorted(declared_model_tables):
+                if table in migration_tables:
+                    continue
+                if any(table in entry and "migration" in entry.lower() for entry in must_test):
+                    errors.append(
+                        f"{task_id}:must_test asserts table '{table}' is created by the migration, "
+                        f"but the in-scope migration(s) only create {sorted(migration_tables)}; "
+                        f"remove the migration test for '{table}' (and drop the model if it has no migration)"
+                    )
+
         return errors
 
     def _parse_task_designer_output(self, text: str, base_item: dict[str, Any]) -> dict[str, Any]:
@@ -8715,6 +8850,35 @@ class WorkflowOrchestrator:
         self.logger.info("Diagnostic dependency_auto_selected=True")
         return {"ok": True, "status": "", "auto_selected": True}
 
+    def _apply_task_designer_contract_with_retry(
+        self, agent: dict[str, Any], *, index: int, total: int, max_retries: int = 2
+    ) -> bool:
+        """Apply the latest task-designer contract; on validation failure, regenerate.
+
+        The task-designer is non-deterministic and can emit an invalid contract (e.g. a
+        migration test for a table no in-scope migration creates). Rather than failing the
+        whole run on a single bad draft, re-run the task-designer with the validation
+        feedback injected so it can self-correct.
+        """
+        report = self._load_saved_agent_report("implementation", "task-designer") or {}
+        if self._apply_task_designer_contract_from_report(report):
+            return True
+        for attempt in range(1, max_retries + 1):
+            self.logger.info(
+                f"Task-designer contract invalid; regenerating with feedback (retry {attempt}/{max_retries})"
+            )
+            self._task_designer_feedback_for_prompt = True
+            try:
+                ran = self._run_agent(agent, "implementation", index=index, total=total)
+            finally:
+                self._task_designer_feedback_for_prompt = False
+            if not ran:
+                return False
+            report = self._load_saved_agent_report("implementation", "task-designer") or {}
+            if self._apply_task_designer_contract_from_report(report):
+                return True
+        return False
+
     def _run_task_designer_before_developer(self, phase: dict[str, Any], *, total: int) -> bool:
         task_designer_config: dict[str, Any] | None = None
         task_designer_index = 0
@@ -8728,8 +8892,9 @@ class WorkflowOrchestrator:
         self.logger.info("Selected task requires a fresh task-designer contract. Running task-designer before developer.")
         if not self._run_agent(task_designer_config, "implementation", index=task_designer_index, total=total):
             return False
-        task_designer_report = self._load_saved_agent_report("implementation", "task-designer") or {}
-        return self._apply_task_designer_contract_from_report(task_designer_report)
+        return self._apply_task_designer_contract_with_retry(
+            task_designer_config, index=task_designer_index, total=total
+        )
 
     def _implementation_completion_changed_files(self) -> list[str]:
         diagnostics = self._collect_scope_watchdog_diff_diagnostics()
