@@ -3220,7 +3220,8 @@ class WorkflowOrchestrator:
                     'You may also request write operations with '
                     '{"tool":"write_file","path":"gateway-v4/app/services/monitoring.py","content":"..."} '
                     'or {"tool":"apply_patch","path":"gateway-v4/app/services/proxy.py","search":"old","replace":"new"}. '
-                    "Before writing, inspect the exact target files first. "
+                    "Before editing an existing file, inspect it first with read_file. "
+                    "For a new file that does not exist yet, do not read it; create it directly with write_file. "
                     "Use only read_file/read_files for contract and reference paths during retrieval. "
                     "Do not use search_text or list_files in developer implementation mode. "
                     "Make the smallest viable backend-only change. "
@@ -3808,6 +3809,14 @@ class WorkflowOrchestrator:
             except ValueError:
                 continue
             if not candidate.exists() or not candidate.is_file():
+                # Surface missing files explicitly instead of returning an empty result.
+                # A developer agent that must create a new file (e.g. a test file) otherwise
+                # reads "nothing" and wrongly concludes it cannot proceed.
+                chunks.append(
+                    f"## {raw_path}\n"
+                    "[file does not exist yet — there is nothing to read. "
+                    "If this path is within your allowed scope, create it directly with write_file.]"
+                )
                 continue
             try:
                 text = candidate.read_text(encoding="utf-8", errors="replace")
@@ -4037,10 +4046,45 @@ class WorkflowOrchestrator:
         if not allowed or candidate is None:
             self._record_failed_write_attempt("write_file", detail)
             return detail
+        content, repaired = self._repair_escaped_file_content(path, content)
+        if repaired:
+            self.logger.warning(f"Repaired escaped newlines in write_file content for {path}")
         candidate.parent.mkdir(parents=True, exist_ok=True)
         candidate.write_text(content, encoding="utf-8")
         self._record_write_tool_usage("write_file", detail)
         return f"Wrote file: {detail}"
+
+    @staticmethod
+    def _repair_escaped_file_content(path: str, content: str) -> tuple[str, bool]:
+        """Repair file content where a model escaped newlines into the JSON string.
+
+        Some models emit a write_file ``content`` value with literal ``\\n``/``\\t`` sequences
+        and no real newlines, collapsing the whole file onto one physical line. That is valid
+        JSON but produces a broken source file (``SyntaxError: unterminated triple-quoted
+        string``). When a ``.py`` file has no real newline yet contains escaped newline
+        sequences, decode the standard backslash escapes. This is done with an explicit
+        character walk (not ``unicode_escape``) so UTF-8 text such as Cyrillic and emoji is
+        preserved instead of being mangled.
+        """
+        if not str(path or "").strip().lower().endswith(".py"):
+            return content, False
+        if "\n" in content or "\r" in content:
+            return content, False
+        if "\\n" not in content and "\\r" not in content:
+            return content, False
+        mapping = {"n": "\n", "r": "\r", "t": "\t", '"': '"', "'": "'", "\\": "\\", "/": "/"}
+        out: list[str] = []
+        index = 0
+        length = len(content)
+        while index < length:
+            char = content[index]
+            if char == "\\" and index + 1 < length and content[index + 1] in mapping:
+                out.append(mapping[content[index + 1]])
+                index += 2
+                continue
+            out.append(char)
+            index += 1
+        return "".join(out), True
 
     def _direct_api_apply_patch(self, path: str, search: str, replace: str) -> str:
         allowed, detail, candidate = self._validate_direct_api_write_request(path, [search, replace])
@@ -4748,7 +4792,8 @@ class WorkflowOrchestrator:
             "- Do not make broad frontend changes.",
             "- Prefer small backend-first changes.",
             "- Frontend changes are limited to API client stubs only if required.",
-            "- Inspect target files before writing.",
+            "- Inspect existing target files with read_file before editing them.",
+            "- For a new file that does not exist yet, do not try to read it; create it directly with write_file.",
             "- Developer must produce real file edits via write_file/apply_patch when a safe scoped change is possible.",
             "- If no safe edit is possible, return status=no_changes with a reason.",
             "- If the task requires wider scope, stop and report that scope expansion is needed.",
@@ -8602,7 +8647,13 @@ class WorkflowOrchestrator:
         self.logger.info(f"Diagnostic dependency_missing_artifacts={self._format_dependency_missing_artifacts(status)}")
 
         if not status["blocked"]:
-            self._dependency_forced_task_id = ""
+            # Keep the pin while we are still on the auto-selected dependency itself (it is now
+            # unblocked because task-designer produced its contract). Clearing it here would let
+            # the retry-loop / selection guards treat the still-stale "completed" dependency as
+            # done again on the next attempt and skip ahead to the dependent task. The pin is
+            # reset when the phase restarts for the next task.
+            if initial_id != self._dependency_forced_task_id:
+                self._dependency_forced_task_id = ""
             self.logger.info(f"Diagnostic selected_task_id_final={initial_id}")
             self.logger.info("Diagnostic dependency_auto_selected=False")
             return {"ok": True, "status": "", "auto_selected": False}
@@ -9848,8 +9899,11 @@ class WorkflowOrchestrator:
                 return None
             if agent_name == "task-designer":
                 return 1600
-            if agent_name == "developer":
-                return 2200
+            # Developer-class agents emit whole files via write_file, so they need a large
+            # output budget. A tight cap truncates the write_file JSON mid-content, which then
+            # fails to parse as a tool call and is silently dropped (the file is never written).
+            if agent_name == "developer" or agent_name in {"code-developer", "infra-developer", "test-developer"}:
+                return 8000
             if agent_name == "qa":
                 return 1600
             if agent_name == "template-validator":

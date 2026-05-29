@@ -3140,6 +3140,31 @@ def test_dependency_auto_selects_blocking_task_when_not_completed(tmp_path: Path
     assert orchestrator._selected_implementation_item["id"] == "TASK-001"
 
 
+def test_auto_selected_dependency_pin_persists_for_retry(tmp_path: Path) -> None:
+    # Regression: when a stale-completed dependency is auto-selected and then becomes unblocked
+    # (task-designer produced its contract), the pin must persist so a failed-attempt retry keeps
+    # targeting the dependency instead of treating it as "completed" again and skipping ahead.
+    orchestrator = _make_dependency_orchestrator(
+        tmp_path,
+        completed_task_ids=["TASK-001"],
+        repo_files=["gateway-v4/app/services/proxy.py", "gateway-v4/app/routers/admin.py"],
+    )
+    orchestrator._selected_implementation_item = orchestrator._implementation_backlog_cache[1]
+
+    first = orchestrator._handle_selected_task_dependencies()
+    assert first["auto_selected"] is True
+    assert orchestrator._dependency_forced_task_id == "TASK-001"
+
+    # task-designer produces the contract for the dependency; developer gate re-validates it.
+    orchestrator._selected_implementation_item = {
+        **orchestrator._implementation_backlog_cache[0],
+        "contract_source": "task-designer",
+    }
+    second = orchestrator._handle_selected_task_dependencies()
+    assert second["auto_selected"] is False
+    assert orchestrator._dependency_forced_task_id == "TASK-001"
+
+
 def test_dependency_explicit_task_id_fails_once_without_auto_select(tmp_path: Path) -> None:
     orchestrator = _make_dependency_orchestrator(
         tmp_path,
@@ -6038,6 +6063,67 @@ def test_scope_plan_blocks_when_planner_and_canonical_backlog_missing(tmp_path: 
 
     assert orchestrator._enforce_implementation_scope_plan() is False
     assert orchestrator._phase_failure_status == "scope_violation"
+
+
+def test_repair_escaped_file_content_decodes_escaped_newlines() -> None:
+    # A .py file the model emitted with escaped newlines (whole file on one physical line).
+    broken = '"""\\nProxy — отправляет запросы 🔌\\n"""\\n\\nimport httpx\\n\\n\\ndef f():\\n    return 1\\n'
+    repaired, changed = WorkflowOrchestrator._repair_escaped_file_content("gateway-v4/app/services/proxy.py", broken)
+    assert changed is True
+    assert "\n" in repaired
+    assert "\\n" not in repaired
+    # UTF-8 text (Cyrillic + emoji) must survive the repair.
+    assert "отправляет запросы 🔌" in repaired
+    assert repaired.startswith('"""\nProxy')
+    # The repaired source must actually compile.
+    compile(repaired, "proxy.py", "exec")
+
+
+def test_repair_escaped_file_content_leaves_valid_content_untouched() -> None:
+    good = '"""Doc."""\n\nimport os\n\n\ndef f():\n    return "a\\nb"\n'
+    repaired, changed = WorkflowOrchestrator._repair_escaped_file_content("x.py", good)
+    assert changed is False
+    assert repaired == good
+    # Non-Python files are never touched even if single-line with escapes.
+    data, changed_data = WorkflowOrchestrator._repair_escaped_file_content("data.json", '{"a": "b\\nc"}')
+    assert changed_data is False
+    assert data == '{"a": "b\\nc"}'
+
+
+def test_direct_api_max_tokens_allows_full_file_writes_for_edit_agents() -> None:
+    # Developer-class agents write whole files; their output budget must be large enough that
+    # the write_file JSON is not truncated (truncation drops the write and the file is never
+    # created — observed as "scoped changed file is missing").
+    for agent in ("developer", "code-developer", "infra-developer", "test-developer"):
+        tokens = WorkflowOrchestrator._direct_api_max_tokens("implementation", agent)
+        assert tokens is not None and tokens >= 8000, agent
+    # Non-writing agents keep their tighter caps.
+    assert WorkflowOrchestrator._direct_api_max_tokens("implementation", "qa") == 1600
+    assert WorkflowOrchestrator._direct_api_max_tokens("implementation", "template-validator") == 1000
+
+
+def test_read_file_reports_missing_new_file_instead_of_empty(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+
+    # A new file the developer must create does not exist yet: read must explain that,
+    # not return an empty string that makes the agent give up with status=no_changes.
+    result = orchestrator._direct_api_read_files(["gateway-v4/tests/test_proxy_metrics.py"], limit=2000)
+    assert "gateway-v4/tests/test_proxy_metrics.py" in result
+    assert "does not exist yet" in result
+    assert "write_file" in result
+
+    # Existing files are still read normally without the missing-file marker.
+    existing = target_workspace / "gateway-v4" / "app" / "models.py"
+    existing.parent.mkdir(parents=True, exist_ok=True)
+    existing.write_text("class ProviderMetrics:\n    pass\n", encoding="utf-8")
+    read = orchestrator._direct_api_read_files(["gateway-v4/app/models.py"], limit=2000)
+    assert "ProviderMetrics" in read
+    assert "does not exist yet" not in read
 
 
 def test_repo_map_after_detects_newly_created_allowed_file(tmp_path: Path) -> None:
