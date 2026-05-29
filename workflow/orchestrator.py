@@ -26,6 +26,7 @@ import yaml
 from tools.repo_map import compare_repo_maps, generate_repo_map, is_excluded_path, validate_agent_paths
 from workflow.logger import WorkflowLogger
 from workflow.multi_developer_dispatcher import filter_paths_for_agent, route_paths
+from workflow.run_explainer import find_latest_implementation_run, generate_human_report
 from workflow.runtime import has_provider_credentials, load_runtime_config, required_key_env, resolve_runner_path
 
 PROJECT_CODEX_TEMPLATE = (
@@ -136,8 +137,12 @@ class WorkflowOrchestrator:
         self._selected_task_source = ""
         self._backlog_selected_task_id = ""
         self._skipped_completed_task_ids: list[str] = []
+        self._dependency_forced_task_id = ""
         self._completed_task_recorded = False
         self._completed_task_record_error = ""
+        self._human_report_path = self.logger.run_dir / "human_report.md"
+        self._human_report_updated = False
+        self._human_report_error = ""
         self._selected_implementation_item: dict[str, Any] | None = None
         self._implementation_planner_output_chars = 0
         self._planner_invalid_paths: list[str] = []
@@ -220,6 +225,7 @@ class WorkflowOrchestrator:
         if not self._preflight_runtime("implementation"):
             return False
         ok = self.run_phase("implementation")
+        self._update_human_report(final_status="success" if ok else (self._phase_failure_status or "failed"))
         self._persist_project_codex_context()
         self._persist_project_resume_context()
         return ok
@@ -266,6 +272,7 @@ class WorkflowOrchestrator:
         self._implementation_backlog_source = ""
         self._selected_task_source = ""
         self._skipped_completed_task_ids = []
+        self._dependency_forced_task_id = ""
         self._completed_task_recorded = False
         self._completed_task_record_error = ""
         self._implementation_planner_output_chars = 0
@@ -348,6 +355,7 @@ class WorkflowOrchestrator:
                 attempt > 1
                 and cached_selected_task_id
                 and cached_selected_task_id in set(self._completed_implementation_task_ids())
+                and cached_selected_task_id != self._dependency_forced_task_id
                 and not self._selected_task_from_explicit_cli
                 and not self.rerun_completed
             ):
@@ -356,7 +364,7 @@ class WorkflowOrchestrator:
                 self._skipped_completed_task_ids = []
             self.logger.info(f"Попытка реализации {attempt}/{max_retries}")
             ok = self._run_phase_agents(phase, "implementation")
-            if not ok and self._phase_failure_status in {"scope_violation", "no_changes", "planner_invalid", "task_designer_invalid", "strict_retrieval_blocked"}:
+            if not ok and self._phase_failure_status in {"scope_violation", "no_changes", "planner_invalid", "task_designer_invalid", "strict_retrieval_blocked", "task_dependencies_incomplete", "dependency_missing_from_backlog"}:
                 if self.config["git"]["enabled"] and self.config["git"]["auto_rollback"]:
                     if not self._rollback_git(self._phase_failure_status.replace("_", " ")):
                         self._phase_failure_status = "rollback_failed"
@@ -444,40 +452,22 @@ class WorkflowOrchestrator:
                     self.logger.error(selection["error"])
                     had_failures = True
                     return False
-                dependency_error = self._selected_task_dependency_error()
-                if dependency_error:
-                    if self._retry_selection_after_dependency_error():
-                        selection = self._prepare_implementation_backlog_selection(require_backlog=True)
-                        if selection["error"]:
-                            self.logger.error(selection["error"])
-                            had_failures = True
-                            return False
-                        dependency_error = self._selected_task_dependency_error()
-                    self.logger.error(dependency_error)
-                    if dependency_error:
-                        self._phase_failure_status = "task_dependencies_incomplete"
-                        had_failures = True
-                        return False
+                dependency_result = self._handle_selected_task_dependencies()
+                if not dependency_result["ok"]:
+                    self._phase_failure_status = dependency_result["status"]
+                    had_failures = True
+                    return False
             if phase_key == "implementation" and agent["name"] == "developer":
                 selection = self._prepare_implementation_backlog_selection(require_backlog=True)
                 if selection["error"]:
                     self.logger.error(selection["error"])
                     had_failures = True
                     return False
-                dependency_error = self._selected_task_dependency_error()
-                if dependency_error:
-                    if self._retry_selection_after_dependency_error():
-                        selection = self._prepare_implementation_backlog_selection(require_backlog=True)
-                        if selection["error"]:
-                            self.logger.error(selection["error"])
-                            had_failures = True
-                            return False
-                        dependency_error = self._selected_task_dependency_error()
-                    self.logger.error(dependency_error)
-                    if dependency_error:
-                        self._phase_failure_status = "task_dependencies_incomplete"
-                        had_failures = True
-                        return False
+                dependency_result = self._handle_selected_task_dependencies()
+                if not dependency_result["ok"]:
+                    self._phase_failure_status = dependency_result["status"]
+                    had_failures = True
+                    return False
                 task_designer_required = any(str(candidate.get("name") or "") == "task-designer" for candidate in phase.get("agents", []))
                 if task_designer_required and str((self._selected_implementation_item or {}).get("contract_source") or "") != "task-designer":
                     if self.from_agent_name == "developer":
@@ -626,6 +616,8 @@ class WorkflowOrchestrator:
             "no_changes_detected": not bool(changed_paths),
         }
         self.logger.save_agent_report("implementation", "developer", payload)
+        payload_status = str(payload.get("status") or "")
+        self._update_human_report(final_status=payload_status if payload_status != "success" else "in_progress", agent_name="developer")
 
     def _multi_developer_current_changed_files(self, allowed_paths: list[str]) -> list[str]:
         diagnostics = self._collect_scope_watchdog_diff_diagnostics()
@@ -1267,6 +1259,8 @@ class WorkflowOrchestrator:
                     **extra_fields,
                 },
             )
+            if phase == "implementation":
+                self._update_human_report(final_status=status if status != "success" else "in_progress", agent_name=agent_name)
             self._log_usage_totals(agent_name, phase, usage)
 
         if executor == "direct_api":
@@ -3581,17 +3575,21 @@ class WorkflowOrchestrator:
             path = str(payload.get("path") or "").strip()
             if not path:
                 return "Invalid read_file request."
+            self._record_retrieval_tool_usage(phase, agent_name, tool, [path])
             return self._direct_api_read_files([path], limit=self._direct_api_read_limit_for_agent(phase, agent_name))
         if tool == "read_files":
             paths = payload.get("paths")
             if not isinstance(paths, list):
                 return "Invalid read_files request."
-            return self._direct_api_read_files([str(path) for path in paths], limit=self._direct_api_read_limit_for_agent(phase, agent_name))
+            normalized_paths = [str(path) for path in paths]
+            self._record_retrieval_tool_usage(phase, agent_name, tool, normalized_paths)
+            return self._direct_api_read_files(normalized_paths, limit=self._direct_api_read_limit_for_agent(phase, agent_name))
         if tool == "search_text":
             pattern = str(payload.get("pattern") or "").strip()
             limit = self._coerce_int(payload.get("limit")) or 20
             if not pattern:
                 return "Invalid search_text request."
+            self._record_retrieval_tool_usage(phase, agent_name, tool)
             if phase == "implementation" and (agent_name == "developer" or self._is_multi_developer_edit_agent(agent_name)):
                 return (
                     "search_text is disabled for developer in implementation mode. "
@@ -3601,6 +3599,7 @@ class WorkflowOrchestrator:
         if tool == "list_files":
             directory = str(payload.get("directory") or ".").strip() or "."
             max_depth = self._coerce_int(payload.get("max_depth")) or 3
+            self._record_retrieval_tool_usage(phase, agent_name, tool)
             if phase == "implementation" and (agent_name == "developer" or self._is_multi_developer_edit_agent(agent_name)):
                 return (
                     "list_files is disabled for developer in implementation mode. "
@@ -3614,6 +3613,7 @@ class WorkflowOrchestrator:
             content = payload.get("content")
             if not path or not isinstance(content, str):
                 return "Invalid write_file request."
+            self._record_retrieval_tool_usage(phase, agent_name, tool)
             return self._direct_api_write_file(path, content)
         if tool == "apply_patch":
             if not (phase == "implementation" and (agent_name == "developer" or self._is_multi_developer_edit_agent(agent_name))):
@@ -3623,6 +3623,7 @@ class WorkflowOrchestrator:
             replace = payload.get("replace")
             if not path or not isinstance(search, str) or not isinstance(replace, str):
                 return "Invalid apply_patch request."
+            self._record_retrieval_tool_usage(phase, agent_name, tool)
             return self._direct_api_apply_patch(path, search, replace)
         return f"Unsupported retrieval tool: {tool}"
 
@@ -3975,6 +3976,28 @@ class WorkflowOrchestrator:
         agent_name = str(getattr(self, "_active_direct_api_agent_name", "") or "").strip()
         return agent_name or "developer"
 
+    def _record_retrieval_tool_usage(self, phase: str, agent_name: str, tool_name: str, paths: list[str] | None = None) -> None:
+        if not agent_name:
+            return
+        current = self._get_agent_report_extras(phase, agent_name)
+        tools = list(current.get("retrieval_tools_used") or [])
+        tools.append(tool_name)
+        read_paths = list(current.get("read_paths") or [])
+        if tool_name in {"read_file", "read_files"}:
+            for path in paths or []:
+                normalized = self._normalize_target_relative_path(path)
+                if normalized:
+                    read_paths.append(normalized)
+        self._set_agent_report_extras(
+            phase,
+            agent_name,
+            {
+                "retrieval_tools_used": tools,
+                "read_paths": sorted(dict.fromkeys(read_paths)),
+                "files_read": sorted(dict.fromkeys(read_paths)),
+            },
+        )
+
     def _record_write_tool_usage(self, tool_name: str, path: str = "") -> None:
         agent_name = self._active_write_agent_name()
         current = self._get_agent_report_extras("implementation", agent_name)
@@ -3990,6 +4013,7 @@ class WorkflowOrchestrator:
             {
                 "write_tools_used": used,
                 "write_paths": write_paths,
+                "files_written": sorted(dict.fromkeys(write_paths)),
                 "last_write_error": "",
             },
         )
@@ -4763,6 +4787,9 @@ class WorkflowOrchestrator:
         normalized.setdefault("command", "")
         normalized.setdefault("usage", {})
         self.logger.save_agent_report(phase, agent_name, normalized)
+        if phase == "implementation":
+            report_status = str(normalized.get("status") or "")
+            self._update_human_report(final_status=report_status if report_status != "success" else "in_progress", agent_name=agent_name)
 
     @staticmethod
     def _normalize_repo_relative_path(value: str) -> str:
@@ -4848,7 +4875,12 @@ class WorkflowOrchestrator:
 
     def _enforce_implementation_scope_plan(self) -> bool:
         planner_report = self._load_saved_agent_report("implementation", "implementation-planner")
-        if not planner_report or not self._selected_implementation_item:
+        # When the backlog comes from the canonical state file, implementation-planner is
+        # intentionally skipped, so its per-run report is absent. The selected task itself
+        # carries the allowed/forbidden paths needed to validate scope, so a missing planner
+        # report is only fatal when there is no canonical backlog to fall back on.
+        canonical_backlog = self._load_canonical_implementation_backlog()
+        if not self._selected_implementation_item or (not planner_report and not canonical_backlog):
             diagnostics = {
                 "scope_policy_result": "blocked",
                 "changed_files_count": 0,
@@ -5900,6 +5932,46 @@ class WorkflowOrchestrator:
         print(self._format_implementation_backlog(backlog, backlog_source))
         return 0
 
+    def explain_latest_run(self) -> int:
+        run_dir = find_latest_implementation_run(self.logger.log_dir)
+        if run_dir is None:
+            print("No implementation run found.")
+            return 1
+        path = generate_human_report(
+            run_dir,
+            project_id=self.project_id,
+            feedback_root=self._engine_path(self.config.get("paths", {}).get("feedback_dir", ".openclaw/feedback")),
+        )
+        print(path)
+        return 0
+
+    def _update_human_report(self, *, final_status: str = "", agent_name: str = "") -> bool:
+        self._human_report_updated = False
+        self._human_report_error = ""
+        try:
+            self._human_report_path = generate_human_report(
+                self.logger.run_dir,
+                project_id=self.project_id,
+                target_workspace=self.target_workspace,
+                feedback_root=self._engine_path(self.config.get("paths", {}).get("feedback_dir", ".openclaw/feedback")),
+                final_status=final_status,
+            )
+            self._human_report_updated = True
+        except Exception as exc:
+            self._human_report_updated = False
+            self._human_report_error = str(exc)
+        if agent_name:
+            self.logger.agent_progress(agent_name, f"Diagnostic human_report_path={self._human_report_path}")
+            self.logger.agent_progress(agent_name, f"Diagnostic human_report_updated={self._human_report_updated}")
+            if self._human_report_error:
+                self.logger.agent_progress(agent_name, f"Diagnostic human_report_error={self._human_report_error}")
+        else:
+            self.logger.info(f"Diagnostic human_report_path={self._human_report_path}")
+            self.logger.info(f"Diagnostic human_report_updated={self._human_report_updated}")
+            if self._human_report_error:
+                self.logger.info(f"Diagnostic human_report_error={self._human_report_error}")
+        return self._human_report_updated
+
     def _prepare_implementation_backlog_selection(
         self,
         reports: list[dict[str, Any]] | None = None,
@@ -5914,6 +5986,7 @@ class WorkflowOrchestrator:
             and not self._selected_task_from_explicit_cli
             and not self.rerun_completed
             and str(self._selected_implementation_item.get("contract_source") or "") != "task-designer"
+            and str(self._selected_implementation_item.get("id") or "").strip() != self._dependency_forced_task_id
             and str(self._selected_implementation_item.get("id") or "").strip() in set(self._completed_implementation_task_ids())
         ):
             self._selected_implementation_item = None
@@ -7225,6 +7298,10 @@ class WorkflowOrchestrator:
             return True
         if normalized.startswith(("return ", "yield ", "raise ")):
             return False
+        # Import statements are concrete, verifiable substrings (e.g. a developer contract may
+        # require "from app.models import ProviderMetrics" to appear in the target file).
+        if normalized.startswith("import ") or (normalized.startswith("from ") and " import " in normalized):
+            return False
         if re.fullmatch(r"[a-z_][a-z0-9_\.]*", normalized):
             return False
         signal_markers = ("class ", "def ", "async def ", "mapped[", " = ", "assert ", "test_", "(", ":", "->")
@@ -8140,6 +8217,7 @@ class WorkflowOrchestrator:
                 "selected_task_id": self.selected_task_ref,
             },
         )
+        self._update_human_report(final_status=status if status != "success" else "in_progress", agent_name="developer-checks")
 
     @staticmethod
     def _is_alembic_migration_path(path: str) -> bool:
@@ -8399,12 +8477,29 @@ class WorkflowOrchestrator:
         payload = {"completed_tasks": records}
         self.completed_tasks_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def _selected_task_dependency_error(self) -> str:
+    def _selected_task_dependency_status(self) -> dict[str, Any]:
+        """Inspect the selected task's declared dependencies against the backlog and repo state.
+
+        Returns a structured snapshot used for both diagnostics and dependency-aware
+        task selection. A dependency is considered "blocking" when it is not recorded as
+        completed, or when it is completed but the artifacts it was supposed to create are
+        missing from the workspace. A declared dependency that is absent from the backlog and
+        not completed is reported separately as ``missing_from_backlog``.
+        """
         item = self._selected_implementation_item or {}
-        task_id = str(item.get("id") or "").strip() or "selected task"
+        task_id = str(item.get("id") or "").strip()
         declared_dependencies = [str(value).strip() for value in (item.get("depends_on") or []) if str(value).strip()]
+        status: dict[str, Any] = {
+            "selected_task_id": task_id,
+            "declared_dependencies": declared_dependencies,
+            "blocked": False,
+            "blocking_dependency_ids": [],
+            "dependency_missing_artifacts": {},
+            "dependency_not_completed": [],
+            "missing_from_backlog": [],
+        }
         if not declared_dependencies:
-            return ""
+            return status
         backlog = self._implementation_backlog_cache or []
         backlog_by_id = {
             str(candidate.get("id") or "").strip(): candidate
@@ -8419,12 +8514,24 @@ class WorkflowOrchestrator:
             if str(repo_item.get("path") or "").strip()
         }
         repo_directories = {str(path).strip() for path in (repo_map.get("directories") or []) if str(path).strip()}
-        unresolved: list[str] = []
+
+        def _mark_blocking(dependency_id: str) -> None:
+            if dependency_id not in status["blocking_dependency_ids"]:
+                status["blocking_dependency_ids"].append(dependency_id)
+
         for dependency_id in declared_dependencies:
-            if dependency_id not in completed:
-                unresolved.append(f"{dependency_id}:not_completed")
+            dependency_item = backlog_by_id.get(dependency_id)
+            if dependency_item is None:
+                # A completed dependency that simply dropped out of the current backlog is
+                # treated as resolved (its artifacts cannot be re-verified here). A missing,
+                # not-completed dependency is a hard error that cannot be auto-resolved.
+                if dependency_id not in completed:
+                    status["missing_from_backlog"].append(dependency_id)
                 continue
-            dependency_item = backlog_by_id.get(dependency_id) or {}
+            if dependency_id not in completed:
+                status["dependency_not_completed"].append(dependency_id)
+                _mark_blocking(dependency_id)
+                continue
             missing_artifacts: list[str] = []
             for path in dependency_item.get("new_files") or []:
                 normalized = self._normalize_repo_relative_path(path)
@@ -8435,22 +8542,127 @@ class WorkflowOrchestrator:
                 if normalized and normalized not in repo_directories:
                     missing_artifacts.append(normalized)
             if missing_artifacts:
-                unresolved.append(f"{dependency_id}:missing_artifacts:{', '.join(missing_artifacts[:4])}")
-        if not unresolved:
-            return ""
-        return (
-            f"Selected task {task_id} has incomplete dependencies. "
-            f"Resolve depends_on first: {'; '.join(unresolved)}"
+                status["dependency_missing_artifacts"][dependency_id] = missing_artifacts
+                _mark_blocking(dependency_id)
+        status["blocked"] = bool(status["blocking_dependency_ids"] or status["missing_from_backlog"])
+        return status
+
+    def _format_unresolved_dependencies(self, status: dict[str, Any]) -> str:
+        parts: list[str] = []
+        for dependency_id in status.get("dependency_not_completed") or []:
+            parts.append(f"{dependency_id}:not_completed")
+        for dependency_id, artifacts in (status.get("dependency_missing_artifacts") or {}).items():
+            parts.append(f"{dependency_id}:missing_artifacts:{', '.join(artifacts[:4])}")
+        for dependency_id in status.get("missing_from_backlog") or []:
+            parts.append(f"{dependency_id}:missing_from_backlog")
+        return "; ".join(parts)
+
+    def _format_dependency_missing_artifacts(self, status: dict[str, Any]) -> str:
+        mapping = status.get("dependency_missing_artifacts") or {}
+        if not mapping:
+            return "none"
+        return "; ".join(
+            f"{dependency_id}:{', '.join(artifacts)}" for dependency_id, artifacts in mapping.items()
         )
 
-    def _retry_selection_after_dependency_error(self) -> bool:
-        if self.config["workflow"]["mode"] == "auto":
-            return False
-        if self.from_agent_name not in {"task-designer", "developer", "qa", "template-validator"}:
-            return False
-        self.selected_task_ref = ""
-        self._reset_selected_implementation_item()
-        return True
+    def _selected_task_dependency_error(self) -> str:
+        status = self._selected_task_dependency_status()
+        if not status["blocked"]:
+            return ""
+        task_id = status["selected_task_id"] or "selected task"
+        return (
+            f"Selected task {task_id} has incomplete dependencies. "
+            f"Resolve depends_on first: {self._format_unresolved_dependencies(status)}"
+        )
+
+    def _handle_selected_task_dependencies(self) -> dict[str, Any]:
+        """Validate the selected task's dependencies and apply dependency-aware selection.
+
+        Behaviour:
+        - If the selected task has no blocking dependencies, proceed unchanged.
+        - If a declared dependency is missing from the backlog, fail clearly (no retry).
+        - If the user explicitly selected this task via ``--task-id``, fail clearly once and
+          tell them to run the blocking dependency first (no auto-switch, no retry loop).
+        - Otherwise, automatically switch the selection to the first blocking dependency so
+          the pipeline produces the missing artifacts before retrying the dependent task.
+
+        Diagnostics are emitted for every code path. The return value is a dict with ``ok``
+        (whether the phase may proceed) and ``status`` (the failure status code when ``ok`` is
+        False).
+        """
+        status = self._selected_task_dependency_status()
+        initial_id = status["selected_task_id"] or "selected task"
+        explicit = bool(self._selected_task_from_explicit_cli)
+        blocking_ids = status["blocking_dependency_ids"]
+        missing_from_backlog = status["missing_from_backlog"]
+        self.logger.info(f"Diagnostic selected_task_id_initial={initial_id}")
+        self.logger.info(f"Diagnostic explicit_task_id={explicit}")
+        self.logger.info(f"Diagnostic dependency_blocked={status['blocked']}")
+        self.logger.info(f"Diagnostic blocking_dependency_ids={','.join(blocking_ids) if blocking_ids else 'none'}")
+        self.logger.info(f"Diagnostic dependency_missing_artifacts={self._format_dependency_missing_artifacts(status)}")
+
+        if not status["blocked"]:
+            self._dependency_forced_task_id = ""
+            self.logger.info(f"Diagnostic selected_task_id_final={initial_id}")
+            self.logger.info("Diagnostic dependency_auto_selected=False")
+            return {"ok": True, "status": "", "auto_selected": False}
+
+        if missing_from_backlog:
+            self._dependency_forced_task_id = ""
+            self.logger.info(f"Diagnostic dependency_missing_from_backlog={','.join(missing_from_backlog)}")
+            self.logger.error(
+                f"Selected task {initial_id} depends on tasks missing from the backlog: "
+                f"{', '.join(missing_from_backlog)}. Regenerate the backlog with --fresh-run before retrying."
+            )
+            self.logger.info(f"Diagnostic selected_task_id_final={initial_id}")
+            self.logger.info("Diagnostic dependency_auto_selected=False")
+            return {"ok": False, "status": "dependency_missing_from_backlog", "auto_selected": False}
+
+        if explicit:
+            self._dependency_forced_task_id = ""
+            self.logger.error(
+                f"Selected task {initial_id} has incomplete dependencies. "
+                f"Resolve depends_on first: {self._format_unresolved_dependencies(status)}. "
+                f"Run the blocking dependency first (for example --task-id {blocking_ids[0]}), "
+                f"or pass --rerun-completed if its artifacts must be rebuilt."
+            )
+            self.logger.info(f"Diagnostic selected_task_id_final={initial_id}")
+            self.logger.info("Diagnostic dependency_auto_selected=False")
+            return {"ok": False, "status": "task_dependencies_incomplete", "auto_selected": False}
+
+        blocking_id = blocking_ids[0]
+        backlog_by_id = {
+            str(candidate.get("id") or "").strip(): candidate
+            for candidate in (self._implementation_backlog_cache or [])
+            if str(candidate.get("id") or "").strip()
+        }
+        dependency_item = backlog_by_id.get(blocking_id)
+        if dependency_item is None:
+            self._dependency_forced_task_id = ""
+            self.logger.info(f"Diagnostic dependency_missing_from_backlog={blocking_id}")
+            self.logger.error(
+                f"Selected task {initial_id} is blocked by dependency {blocking_id}, "
+                f"which is missing from the backlog. Regenerate the backlog with --fresh-run."
+            )
+            self.logger.info(f"Diagnostic selected_task_id_final={initial_id}")
+            self.logger.info("Diagnostic dependency_auto_selected=False")
+            return {"ok": False, "status": "dependency_missing_from_backlog", "auto_selected": False}
+
+        self.logger.info(f"{initial_id} blocked by {blocking_id}, selecting dependency {blocking_id}")
+        switched_item = dict(dependency_item)
+        # The dependency must be (re)built from scratch, so drop any stale task-designer
+        # contract marker carried on the backlog entry.
+        switched_item.pop("contract_source", None)
+        self._selected_implementation_item = switched_item
+        self._selected_task_source = self._selected_task_source_for(self._implementation_backlog_source)
+        # Pin the auto-selected dependency so the completed-task guards in
+        # _prepare_implementation_backlog_selection / the retry loop do not revert the
+        # selection back to the dependent task before task-designer/developer run for it.
+        self._dependency_forced_task_id = blocking_id
+        self._update_canonical_backlog_selected_task(blocking_id)
+        self.logger.info(f"Diagnostic selected_task_id_final={blocking_id}")
+        self.logger.info("Diagnostic dependency_auto_selected=True")
+        return {"ok": True, "status": "", "auto_selected": True}
 
     def _run_task_designer_before_developer(self, phase: dict[str, Any], *, total: int) -> bool:
         task_designer_config: dict[str, Any] | None = None

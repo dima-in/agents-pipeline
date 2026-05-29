@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import git
 import manage_agents as manage_agents_module
+import start as start_module
 import yaml
 from manage_agents import AgentManager
 from monitor_logs import LogMonitor
@@ -270,6 +271,12 @@ def test_start_parser_accepts_rerun_completed_and_mark_selected_complete() -> No
     assert args.mark_selected_complete is True
 
 
+def test_start_parser_accepts_explain_run() -> None:
+    args = build_parser().parse_args(["--explain-run"])
+
+    assert args.explain_run is True
+
+
 def test_start_parser_accepts_goal() -> None:
     args = build_parser().parse_args(
         [
@@ -281,6 +288,148 @@ def test_start_parser_accepts_goal() -> None:
     )
 
     assert args.goal == "Implement only repo-map validation improvements"
+
+
+def test_human_report_created_after_implementation_agent_report(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    _prepare_backlog_target_workspace(target_workspace)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+
+    orchestrator._overwrite_agent_report(
+        "implementation",
+        "developer",
+        {
+            "status": "success",
+            "result": "completed",
+            "runtime": {"provider": "openrouter", "model": "gpt-5.4", "thinking": "low"},
+            "user_message": "Write application code only",
+            "selected_task_id": "TASK-123",
+            "selected_task_source": "canonical_backlog",
+            "selected_task_allowed_paths": ["gateway-v4/app/models.py"],
+            "retrieval_budget": 2,
+            "execution_mode": "strict",
+            "parsed_output": "status=implemented",
+        },
+    )
+
+    report_path = orchestrator.logger.run_dir / "human_report.md"
+    text = report_path.read_text(encoding="utf-8")
+
+    assert report_path.exists()
+    assert "Отчёт по запуску implementation" in text
+    assert "Агент: developer" in text
+    assert "gpt-5.4" in text
+    assert "selected_task_id: TASK-123" in text
+    assert "gateway-v4/app/models.py" in text
+
+
+def test_human_report_includes_strict_retrieval_failure_reason(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    _prepare_backlog_target_workspace(target_workspace)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+
+    orchestrator._overwrite_agent_report(
+        "implementation",
+        "code-developer",
+        {
+            "status": "strict_retrieval_blocked",
+            "result": "strict mode allows only one read_file/read_files operation",
+            "runtime": {"provider": "openrouter", "model": "gpt-5.4", "thinking": "low"},
+            "selected_task_id": "TASK-001",
+            "selected_task_allowed_paths": ["gateway-v4/app/models.py"],
+            "retrieval_limit_reason": "strict mode allows only one read_file/read_files operation",
+            "blocked_retrieval_tool": "read_file",
+            "parsed_output": "Strict execution mode stopped unnecessary retrieval.",
+        },
+    )
+
+    text = (orchestrator.logger.run_dir / "human_report.md").read_text(encoding="utf-8")
+
+    assert "strict_retrieval_blocked" in text
+    assert "strict mode allows only one read_file/read_files operation" in text
+    assert "read_file (blocked)" in text
+    assert "strict retrieval" in text
+
+
+def test_human_report_includes_changed_files_on_success(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    _prepare_backlog_target_workspace(target_workspace)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+
+    orchestrator._overwrite_agent_report(
+        "implementation",
+        "developer",
+        {
+            "status": "success",
+            "result": "completed",
+            "runtime": {"provider": "openrouter", "model": "gpt-5.4", "thinking": "low"},
+            "selected_task_id": "TASK-001",
+            "selected_task_allowed_paths": ["gateway-v4/app/models.py"],
+            "write_tools_used": ["apply_patch"],
+            "write_paths": ["gateway-v4/app/models.py"],
+            "developer_changed_files": ["gateway-v4/app/models.py"],
+            "parsed_output": "status=implemented",
+        },
+    )
+
+    text = (orchestrator.logger.run_dir / "human_report.md").read_text(encoding="utf-8")
+
+    assert "Изменения в коде" in text
+    assert "gateway-v4/app/models.py" in text
+    assert "change type: modified" in text
+    assert "apply_patch" in text
+
+
+def test_explain_run_cli_regenerates_latest_human_report(tmp_path: Path, monkeypatch, capsys) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    _prepare_backlog_target_workspace(target_workspace)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    previous_run = orchestrator.logger.log_dir / "run_20260101_120000"
+    agent_dir = previous_run / "agents" / "implementation"
+    agent_dir.mkdir(parents=True)
+    (agent_dir / "developer.json").write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-01-01T12:00:00",
+                "phase": "implementation",
+                "agent_name": "developer",
+                "status": "success",
+                "result": "completed",
+                "runtime": {"provider": "openrouter", "model": "gpt-5.4", "thinking": "low"},
+                "target_workspace": str(target_workspace),
+                "selected_task_id": "TASK-999",
+                "selected_task_allowed_paths": ["gateway-v4/app/models.py"],
+                "parsed_output": "status=implemented",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(start_module, "WorkflowOrchestrator", lambda **_kwargs: orchestrator)
+
+    exit_code = start_module.main(["--config", str(config_path), "--explain-run"])
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "human_report.md" in output
+    assert (previous_run / "human_report.md").exists()
+    assert "TASK-999" in (previous_run / "human_report.md").read_text(encoding="utf-8")
 
 
 def test_create_git_branch_reuses_existing_branch_on_rerun(tmp_path: Path) -> None:
@@ -2693,7 +2842,7 @@ def test_repo_map_target_mismatch_blocks_developer_before_run(tmp_path: Path) ->
     assert orchestrator._phase_failure_status == "repo_map_target_workspace_mismatch"
 
 
-def test_task_designer_blocked_when_selected_task_dependencies_incomplete(tmp_path: Path) -> None:
+def test_task_designer_fails_once_when_explicit_task_dependencies_incomplete(tmp_path: Path) -> None:
     engine_root = tmp_path / "engine"
     target_workspace = tmp_path / "target"
     (target_workspace / "gateway-v4" / "app").mkdir(parents=True, exist_ok=True)
@@ -2703,6 +2852,8 @@ def test_task_designer_blocked_when_selected_task_dependencies_incomplete(tmp_pa
     _write_minimal_workflow_config(config_path)
     orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
     orchestrator._wait_for_user = lambda _prompt: True
+    orchestrator._selected_task_from_explicit_cli = True
+    orchestrator.selected_task_ref = "TASK-002"
     orchestrator._implementation_backlog_cache = [
         {
             "id": "TASK-001",
@@ -2777,7 +2928,7 @@ def test_task_designer_blocked_when_selected_task_dependencies_incomplete(tmp_pa
     assert orchestrator._phase_failure_status == "task_dependencies_incomplete"
 
 
-def test_developer_blocked_when_selected_task_dependencies_incomplete(tmp_path: Path) -> None:
+def test_developer_fails_once_when_explicit_task_dependencies_incomplete(tmp_path: Path) -> None:
     engine_root = tmp_path / "engine"
     target_workspace = tmp_path / "target"
     (target_workspace / "gateway-v4" / "app").mkdir(parents=True, exist_ok=True)
@@ -2787,6 +2938,8 @@ def test_developer_blocked_when_selected_task_dependencies_incomplete(tmp_path: 
     _write_minimal_workflow_config(config_path)
     orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
     orchestrator._wait_for_user = lambda _prompt: True
+    orchestrator._selected_task_from_explicit_cli = True
+    orchestrator.selected_task_ref = "TASK-002"
     orchestrator._implementation_backlog_cache = [
         {
             "id": "TASK-001",
@@ -2860,6 +3013,219 @@ def test_developer_blocked_when_selected_task_dependencies_incomplete(tmp_path: 
     assert ok is False
     assert calls == []
     assert orchestrator._phase_failure_status == "task_dependencies_incomplete"
+
+
+def _dependency_two_task_backlog() -> list[dict[str, object]]:
+    return [
+        {
+            "id": "TASK-001",
+            "title": "Add provider metrics recording to proxy service",
+            "priority": "P0",
+            "scope": "backend-only",
+            "existing_paths": ["gateway-v4/app/services/proxy.py"],
+            "new_directories": [],
+            "new_files": ["gateway-v4/tests/test_proxy_metrics.py"],
+            "allowed_paths": ["gateway-v4/app/services/proxy.py", "gateway-v4/tests/test_proxy_metrics.py"],
+            "forbidden_paths": [],
+            "required_test_paths": ["gateway-v4/tests/test_proxy_metrics.py"],
+            "depends_on": [],
+            "acceptance_criteria": ["done"],
+            "reason_each_path_is_needed": {"gateway-v4/tests/test_proxy_metrics.py": "Test file."},
+            "risk_level": "low",
+            "estimated_effort": "M",
+        },
+        {
+            "id": "TASK-002",
+            "title": "Add admin endpoint for provider metrics retrieval",
+            "priority": "P1",
+            "scope": "backend-only",
+            "existing_paths": ["gateway-v4/app/routers/admin.py"],
+            "new_directories": [],
+            "new_files": ["gateway-v4/tests/test_admin_metrics_endpoint.py"],
+            "allowed_paths": ["gateway-v4/app/routers/admin.py", "gateway-v4/tests/test_admin_metrics_endpoint.py"],
+            "forbidden_paths": [],
+            "required_test_paths": ["gateway-v4/tests/test_admin_metrics_endpoint.py"],
+            "depends_on": ["TASK-001"],
+            "acceptance_criteria": ["done"],
+            "reason_each_path_is_needed": {"gateway-v4/tests/test_admin_metrics_endpoint.py": "Test file."},
+            "risk_level": "low",
+            "estimated_effort": "M",
+        },
+    ]
+
+
+def _make_dependency_orchestrator(
+    tmp_path: Path,
+    *,
+    completed_task_ids: list[str] | None = None,
+    repo_files: list[str] | None = None,
+) -> "WorkflowOrchestrator":
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True, exist_ok=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    orchestrator._wait_for_user = lambda _prompt: True
+    orchestrator._implementation_backlog_cache = _dependency_two_task_backlog()
+    orchestrator._implementation_backlog_source = "canonical_backlog"
+    repo_map = {
+        "target_workspace": str(target_workspace),
+        "top_level_tree": ["gateway-v4/"],
+        "directories": ["", "gateway-v4", "gateway-v4/app", "gateway-v4/tests"],
+        "files": [{"path": path} for path in (repo_files or [])],
+    }
+    orchestrator.repo_map_path.parent.mkdir(parents=True, exist_ok=True)
+    orchestrator.repo_map_path.write_text(json.dumps(repo_map), encoding="utf-8")
+    orchestrator._repo_map_cache = repo_map
+    if completed_task_ids:
+        orchestrator.completed_tasks_path.parent.mkdir(parents=True, exist_ok=True)
+        orchestrator.completed_tasks_path.write_text(
+            json.dumps({"completed_tasks": [{"task_id": task_id} for task_id in completed_task_ids]}),
+            encoding="utf-8",
+        )
+    return orchestrator
+
+
+def test_dependency_auto_selects_blocking_task_when_artifacts_missing(tmp_path: Path) -> None:
+    # TASK-001 is recorded as completed but its declared artifact is missing from the workspace.
+    orchestrator = _make_dependency_orchestrator(
+        tmp_path,
+        completed_task_ids=["TASK-001"],
+        repo_files=["gateway-v4/app/services/proxy.py", "gateway-v4/app/routers/admin.py"],
+    )
+    orchestrator._selected_implementation_item = orchestrator._implementation_backlog_cache[1]
+
+    result = orchestrator._handle_selected_task_dependencies()
+
+    assert result["ok"] is True
+    assert result["auto_selected"] is True
+    assert orchestrator._selected_implementation_item["id"] == "TASK-001"
+
+
+def test_auto_selected_completed_dependency_survives_selection_refresh(tmp_path: Path) -> None:
+    # Regression: a completed-but-missing-artifacts dependency that is auto-selected must not be
+    # reverted back to the dependent task when the backlog selection is re-resolved (which happens
+    # while building the task-designer/developer context).
+    orchestrator = _make_dependency_orchestrator(
+        tmp_path,
+        completed_task_ids=["TASK-001"],
+        repo_files=["gateway-v4/app/services/proxy.py", "gateway-v4/app/routers/admin.py"],
+    )
+    orchestrator._selected_implementation_item = orchestrator._implementation_backlog_cache[1]
+
+    result = orchestrator._handle_selected_task_dependencies()
+    assert result["auto_selected"] is True
+    assert orchestrator._selected_implementation_item["id"] == "TASK-001"
+
+    selection = orchestrator._prepare_implementation_backlog_selection(require_backlog=True)
+
+    assert selection["error"] == ""
+    assert selection["selected_item"]["id"] == "TASK-001"
+    assert orchestrator._selected_implementation_item["id"] == "TASK-001"
+
+
+def test_dependency_auto_selects_blocking_task_when_not_completed(tmp_path: Path) -> None:
+    orchestrator = _make_dependency_orchestrator(
+        tmp_path,
+        completed_task_ids=[],
+        repo_files=["gateway-v4/app/services/proxy.py", "gateway-v4/app/routers/admin.py"],
+    )
+    orchestrator._selected_implementation_item = orchestrator._implementation_backlog_cache[1]
+
+    result = orchestrator._handle_selected_task_dependencies()
+
+    assert result["ok"] is True
+    assert result["auto_selected"] is True
+    assert orchestrator._selected_implementation_item["id"] == "TASK-001"
+
+
+def test_dependency_explicit_task_id_fails_once_without_auto_select(tmp_path: Path) -> None:
+    orchestrator = _make_dependency_orchestrator(
+        tmp_path,
+        completed_task_ids=["TASK-001"],
+        repo_files=["gateway-v4/app/services/proxy.py", "gateway-v4/app/routers/admin.py"],
+    )
+    orchestrator._selected_task_from_explicit_cli = True
+    orchestrator.selected_task_ref = "TASK-002"
+    orchestrator._selected_implementation_item = orchestrator._implementation_backlog_cache[1]
+
+    result = orchestrator._handle_selected_task_dependencies()
+
+    assert result["ok"] is False
+    assert result["status"] == "task_dependencies_incomplete"
+    assert result["auto_selected"] is False
+    # Selection must not be switched away from the explicitly requested task.
+    assert orchestrator._selected_implementation_item["id"] == "TASK-002"
+
+
+def test_dependency_missing_from_backlog_fails_clearly(tmp_path: Path) -> None:
+    orchestrator = _make_dependency_orchestrator(
+        tmp_path,
+        completed_task_ids=[],
+        repo_files=["gateway-v4/app/routers/admin.py"],
+    )
+    # Drop TASK-001 from the backlog so TASK-002 references a dependency that does not exist.
+    orchestrator._implementation_backlog_cache = [orchestrator._implementation_backlog_cache[1]]
+    orchestrator._selected_implementation_item = orchestrator._implementation_backlog_cache[0]
+
+    result = orchestrator._handle_selected_task_dependencies()
+
+    assert result["ok"] is False
+    assert result["status"] == "dependency_missing_from_backlog"
+    assert result["auto_selected"] is False
+
+
+def test_completed_dependency_with_artifacts_allows_dependent_task(tmp_path: Path) -> None:
+    orchestrator = _make_dependency_orchestrator(
+        tmp_path,
+        completed_task_ids=["TASK-001"],
+        repo_files=[
+            "gateway-v4/app/services/proxy.py",
+            "gateway-v4/app/routers/admin.py",
+            "gateway-v4/tests/test_proxy_metrics.py",
+        ],
+    )
+    orchestrator._selected_implementation_item = orchestrator._implementation_backlog_cache[1]
+
+    result = orchestrator._handle_selected_task_dependencies()
+
+    assert result["ok"] is True
+    assert result["auto_selected"] is False
+    assert orchestrator._selected_implementation_item["id"] == "TASK-002"
+
+
+def test_dependency_failure_does_not_loop_three_attempts(tmp_path: Path, monkeypatch) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True, exist_ok=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    orchestrator.config["phases"]["implementation"] = {
+        "name": "Implementation",
+        "max_retries": 3,
+        "agents": [{"name": "developer", "max_retries": 3}],
+    }
+
+    run_calls: list[int] = []
+    monkeypatch.setattr(orchestrator, "_load_latest_project_research_reports", lambda: ([{"agent_name": "product-manager"}], None))
+    monkeypatch.setattr(orchestrator, "_refresh_repo_map", lambda snapshot_path=None: True)
+    monkeypatch.setattr(orchestrator, "_load_repo_map", lambda: {"target_workspace": str(target_workspace), "files": [], "directories": []})
+    monkeypatch.setattr(orchestrator, "_prompt_post_implementation_action", lambda: "stop")
+
+    def fake_run_phase_agents(_phase, _phase_key):
+        run_calls.append(orchestrator._implementation_attempt)
+        orchestrator._phase_failure_status = "task_dependencies_incomplete"
+        return False
+
+    monkeypatch.setattr(orchestrator, "_run_phase_agents", fake_run_phase_agents)
+
+    ok = orchestrator._run_implementation_phase()
+
+    assert ok is False
+    assert orchestrator._phase_failure_status == "task_dependencies_incomplete"
+    assert run_calls == [1]
 
 
 def test_later_task_may_use_file_created_earlier(tmp_path: Path) -> None:
@@ -5563,6 +5929,115 @@ def test_validator_rejects_vague_backend_contract(tmp_path: Path) -> None:
     assert parsed["item"] is not None
     assert any("vague_must_contain" in item for item in parsed["errors"])
     assert any("vague_must_test" in item for item in parsed["errors"])
+
+
+def test_import_statements_are_concrete_contract_items() -> None:
+    # Import statements are exact, verifiable substrings and must not be treated as vague.
+    assert WorkflowOrchestrator._is_vague_contract_item("from app.models import ProviderMetrics") is False
+    assert WorkflowOrchestrator._is_vague_contract_item("from app.database import get_db") is False
+    assert WorkflowOrchestrator._is_vague_contract_item("import os") is False
+    # Genuinely vague phrasing is still rejected.
+    assert WorkflowOrchestrator._is_vague_contract_item("Implement monitoring functionality") is True
+
+
+def test_validator_accepts_import_based_must_contain(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    target_file = target_workspace / "gateway-v4" / "app" / "services" / "proxy.py"
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    target_file.write_text("pass\n", encoding="utf-8")
+    orchestrator = WorkflowOrchestrator(
+        str(config_path),
+        engine_root=str(engine_root),
+        launch_cwd=str(target_workspace),
+    )
+    planner_item = {
+        "id": "TASK-001",
+        "title": "Add provider metrics recording to proxy service",
+        "priority": "P0",
+        "scope": "backend-only",
+        "existing_paths": ["gateway-v4/app/services/proxy.py"],
+        "new_directories": [],
+        "new_files": ["gateway-v4/tests/test_proxy_metrics.py"],
+        "allowed_paths": ["gateway-v4/app/services/proxy.py", "gateway-v4/tests/test_proxy_metrics.py"],
+        "forbidden_paths": [],
+        "required_test_paths": ["gateway-v4/tests/test_proxy_metrics.py"],
+        "depends_on": [],
+        "acceptance_criteria": ["Metrics recorded."],
+        "reason_each_path_is_needed": {
+            "gateway-v4/app/services/proxy.py": "Implementation target.",
+            "gateway-v4/tests/test_proxy_metrics.py": "Required regression test.",
+        },
+        "target_file": {"path": "gateway-v4/app/services/proxy.py", "action": "update", "purpose": "Record metrics."},
+        "reference_files": ["gateway-v4/app/services/proxy.py"],
+        "risk_level": "low",
+        "estimated_effort": "M",
+    }
+
+    parsed = orchestrator._parse_task_designer_output(
+        json.dumps(
+            {
+                "task_id": "TASK-001",
+                "title": "Add provider metrics recording to proxy service",
+                "target_file": {"path": "gateway-v4/app/services/proxy.py", "action": "update", "purpose": "Record metrics."},
+                "test_file": {"path": "gateway-v4/tests/test_proxy_metrics.py", "action": "create"},
+                "depends_on": [],
+                "must_contain": [
+                    "from app.models import ProviderMetrics",
+                    "from app.database import get_db",
+                    "metric = ProviderMetrics(",
+                    "db.add(metric)",
+                ],
+                "must_import": ["from app.models import ProviderMetrics", "from app.database import get_db"],
+                "integration": ["Record metric after each provider request."],
+                "reference_files": ["gateway-v4/app/services/proxy.py"],
+                "reference_excerpts": {"gateway-v4/app/services/proxy.py": "pass"},
+                "must_test": ["test_proxy_records_metric_on_success: assert ProviderMetrics record created"],
+                "forbidden": ["Do not edit billing files."],
+            }
+        ),
+        planner_item,
+    )
+
+    assert parsed["item"] is not None
+    assert not any("vague_must_contain" in item for item in parsed["errors"])
+
+
+def test_scope_plan_passes_from_canonical_backlog_without_planner_report(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    _prepare_backlog_target_workspace(target_workspace)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    orchestrator._save_canonical_implementation_backlog(_canonical_backlog_fixture(), selected_task_id="TASK-001")
+    orchestrator._selected_implementation_item = _canonical_backlog_fixture()[0]
+    # implementation-planner is skipped for canonical backlogs, so no planner report exists.
+    assert orchestrator._load_saved_agent_report("implementation", "implementation-planner") is None
+
+    assert orchestrator._enforce_implementation_scope_plan() is True
+    assert orchestrator._phase_failure_status is None
+
+
+def test_scope_plan_blocks_when_planner_and_canonical_backlog_missing(tmp_path: Path) -> None:
+    engine_root = tmp_path / "engine"
+    target_workspace = tmp_path / "target"
+    target_workspace.mkdir(parents=True)
+    _prepare_backlog_target_workspace(target_workspace)
+    config_path = engine_root / "workflow" / "config.yaml"
+    _write_minimal_workflow_config(config_path)
+    orchestrator = WorkflowOrchestrator(str(config_path), engine_root=str(engine_root), launch_cwd=str(target_workspace))
+    orchestrator._selected_implementation_item = _canonical_backlog_fixture()[0]
+    # Neither a planner report nor a canonical backlog is available.
+    assert orchestrator._load_saved_agent_report("implementation", "implementation-planner") is None
+    assert orchestrator._load_canonical_implementation_backlog() == []
+
+    assert orchestrator._enforce_implementation_scope_plan() is False
+    assert orchestrator._phase_failure_status == "scope_violation"
 
 
 def test_repo_map_after_detects_newly_created_allowed_file(tmp_path: Path) -> None:

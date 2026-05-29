@@ -91,6 +91,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Mark the current selected implementation task complete without running agents",
     )
     parser.add_argument(
+        "--explain-run",
+        action="store_true",
+        help="Regenerate and print the latest implementation human_report.md path",
+    )
+    parser.add_argument(
         "--research-run",
         default=None,
         help="Specific research run id to use for implementation context",
@@ -173,6 +178,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.mark_selected_complete:
         return orchestrator.mark_selected_implementation_task_complete()
+
+    if args.explain_run:
+        return orchestrator.explain_latest_run()
 
     if args.preflight_only:
         return 0 if orchestrator._preflight_runtime() else 1
