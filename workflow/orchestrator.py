@@ -2338,6 +2338,15 @@ class WorkflowOrchestrator:
             return False
         if agent_name not in {"infra-developer", "test-developer", "code-developer"}:
             return False
+        # During a repair retry the developer must read the failing file(s) and the injected
+        # feedback to fix them. The strict single-read budget makes that impossible (the agent
+        # is hard-stopped with strict_retrieval_blocked and can never land a fix, so leftover
+        # broken code keeps failing py_compile/pytest). Use balanced retrieval after attempt 1.
+        if (
+            getattr(self, "_implementation_retry_from_agent", "") == "developer"
+            or getattr(self, "_implementation_attempt", 1) > 1
+        ):
+            return False
         if str(message_bundle.get("selected_task_scope") or "").strip() != "backend-only":
             return False
         allowed_paths = [

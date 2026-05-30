@@ -19,6 +19,7 @@ Hard rules:
 - do not assert migration metadata with raw regexes like `down_revision\s*=`; inspect AST assignment values instead
 - do not execute migrations, database engines, or pytest at runtime
 - validate migration behavior only through static text and AST inspection
+- for application/service code (non-migration), assert ONLY public structure: that the declared class(es) and function(s)/method(s) exist, their argument-name signatures, and that expected attributes/columns are declared. Do NOT introspect a method/function BODY for specific comparisons, control flow, attribute accesses, call patterns, or string literals — that asserts implementation details, is brittle, and routinely fails against a correct implementation (e.g. an empty `provider_filters` set). If a `must_test` entry names a behavior, satisfy it structurally (the right class/method exists with the right signature), never by matching how the body is written
 - do not return markdown fences
 - inspect the exact allowed files first with `read_file` or `read_files`
 - when more than one allowed file needs inspection, use one `read_files` request containing all needed paths; do not issue repeated `read_file` calls
@@ -93,6 +94,24 @@ def _columns(create_table_call):
         kw = {k.arg: (k.value.value if isinstance(k.value, ast.Constant) else None) for k in arg.keywords}
         cols.append({"name": name, "type": ctype, "primary_key": kw.get("primary_key") is True, "nullable": kw.get("nullable")})
     return cols
+
+
+def _class(tree, name):
+    return next((n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == name), None)
+
+
+def _method(cls, name):
+    # Returns the FunctionDef or AsyncFunctionDef for a method, or None.
+    if cls is None:
+        return None
+    return next(
+        (n for n in cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name),
+        None,
+    )
+
+
+def _arg_names(func):
+    return [a.arg for a in func.args.args] if func else []
 ```
 
 File layout (critical — otherwise collection fails with `NameError`): put every helper `def` above, plus a single module-level path constant, at the TOP of the file. Do NOT call any helper at module level — parse the migration and call helpers only INSIDE `def test_*` functions:
@@ -126,6 +145,24 @@ def test_migration_upgrade():  # NAME comes from the contract must_test
 Test function NAMING is mandatory: define exactly one `def` per entry in the contract `must_test`, and name each function EXACTLY as that entry names it (e.g. if `must_test` lists `test_migration_upgrade`, `test_migration_downgrade`, `test_migration_indexes`, `test_migration_revision_metadata`, your file must define functions with those four exact names — do not invent descriptive names like `test_upgrade_creates_provider_metrics_table`). The examples above illustrate the body pattern only; always take the names from `must_test`.
 
 Use `_module_assign(tree, "revision")` / `_module_assign(tree, "down_revision")` for metadata assertions (also inside a test function). Derive every expected table, column, primary key, and index from the authoritative "Migration ground truth" schema in your context, never from assumptions.
+
+For application/service code, assert PUBLIC STRUCTURE ONLY (class exists, method exists, argument-name signature). Never introspect the method body — do not collect comparisons, attribute accesses, or call patterns from inside it:
+
+```python
+SERVICE_PATH = Path(__file__).resolve().parent.parent / "app" / "services" / "performance_monitor.py"
+
+
+def test_record_request_metric_creates_entry():  # NAME from must_test
+    tree = ast.parse(SERVICE_PATH.read_text(encoding="utf-8"))
+    cls = _class(tree, "PerformanceMonitor")
+    assert cls is not None
+    record = _method(cls, "record_request_metric")
+    assert record is not None
+    # Signature only — NOT what the body does:
+    assert _arg_names(record) == ["self", "provider", "model", "latency_ms", "status_code", "cost_usd"]
+    # WRONG (brittle, fails against a correct impl): scanning the body for
+    # `ProviderMetrics.provider == "provider"` comparisons. Never do this.
+```
 
 Tool request examples:
 {"tool":"read_file","path":"gateway-v4/tests/test_provider_metrics_migration.py"}

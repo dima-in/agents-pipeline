@@ -525,6 +525,26 @@ def test_strict_mode_still_auto_enabled_for_single_code_file(tmp_path) -> None:
     assert bundle["retrieval_budget"] == 2
 
 
+def test_strict_mode_disabled_during_repair_so_developer_can_read_to_fix(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    bundle = strict_message_bundle()
+    # First attempt: strict is on (no repair in progress).
+    assert orchestrator.should_enable_strict_mode("infra-developer", "implementation", bundle) is True
+
+    # A repair retry (attempt > 1) must relax to balanced retrieval, otherwise the
+    # developer is hard-stopped after one read and can never fix the failing file.
+    orchestrator._implementation_attempt = 2
+    assert orchestrator.should_enable_strict_mode("infra-developer", "implementation", bundle) is False
+
+    # The explicit developer-repair flag relaxes it too, even on attempt 1.
+    orchestrator._implementation_attempt = 1
+    orchestrator._implementation_retry_from_agent = "developer"
+    assert orchestrator.should_enable_strict_mode("infra-developer", "implementation", bundle) is False
+    orchestrator._apply_execution_policy("infra-developer", "implementation", bundle)
+    assert bundle["execution_mode"] == "balanced"
+    assert bundle["retrieval_budget"] == 6
+
+
 def test_retrieval_blocked_in_strict_mode_after_one_read(tmp_path) -> None:
     orchestrator = make_orchestrator_with_workspace(tmp_path)
     bundle = strict_message_bundle()
