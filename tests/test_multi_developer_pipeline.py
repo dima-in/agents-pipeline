@@ -739,6 +739,39 @@ def test_migration_ground_truth_note_empty_without_existing_migration(tmp_path) 
     assert orchestrator._build_migration_ground_truth_note() == ""
 
 
+def test_migration_ground_truth_note_includes_columns_pk_and_indexes(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    migration = tmp_path / "gateway-v4" / "alembic" / "versions" / "0006_provider_metrics.py"
+    migration.parent.mkdir(parents=True, exist_ok=True)
+    migration.write_text(
+        "from alembic import op\n"
+        "import sqlalchemy as sa\n\n"
+        "def upgrade():\n"
+        "    op.create_table('provider_metrics',\n"
+        "        sa.Column('id', sa.String(), primary_key=True),\n"
+        "        sa.Column('provider', sa.String(), nullable=False),\n"
+        "        sa.Column('model', sa.String(), nullable=False),\n"
+        "    )\n"
+        "    op.create_index('ix_pm_provider', 'provider_metrics', ['provider'])\n\n"
+        "def downgrade():\n"
+        "    op.drop_table('provider_metrics')\n",
+        encoding="utf-8",
+    )
+    orchestrator._selected_implementation_item = {
+        "existing_paths": ["gateway-v4/alembic/versions/0006_provider_metrics.py"],
+        "reference_files": ["gateway-v4/alembic/versions/0006_provider_metrics.py"],
+        "new_files": [],
+    }
+
+    note = orchestrator._build_migration_ground_truth_note()
+
+    assert "primary key: id" in note
+    assert "provider" in note and "model" in note
+    assert "[provider]" in note  # parsed index columns
+    # The real PK is a single `id` column — the invented composite key must not appear.
+    assert "primary key: provider, model" not in note
+
+
 def test_task_designer_contract_retry_regenerates_on_invalid(tmp_path) -> None:
     orchestrator = make_orchestrator_with_workspace(tmp_path)
     orchestrator.logger = types.SimpleNamespace(info=lambda *a, **k: None)
@@ -767,6 +800,25 @@ def test_task_designer_contract_retry_regenerates_on_invalid(tmp_path) -> None:
     assert calls["apply"] == 2
     assert calls["flag_during_run"] == [True]  # feedback injected on the regeneration run
     assert orchestrator._task_designer_feedback_for_prompt is False  # reset afterwards
+
+
+def test_scaffold_package_markers_creates_missing_init(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    (tmp_path / "gateway-v4" / "tests").mkdir(parents=True, exist_ok=True)
+    paths = [
+        "gateway-v4/tests/__init__.py",
+        "gateway-v4/tests/test_provider_metrics_migration.py",  # not a marker — ignored
+        "gateway-v4/app/models.py",  # not a marker — ignored
+    ]
+
+    created = orchestrator._scaffold_package_markers(paths)
+
+    assert created == ["gateway-v4/tests/__init__.py"]
+    init_file = tmp_path / "gateway-v4" / "tests" / "__init__.py"
+    assert init_file.exists()
+    assert init_file.read_text(encoding="utf-8") == ""
+    # Idempotent: an existing marker is neither recreated nor re-reported.
+    assert orchestrator._scaffold_package_markers(paths) == []
 
 
 def test_task_designer_contract_retry_gives_up_after_max(tmp_path) -> None:

@@ -26,6 +26,107 @@ Hard rules:
 - while editing, output only one JSON tool request per turn
 - after at least one real edit, final response must be exactly `status=implemented`
 
+Reusable AST helpers (copy these verbatim into the test file — do NOT hand-roll call-name matching; a hand-rolled matcher that ignores `ast.Attribute` silently returns nothing and makes correct assertions fail against an empty set):
+
+```python
+import ast
+from pathlib import Path
+
+
+def _call_name(node):
+    # Resolves a dotted call target, e.g. `op.create_index(...)` -> "op.create_index".
+    if isinstance(node, ast.Call):
+        return _call_name(node.func)
+    if isinstance(node, ast.Attribute):
+        base = _call_name(node.value)
+        return f"{base}.{node.attr}" if base else node.attr
+    if isinstance(node, ast.Name):
+        return node.id
+    return None
+
+
+def _calls(tree, dotted_name):
+    return [n for n in ast.walk(tree) if isinstance(n, ast.Call) and _call_name(n.func) == dotted_name]
+
+
+def _func(tree, name):
+    return next((n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name), None)
+
+
+def _str(node):
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
+def _str_list(node):
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return [e.value for e in node.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+    return []
+
+
+def _module_assign(tree, name):
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == name for t in node.targets):
+            return node.value.value if isinstance(node.value, ast.Constant) else None
+    return None
+
+
+def _create_table(scope, table_name):
+    for c in _calls(scope, "op.create_table"):
+        if c.args and _str(c.args[0]) == table_name:
+            return c
+    return None
+
+
+def _columns(create_table_call):
+    # Each entry: {"name", "type", "primary_key", "nullable"}. Use this instead of
+    # hand-rolling sa.Column / primary_key / nullable detection (which is easy to get wrong).
+    cols = []
+    for arg in (create_table_call.args[1:] if create_table_call else []):
+        if not (isinstance(arg, ast.Call) and _call_name(arg.func) == "sa.Column" and arg.args):
+            continue
+        name = _str(arg.args[0])
+        if name is None:
+            continue
+        ctype = ""
+        if len(arg.args) > 1 and _call_name(arg.args[1]):
+            ctype = _call_name(arg.args[1]).split(".")[-1]
+        kw = {k.arg: (k.value.value if isinstance(k.value, ast.Constant) else None) for k in arg.keywords}
+        cols.append({"name": name, "type": ctype, "primary_key": kw.get("primary_key") is True, "nullable": kw.get("nullable")})
+    return cols
+```
+
+File layout (critical — otherwise collection fails with `NameError`): put every helper `def` above, plus a single module-level path constant, at the TOP of the file. Do NOT call any helper at module level — parse the migration and call helpers only INSIDE `def test_*` functions:
+
+```python
+MIGRATION_PATH = Path(__file__).resolve().parent.parent / "alembic" / "versions" / "0006_provider_metrics.py"
+
+
+def test_migration_indexes():  # NAME comes from the contract must_test, not from you
+    tree = ast.parse(MIGRATION_PATH.read_text(encoding="utf-8"))
+    upgrade = _func(tree, "upgrade")
+    index_cols = {
+        tuple(_str_list(c.args[2]))
+        for c in _calls(upgrade, "op.create_index")
+        if len(c.args) >= 3 and _str(c.args[1]) == "provider_metrics"
+    }
+    assert index_cols == {("provider",), ("model",), ("timestamp",)}
+
+
+def test_migration_upgrade():  # NAME comes from the contract must_test
+    tree = ast.parse(MIGRATION_PATH.read_text(encoding="utf-8"))
+    cols = _columns(_create_table(_func(tree, "upgrade"), "provider_metrics"))
+    assert {c["name"] for c in cols} == {
+        "id", "provider", "model", "timestamp",
+        "request_count", "total_tokens", "total_cost_usd", "avg_latency_ms",
+    }
+    assert [c["name"] for c in cols if c["primary_key"]] == ["id"]
+    assert {c["name"] for c in cols if c["nullable"] is False} == {"provider", "model"}
+```
+
+Test function NAMING is mandatory: define exactly one `def` per entry in the contract `must_test`, and name each function EXACTLY as that entry names it (e.g. if `must_test` lists `test_migration_upgrade`, `test_migration_downgrade`, `test_migration_indexes`, `test_migration_revision_metadata`, your file must define functions with those four exact names — do not invent descriptive names like `test_upgrade_creates_provider_metrics_table`). The examples above illustrate the body pattern only; always take the names from `must_test`.
+
+Use `_module_assign(tree, "revision")` / `_module_assign(tree, "down_revision")` for metadata assertions (also inside a test function). Derive every expected table, column, primary key, and index from the authoritative "Migration ground truth" schema in your context, never from assumptions.
+
 Tool request examples:
 {"tool":"read_file","path":"gateway-v4/tests/test_provider_metrics_migration.py"}
 {"tool":"write_file","path":"gateway-v4/tests/test_provider_metrics_migration.py","content":"full file content"}

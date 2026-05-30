@@ -550,6 +550,31 @@ class WorkflowOrchestrator:
                     paths.append(normalized)
         return sorted(dict.fromkeys(paths))
 
+    def _scaffold_package_markers(self, paths: list[str]) -> list[str]:
+        """Create any empty `__init__.py` package markers declared in the task scope.
+
+        These are trivial empty files; an LLM developer that may write only one file per
+        turn otherwise leaves the package marker uncreated, failing QA's contract check.
+        Creating them deterministically keeps the package importable and within scope.
+        """
+        created: list[str] = []
+        workspace_root = self.target_workspace.resolve()
+        for raw in paths:
+            normalized = self._normalize_repo_relative_path(raw)
+            if not normalized or Path(normalized).name != "__init__.py":
+                continue
+            candidate = (self.target_workspace / normalized).resolve()
+            try:
+                candidate.relative_to(workspace_root)
+            except ValueError:
+                continue
+            if candidate.exists():
+                continue
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            candidate.write_text("", encoding="utf-8")
+            created.append(normalized)
+        return created
+
     def _build_multi_developer_task_override(self, agent_name: str, editable_paths: list[str]) -> dict[str, Any]:
         item = dict(self._selected_implementation_item or {})
         allowed_paths = filter_paths_for_agent(editable_paths, agent_name)
@@ -881,7 +906,10 @@ class WorkflowOrchestrator:
             ],
         )
         applied_agents: list[str] = []
-        changed_paths: list[str] = []
+        scaffolded_markers = self._scaffold_package_markers(editable_paths)
+        if scaffolded_markers:
+            self.logger.info("Scaffolded package markers: " + ", ".join(scaffolded_markers))
+        changed_paths: list[str] = list(scaffolded_markers)
         warnings: list[str] = []
         for routed_name in routed_agents:
             agent_config = agent_configs.get(routed_name)
@@ -3271,23 +3299,30 @@ class WorkflowOrchestrator:
             },
         )
         last_error: Exception | None = None
-        for attempt in range(1, 4):
+        max_attempts = 4
+        for attempt in range(1, max_attempts + 1):
             try:
                 response = urllib_request.urlopen(request, timeout=timeout)
                 if hasattr(response, "__enter__") and hasattr(response, "__exit__"):
                     with response:
                         return 200, response.read().decode("utf-8", errors="replace")
                 return 200, response.read().decode("utf-8", errors="replace")
-            except http.client.IncompleteRead as exc:
-                last_error = exc
-                if attempt >= 3:
+            except urllib_error.HTTPError as exc:
+                # Client errors (4xx) are not transient — surface immediately. Server
+                # errors (5xx) are retried with backoff.
+                if exc.code and exc.code < 500:
                     raise
-                time.sleep(min(1.5, 0.5 * attempt))
-            except urllib_error.URLError as exc:
                 last_error = exc
-                if attempt >= 3:
+                if attempt >= max_attempts:
                     raise
-                time.sleep(min(1.5, 0.5 * attempt))
+                time.sleep(min(4.0, 0.75 * attempt))
+            except (http.client.HTTPException, OSError) as exc:
+                # Transient network failures: IncompleteRead, ssl.SSLError (bad record mac),
+                # socket timeouts, connection resets, and other URLError/OSError cases.
+                last_error = exc
+                if attempt >= max_attempts:
+                    raise
+                time.sleep(min(4.0, 0.75 * attempt))
         if last_error is not None:
             raise last_error
         raise RuntimeError("direct_api request failed without response")
@@ -5698,13 +5733,17 @@ class WorkflowOrchestrator:
                     return True
         return False
 
-    def _in_scope_migration_tables(self, item: dict[str, Any]) -> tuple[bool, set[str]]:
-        """Tables actually created by existing migration files in the task scope.
+    def _extract_migration_schema(self, item: dict[str, Any]) -> tuple[bool, dict[str, dict[str, Any]], dict[str, Any]]:
+        """Per-table schema + metadata parsed from in-scope migration files (ground truth).
 
-        Returns (found_existing_migration, created_table_names). Migrations that are
-        declared as new_files are excluded — they do not exist yet, so they are not
-        ground truth. This lets the contract validator reject claims that a migration
-        creates a table it does not, rather than trusting the planning agents.
+        Returns (found_existing_migration, schema, meta), where schema[table] = {
+            "columns": [{"name", "type", "primary_key", "nullable"}],
+            "primary_key": [column names],
+            "indexes": [[column names], ...],
+        } and meta = {"revision", "down_revision", "downgrade_drop_tables",
+        "downgrade_drop_index_count"}. Migrations declared as new_files are excluded
+        (they do not exist yet), so the result is authoritative reality the agents must
+        match rather than invent.
         """
         new_files = {self._normalize_repo_relative_path(path) for path in item.get("new_files") or []}
         scope_paths: list[str] = []
@@ -5713,7 +5752,13 @@ class WorkflowOrchestrator:
                 normalized = self._normalize_repo_relative_path(path)
                 if normalized:
                     scope_paths.append(normalized)
-        tables: set[str] = set()
+        schema: dict[str, dict[str, Any]] = {}
+        meta: dict[str, Any] = {
+            "revision": None,
+            "down_revision": None,
+            "downgrade_drop_tables": [],
+            "downgrade_drop_index_count": 0,
+        }
         found = False
         for rel in dict.fromkeys(scope_paths):
             if "/alembic/versions/" not in rel or not rel.endswith(".py") or rel in new_files:
@@ -5726,32 +5771,138 @@ class WorkflowOrchestrator:
             except (OSError, SyntaxError):
                 continue
             found = True
+            for stmt in tree.body:
+                if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Constant):
+                    for target in stmt.targets:
+                        if isinstance(target, ast.Name) and target.id in {"revision", "down_revision"}:
+                            meta[target.id] = stmt.value.value
+            downgrade_fn = next(
+                (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "downgrade"), None
+            )
+            if downgrade_fn is not None:
+                for node in ast.walk(downgrade_fn):
+                    if not isinstance(node, ast.Call):
+                        continue
+                    drop_name = self._contract_ast_call_name(node.func)
+                    if drop_name in {"op.drop_table", "drop_table"} and node.args:
+                        dropped = self._contract_ast_literal(node.args[0])
+                        if isinstance(dropped, str):
+                            meta["downgrade_drop_tables"].append(dropped)
+                    elif drop_name in {"op.drop_index", "drop_index"}:
+                        meta["downgrade_drop_index_count"] += 1
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call):
                     continue
-                if self._contract_ast_call_name(node.func) not in {"op.create_table", "create_table"}:
-                    continue
-                if node.args and isinstance(self._contract_ast_literal(node.args[0]), str):
-                    tables.add(self._contract_ast_literal(node.args[0]))
-        return found, tables
+                call_name = self._contract_ast_call_name(node.func)
+                if call_name in {"op.create_table", "create_table"} and node.args:
+                    table = self._contract_ast_literal(node.args[0])
+                    if not isinstance(table, str):
+                        continue
+                    entry = schema.setdefault(table, {"columns": [], "primary_key": [], "indexes": []})
+                    for arg in node.args[1:]:
+                        if not isinstance(arg, ast.Call):
+                            continue
+                        arg_name = self._contract_ast_call_name(arg.func)
+                        if arg_name in {"sa.Column", "Column"} and arg.args:
+                            col_name = self._contract_ast_literal(arg.args[0])
+                            if not isinstance(col_name, str):
+                                continue
+                            col_type = ""
+                            if len(arg.args) > 1:
+                                col_type = (self._contract_ast_call_name(arg.args[1]) or "").split(".")[-1]
+                            is_pk = False
+                            nullable: bool | None = None
+                            for kw in arg.keywords:
+                                if kw.arg == "primary_key":
+                                    is_pk = self._contract_ast_literal(kw.value) is True
+                                elif kw.arg == "nullable":
+                                    nullable = self._contract_ast_literal(kw.value)
+                            entry["columns"].append(
+                                {"name": col_name, "type": col_type, "primary_key": is_pk, "nullable": nullable}
+                            )
+                            if is_pk:
+                                entry["primary_key"].append(col_name)
+                        elif arg_name in {"sa.PrimaryKeyConstraint", "PrimaryKeyConstraint"}:
+                            for pk_arg in arg.args:
+                                pk_col = self._contract_ast_literal(pk_arg)
+                                if isinstance(pk_col, str):
+                                    entry["primary_key"].append(pk_col)
+                elif call_name in {"op.create_index", "create_index"} and len(node.args) >= 3:
+                    table = self._contract_ast_literal(node.args[1])
+                    cols_node = node.args[2]
+                    cols: list[str] = []
+                    if isinstance(cols_node, (ast.List, ast.Tuple)):
+                        for el in cols_node.elts:
+                            val = self._contract_ast_literal(el)
+                            if isinstance(val, str):
+                                cols.append(val)
+                    if isinstance(table, str) and cols:
+                        schema.setdefault(table, {"columns": [], "primary_key": [], "indexes": []})["indexes"].append(cols)
+        for entry in schema.values():
+            entry["primary_key"] = list(dict.fromkeys(entry["primary_key"]))
+        meta["downgrade_drop_tables"] = list(dict.fromkeys(meta["downgrade_drop_tables"]))
+        return found, schema, meta
+
+    def _in_scope_migration_tables(self, item: dict[str, Any]) -> tuple[bool, set[str]]:
+        """Tables actually created by existing migration files in the task scope."""
+        found, schema, _meta = self._extract_migration_schema(item)
+        return found, set(schema.keys())
 
     def _build_migration_ground_truth_note(self) -> str:
-        """Authoritative note about which tables the in-scope migrations actually create.
+        """Authoritative full-schema note (tables, columns, types, PK, indexes).
 
-        Grounds planning/edit agents so they do not invent tables (e.g. a health table)
-        that no migration creates. Empty when the task has no existing migration in scope.
+        Grounds planning/edit agents so they match the real migration instead of
+        inventing tables, columns, or a composite primary key. Empty when the task has
+        no existing migration in scope.
         """
-        found, tables = self._in_scope_migration_tables(self._selected_implementation_item or {})
+        found, schema, meta = self._extract_migration_schema(self._selected_implementation_item or {})
         if not found:
             return ""
-        table_list = ", ".join(sorted(tables)) if tables else "(no tables created)"
-        return (
-            f"The in-scope Alembic migration file(s) create exactly these tables: {table_list}. "
-            "This is authoritative ground truth parsed from the real migration source. "
-            "Do NOT require models, columns, or migration tests for any table that is not in this list. "
-            "If the plan mentions another table that no in-scope migration creates, do not claim a "
-            "migration creates it and do not add a migration test for it."
+        if not schema:
+            return (
+                "The in-scope Alembic migration file(s) create no tables. "
+                "Do NOT add models, columns, or migration tests for any table."
+            )
+        lines = [
+            "Authoritative database schema parsed from the in-scope Alembic migration source "
+            "(ground truth — trust this over any plan, summary, or assumption):",
+        ]
+        for table in sorted(schema):
+            entry = schema[table]
+            col_descs: list[str] = []
+            for col in entry["columns"]:
+                detail: list[str] = []
+                if col["type"]:
+                    detail.append(col["type"])
+                if col["primary_key"]:
+                    detail.append("pk")
+                if col["nullable"] is False:
+                    detail.append("not null")
+                col_descs.append(f"{col['name']} ({', '.join(detail)})" if detail else col["name"])
+            pk = ", ".join(entry["primary_key"]) if entry["primary_key"] else "(none declared)"
+            idx = "; ".join("[" + ", ".join(cols) + "]" for cols in entry["indexes"]) or "(none)"
+            lines.append(f"- Table {table}:")
+            lines.append(f"    columns: {', '.join(col_descs) if col_descs else '(none parsed)'}")
+            lines.append(f"    primary key: {pk}")
+            lines.append(f"    indexes: {idx}")
+        if meta.get("revision") is not None or meta.get("down_revision") is not None:
+            lines.append(
+                f"- Migration metadata: revision = {meta['revision']!r}, down_revision = {meta['down_revision']!r} "
+                "(use these exact values; the revision is NOT the file name)."
+            )
+        drop_tables = meta.get("downgrade_drop_tables") or []
+        lines.append(
+            f"- downgrade(): drops table(s) {', '.join(drop_tables) if drop_tables else '(none)'} and makes "
+            f"{meta.get('downgrade_drop_index_count', 0)} explicit op.drop_index call(s) "
+            "(dropping a table removes its indexes implicitly — do not assert index drops that are not there)."
         )
+        lines.append(
+            "Models, migration tests, and contracts MUST match this schema and metadata exactly. Do NOT add, "
+            "rename, or remove columns; do NOT invent a primary key (e.g. a composite provider+model key) "
+            "different from the one above; do NOT assert tables, columns, indexes, revisions, or downgrade "
+            "behavior that are not listed."
+        )
+        return "\n".join(lines)
 
     def _configured_alembic_down_revision(self) -> str:
         implementation = self.config.get("phases", {}).get("implementation", {})
