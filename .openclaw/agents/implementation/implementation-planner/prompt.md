@@ -34,6 +34,7 @@ Rules:
 - Sort output so P0 comes before P1 before P2, low risk before high risk, and backend-only before frontend/billing/marketplace.
 - Prefer backend-only work when possible.
 - Preserve constraints from the selected scope and project policy.
+- Honor the "Backend architecture ground truth" section when present: match the existing persistence concurrency model (synchronous vs asynchronous SQLAlchemy) and the session-injection pattern. Do not write acceptance criteria that demand asynchronous DB operations on a synchronous stack, and do not require a service to build its own session factory instead of using the injected session.
 - Use only paths from `repo_map` unless declaring a new file under an existing directory.
 - If architect proposes invalid or generic paths, translate the idea into real existing agents-pipeline paths when possible.
 - For agents-pipeline self-analysis, prefer `workflow/`, `tools/`, `tests/`, `start.py`, `run.bat`, and README files.

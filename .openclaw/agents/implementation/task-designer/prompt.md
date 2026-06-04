@@ -30,6 +30,10 @@ Output fields:
 - optional `notes`
 
 Strict rules:
+- Honor the "Backend architecture ground truth" section when present: it is authoritative about the target's DB concurrency model and session-injection pattern.
+  - If the stack is synchronous SQLAlchemy, `must_contain` must use synchronous `def` methods for database work (never `async def`), `must_import` must not introduce `AsyncSession`/`create_async_engine`/`async_sessionmaker`, and `integration`/`forbidden`/`notes` must not require "asynchronous database operations", "async/await for DB", or `asyncio.to_thread` DB wrappers, nor forbid "synchronous database calls".
+  - The service/repository must use the injected session (e.g. a `db`/`db_session: Session` parameter or `Depends(get_db)`); do not require it to construct its own `SessionLocal()`.
+  - If the stack is asynchronous, mirror the opposite: `async def` DB methods awaited against the injected `AsyncSession`.
 - Use only the selected task's `allowed_paths`, `required_test_paths`, `existing_paths`, `new_files`, and `reference_files`.
 - `target_file.path` must be one exact file already approved by the selected task outline.
 - `test_file.path` must be one exact file already approved by the selected task outline.

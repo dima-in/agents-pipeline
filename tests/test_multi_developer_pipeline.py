@@ -855,3 +855,137 @@ def test_task_designer_contract_retry_gives_up_after_max(tmp_path) -> None:
 
     assert ok is False
     assert orchestrator._task_designer_feedback_for_prompt is False
+
+
+def _write_sync_db_stack(tmp_path):
+    database_path = tmp_path / "gateway-v4" / "app" / "database.py"
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+    database_path.write_text(
+        "from sqlalchemy import create_engine\n"
+        "from sqlalchemy.orm import declarative_base, sessionmaker, Session\n"
+        "engine = create_engine('sqlite://')\n"
+        "SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)\n"
+        "Base = declarative_base()\n"
+        "def get_db():\n"
+        "    db = SessionLocal()\n"
+        "    try:\n"
+        "        yield db\n"
+        "    finally:\n"
+        "        db.close()\n",
+        encoding="utf-8",
+    )
+    return database_path
+
+
+def _write_async_db_stack(tmp_path):
+    database_path = tmp_path / "gateway-v4" / "app" / "database.py"
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+    database_path.write_text(
+        "from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession\n"
+        "engine = create_async_engine('sqlite+aiosqlite://')\n"
+        "AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession)\n"
+        "async def get_async_session():\n"
+        "    async with AsyncSessionLocal() as session:\n"
+        "        yield session\n",
+        encoding="utf-8",
+    )
+    return database_path
+
+
+def test_extract_db_architecture_detects_sync_stack(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    _write_sync_db_stack(tmp_path)
+
+    arch = orchestrator._extract_db_architecture()
+
+    assert arch["found"] is True
+    assert arch["is_async"] is False
+    assert arch["engine_call"] == "create_engine"
+    assert arch["session_factory"] == "SessionLocal"
+    assert arch["session_dependency"] == "get_db"
+    assert arch["dependency_is_async"] is False
+    assert arch["db_module"] == "gateway-v4/app/database.py"
+
+
+def test_extract_db_architecture_detects_async_stack(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    _write_async_db_stack(tmp_path)
+
+    arch = orchestrator._extract_db_architecture()
+
+    assert arch["found"] is True
+    assert arch["is_async"] is True
+    assert arch["engine_call"] == "create_async_engine"
+    assert arch["session_dependency"] == "get_async_session"
+    assert arch["dependency_is_async"] is True
+
+
+def test_architecture_ground_truth_note_sync_warns_against_async_db(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    _write_sync_db_stack(tmp_path)
+
+    note = orchestrator._build_architecture_ground_truth_note()
+
+    assert "SYNCHRONOUS" in note
+    assert "get_db" in note
+    assert "SessionLocal" in note
+    # Must steer agents away from the exact contradiction that blocked TASK-002.
+    assert "async def" in note
+    assert "asyncio.to_thread" in note
+
+
+def test_contract_demands_async_db_flags_async_on_sync_stack(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    _write_sync_db_stack(tmp_path)
+
+    # The exact shape of the TASK-002 contract QA could never accept.
+    bad_contract = {
+        "must_contain": [
+            "class PerformanceMonitor:",
+            "async def record_request_metrics(",
+            "def __init__(self, db_session",
+        ],
+        "must_import": [
+            "from sqlalchemy.orm import Session",
+            "from app.models import ProviderMetrics",
+        ],
+        "integration": ["All database operations must be asynchronous"],
+        "forbidden": ["Do not add synchronous blocking database calls"],
+        "must_test": ["test_record_request_metrics_creates_new_entry: assert row created"],
+    }
+
+    reason = orchestrator._contract_demands_async_db(bad_contract)
+
+    assert reason
+    assert "synchronous" in reason.lower()
+
+
+def test_contract_demands_async_db_passes_clean_sync_contract(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    _write_sync_db_stack(tmp_path)
+
+    good_contract = {
+        "must_contain": [
+            "class PerformanceMonitor:",
+            "def record_request_metrics(self, db: Session",
+        ],
+        "must_import": ["from sqlalchemy.orm import Session"],
+        "integration": ["Use the injected db session passed by the caller"],
+        "forbidden": ["Do not modify billing routes"],
+        "must_test": ["test_record_request_metrics: assert provider_metrics row is created"],
+    }
+
+    assert orchestrator._contract_demands_async_db(good_contract) == ""
+
+
+def test_contract_demands_async_db_noop_when_stack_unknown(tmp_path) -> None:
+    # No database module in the workspace -> detection finds nothing -> guardrail must not fire.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+
+    bad_contract = {
+        "must_contain": ["async def record_request_metrics("],
+        "must_import": ["from sqlalchemy.orm import Session"],
+        "integration": ["All database operations must be asynchronous"],
+    }
+
+    assert orchestrator._contract_demands_async_db(bad_contract) == ""

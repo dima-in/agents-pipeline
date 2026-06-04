@@ -180,6 +180,7 @@ class WorkflowOrchestrator:
         self._implementation_retry_from_agent = ""
         self._implementation_attempt = 0
         self._repo_map_cache: dict[str, Any] | None = None
+        self._db_architecture_cache: dict[str, Any] | None = None
         self._repo_map_before: dict[str, Any] | None = None
         self._repo_map_after: dict[str, Any] | None = None
         self._repo_map_delta: dict[str, list[str]] = {
@@ -5402,6 +5403,21 @@ class WorkflowOrchestrator:
                     len(sections),
                 )
                 sections.insert(insert_at, ("Migration ground truth", ground_truth))
+        # Ground the planning and edit agents in the codebase's real DB concurrency model and
+        # session-injection pattern so contracts are achievable (e.g. no async DB demands on a
+        # synchronous SQLAlchemy stack). Placed right after the scope so it is never starved by
+        # lower-value sections when the joined context is capped.
+        if (
+            agent_name in {"architect", "implementation-planner", "task-designer", "qa", "template-validator"}
+            or edit_agent
+        ):
+            architecture_note = self._build_architecture_ground_truth_note()
+            if architecture_note:
+                insert_at = next(
+                    (idx + 1 for idx, (title, _) in enumerate(sections) if title == "Selected implementation scope"),
+                    len(sections),
+                )
+                sections.insert(insert_at, ("Backend architecture ground truth", architecture_note))
         if (
             agent_name in {"task-designer", "developer", "qa", "template-validator"}
             or self._is_multi_developer_edit_agent(agent_name)
@@ -5912,6 +5928,356 @@ class WorkflowOrchestrator:
             "behavior that are not listed."
         )
         return "\n".join(lines)
+
+    def _extract_db_architecture(self) -> dict[str, Any]:
+        """Detect the target codebase's DB concurrency + session-injection model (ground truth).
+
+        Parses real source via AST so the planning agents (architect, planner, task-designer)
+        produce contracts that match the stack instead of demanding, e.g., asynchronous DB
+        operations on a synchronous SQLAlchemy codebase, or a service that builds its own
+        ``SessionLocal()`` instead of using the injected session. Universal: it reads the
+        actual engine/session wiring rather than assuming a particular framework.
+
+        Returns a dict with keys: ``found``, ``is_async`` (True/False/None when unknown),
+        ``engine_call``, ``session_factory``, ``session_type``, ``session_dependency``,
+        ``dependency_is_async``, ``db_module``, ``query_style``, ``base``.
+        """
+        cached = getattr(self, "_db_architecture_cache", None)
+        if cached is not None:
+            return cached
+
+        result: dict[str, Any] = {
+            "found": False,
+            "is_async": None,
+            "engine_call": "",
+            "session_factory": "",
+            "session_type": "",
+            "session_dependency": "",
+            "dependency_is_async": None,
+            "db_module": "",
+            "query_style": "",
+            "base": "",
+        }
+        async_signal = False
+        sync_signal = False
+
+        workspace = getattr(self, "target_workspace", None)
+        if not workspace:
+            self._db_architecture_cache = result
+            return result
+        workspace = Path(workspace)
+        if not workspace.exists():
+            self._db_architecture_cache = result
+            return result
+
+        db_basenames = (
+            "database.py",
+            "db.py",
+            "session.py",
+            "sessions.py",
+            "base.py",
+            "deps.py",
+            "dependencies.py",
+            "models.py",
+        )
+        excluded_dirs = {
+            ".git",
+            ".venv",
+            "venv",
+            "env",
+            "node_modules",
+            "__pycache__",
+            "dist",
+            "build",
+            ".pytest_cache",
+            ".mypy_cache",
+            "migrations",
+            "alembic",
+            "site-packages",
+            ".openclaw",
+            ".agents-pipeline",
+        }
+        prioritized: list[Path] = []
+        others: list[Path] = []
+        for root, dirs, files in os.walk(workspace):
+            dirs[:] = [name for name in dirs if name not in excluded_dirs and not name.startswith(".")]
+            try:
+                depth = len(Path(root).relative_to(workspace).parts)
+            except ValueError:
+                depth = 0
+            if depth > 6:
+                dirs[:] = []
+                continue
+            for name in files:
+                if not name.endswith(".py"):
+                    continue
+                path = Path(root) / name
+                (prioritized if name in db_basenames else others).append(path)
+        candidates = prioritized + others
+
+        engine_tokens = (
+            "create_engine",
+            "create_async_engine",
+            "sessionmaker",
+            "async_sessionmaker",
+            "declarative_base",
+            "DeclarativeBase",
+            "AsyncSession",
+        )
+        parsed_files = 0
+        for path in candidates:
+            if parsed_files >= 120:
+                break
+            try:
+                source = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if not any(token in source for token in engine_tokens):
+                continue
+            try:
+                tree = ast.parse(source)
+            except SyntaxError:
+                continue
+            parsed_files += 1
+            try:
+                rel = path.relative_to(workspace).as_posix()
+            except ValueError:
+                rel = path.name
+
+            module_async, module_sync = self._scan_db_module_ast(tree, source, rel, result)
+            async_signal = async_signal or module_async
+            sync_signal = sync_signal or module_sync
+            if result["found"] and result["session_factory"] and result["session_dependency"]:
+                break
+
+        if async_signal:
+            result["is_async"] = True
+        elif sync_signal:
+            result["is_async"] = False
+        self._db_architecture_cache = result
+        return result
+
+    def _scan_db_module_ast(
+        self, tree: ast.AST, source: str, rel: str, result: dict[str, Any]
+    ) -> tuple[bool, bool]:
+        """Merge DB-stack signals from one parsed module into ``result``.
+
+        Returns ``(async_signal, sync_signal)`` observed in this module.
+        """
+        async_signal = False
+        sync_signal = False
+
+        def _note_module() -> None:
+            if not result["db_module"]:
+                result["db_module"] = rel
+            result["found"] = True
+
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    if alias.name == "AsyncSession" or alias.name.endswith(".AsyncSession"):
+                        async_signal = True
+                        if not result["session_type"]:
+                            result["session_type"] = "AsyncSession"
+                continue
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+                call_name = self._contract_ast_call_name(node.value.func) or ""
+                leaf = call_name.split(".")[-1]
+                target_name = ""
+                if node.targets and isinstance(node.targets[0], ast.Name):
+                    target_name = node.targets[0].id
+                if leaf == "create_async_engine":
+                    async_signal = True
+                    result["engine_call"] = result["engine_call"] or "create_async_engine"
+                    _note_module()
+                elif leaf == "create_engine":
+                    sync_signal = True
+                    result["engine_call"] = result["engine_call"] or "create_engine"
+                    _note_module()
+                elif leaf == "async_sessionmaker":
+                    async_signal = True
+                    result["session_factory"] = result["session_factory"] or target_name or "async_session"
+                    _note_module()
+                elif leaf == "sessionmaker":
+                    # sessionmaker(class_=AsyncSession, ...) is the async pattern.
+                    uses_async_class = any(
+                        kw.arg == "class_" and (self._contract_ast_call_name(kw.value) or "").split(".")[-1] == "AsyncSession"
+                        for kw in node.value.keywords
+                    )
+                    if uses_async_class:
+                        async_signal = True
+                    else:
+                        sync_signal = True
+                    result["session_factory"] = result["session_factory"] or target_name or "SessionLocal"
+                    _note_module()
+                elif leaf == "declarative_base":
+                    result["base"] = result["base"] or target_name or "Base"
+                    _note_module()
+            if isinstance(node, ast.ClassDef):
+                for base in node.bases:
+                    base_name = (self._contract_ast_call_name(base) or "").split(".")[-1]
+                    if base_name == "DeclarativeBase":
+                        result["base"] = result["base"] or node.name
+                        _note_module()
+
+        # Session dependency: a (possibly async) generator that yields a session. Prefer one
+        # that references the detected session factory; fall back to a get_*/session name.
+        if not result["session_dependency"]:
+            factory = result["session_factory"]
+            name_hints = ("get_db", "get_session", "get_async_session", "get_db_session", "db_session")
+            best: tuple[str, bool] | None = None
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                has_yield = any(isinstance(inner, (ast.Yield, ast.YieldFrom)) for inner in ast.walk(node))
+                if not has_yield:
+                    continue
+                body_src = ast.get_source_segment(source, node) or ""
+                references_factory = bool(factory) and factory in body_src
+                name_match = any(hint in node.name for hint in name_hints)
+                if references_factory or name_match:
+                    is_async = isinstance(node, ast.AsyncFunctionDef)
+                    if references_factory:
+                        best = (node.name, is_async)
+                        break
+                    if best is None:
+                        best = (node.name, is_async)
+            if best is not None:
+                result["session_dependency"], result["dependency_is_async"] = best
+                if result["dependency_is_async"]:
+                    async_signal = True
+                _note_module()
+
+        if not result["query_style"]:
+            if re.search(r"\.query\s*\(", source):
+                result["query_style"] = "orm_query"
+            elif re.search(r"\bselect\s*\(", source) and re.search(r"\.execute\s*\(", source):
+                result["query_style"] = "select_execute"
+
+        return async_signal, sync_signal
+
+    def _build_architecture_ground_truth_note(self) -> str:
+        """Authoritative note on the DB concurrency model and session-injection pattern.
+
+        Grounds the planning and edit agents so contracts match the real stack (e.g. do not
+        demand asynchronous DB on a synchronous SQLAlchemy codebase, and require services to
+        use the injected session instead of constructing their own). Empty when the target's
+        persistence stack cannot be determined.
+        """
+        arch = self._extract_db_architecture()
+        if not arch.get("found") or arch.get("is_async") is None:
+            return ""
+        engine = arch.get("engine_call") or ""
+        factory = arch.get("session_factory") or ""
+        session_type = arch.get("session_type") or ""
+        dependency = arch.get("session_dependency") or ""
+        module = arch.get("db_module") or ""
+        signature = ", ".join(part for part in (engine, factory, session_type) if part)
+        lines = [
+            "Authoritative backend persistence architecture parsed from the target source "
+            "(ground truth — trust this over any plan, summary, or assumption):",
+        ]
+        if module:
+            lines.append(f"- Database layer is defined in {module}.")
+        if arch["is_async"] is False:
+            lines.append(
+                "- The persistence stack is SYNCHRONOUS SQLAlchemy"
+                + (f" ({signature})." if signature else ".")
+            )
+            if dependency:
+                lines.append(
+                    f"- Services, routers, and repositories receive a session by dependency injection "
+                    f"(e.g. FastAPI `Depends({dependency})`) or as a passed-in `{session_type or 'Session'}` "
+                    "parameter. They MUST use that injected session and MUST NOT construct their own"
+                    + (f" `{factory}()`." if factory else " session.")
+                )
+            elif factory:
+                lines.append(
+                    f"- Services receive a passed-in session and MUST NOT construct their own `{factory}()`."
+                )
+            lines.append(
+                "- Use the synchronous ORM API directly (for example "
+                "`db.query(Model).filter(...).first()/.all()`, `db.add(obj)`, `db.commit()`)."
+            )
+            lines.append(
+                "- Do NOT introduce asynchronous database access: no `async def` methods that touch the "
+                "database, no `await` on database calls, and no `AsyncSession`, `create_async_engine`, "
+                "`async_sessionmaker`, or `asyncio.to_thread(...)` wrappers around synchronous DB calls."
+            )
+            lines.append(
+                "- Contracts, method signatures, and tests MUST match this synchronous model. Do NOT "
+                'require "all database operations to be asynchronous" or forbid "synchronous database '
+                'calls" on this stack.'
+            )
+        else:
+            lines.append(
+                "- The persistence stack is ASYNCHRONOUS SQLAlchemy"
+                + (f" ({signature})." if signature else ".")
+            )
+            if dependency:
+                lines.append(
+                    f"- Services and routers receive an `{session_type or 'AsyncSession'}` by dependency "
+                    f"injection (e.g. FastAPI `Depends({dependency})`) or as a passed-in parameter. They "
+                    "MUST use that injected session and MUST NOT construct their own."
+                )
+            lines.append(
+                "- Use the asynchronous API (`await session.execute(select(...))`, `await session.commit()`); "
+                "database-touching service methods are `async def` and must be awaited."
+            )
+            lines.append(
+                "- Contracts, method signatures, and tests MUST match this asynchronous model. Do NOT "
+                "require synchronous blocking `db.query(...)` calls on this asynchronous stack."
+            )
+        return "\n".join(lines)
+
+    def _contract_demands_async_db(self, item: dict[str, Any]) -> str:
+        """Reason string when a contract demands async DB on a synchronous stack (else '').
+
+        Gives the contract-repair loop teeth so a task-designer contract that requires
+        asynchronous database operations on a synchronous SQLAlchemy codebase is rejected and
+        regenerated, instead of producing an implementation QA can never accept.
+        """
+        arch = self._extract_db_architecture()
+        if not arch.get("found") or arch.get("is_async") is not False:
+            return ""
+        must_contain = [str(value) for value in (item.get("must_contain") or [])]
+        prose: list[str] = []
+        for key in ("integration", "forbidden", "must_test", "task_designer_notes", "notes"):
+            prose.extend(str(value) for value in (item.get(key) or []))
+        haystack = "\n".join(must_contain + prose).lower()
+
+        explicit_patterns = (
+            r"all\s+(?:database|db)\s+operations?\s+(?:must|should|are|be)\b[^\n]*async",
+            r"(?:database|db)\s+operations?\s+(?:must|should)\s+be\s+async",
+            r"async(?:hronous|/await|\s*/\s*await)?\s+(?:pattern\s+)?(?:for\s+)?(?:all\s+)?(?:database|db|persistence)\b",
+            r"asynchronous\s+(?:database|db|persistence|sqlalchemy|metric)",
+            r"synchronous\s+blocking\s+database",
+            r"asyncio\.to_thread",
+        )
+        for pattern in explicit_patterns:
+            if re.search(pattern, haystack):
+                return (
+                    "contract requires asynchronous database access, but the target persistence stack is "
+                    "synchronous SQLAlchemy"
+                    + (f" ({arch.get('engine_call')}/{arch.get('session_factory')})" if arch.get("session_factory") else "")
+                    + "; make database-touching methods synchronous (def, not async def) and use the "
+                    "injected synchronous session with the ORM query API"
+                )
+
+        imports = [str(value).lower() for value in (item.get("must_import") or [])]
+        factory = (arch.get("session_factory") or "").lower()
+        references_sync_session = any(
+            "sqlalchemy.orm import session" in imp or "sessionlocal" in imp or (factory and factory in imp)
+            for imp in imports
+        )
+        has_async_def = any(re.search(r"\basync\s+def\b", value) for value in must_contain)
+        if has_async_def and references_sync_session:
+            return (
+                "contract declares async def methods while importing the synchronous SQLAlchemy Session; "
+                "the target stack is synchronous — database-touching methods must be synchronous (def, not "
+                "async def) and use the injected session"
+            )
+        return ""
 
     def _configured_alembic_down_revision(self) -> str:
         implementation = self.config.get("phases", {}).get("implementation", {})
@@ -7756,6 +8122,12 @@ class WorkflowOrchestrator:
                         f"but the in-scope migration(s) only create {sorted(migration_tables)}; "
                         f"remove the migration test for '{table}' (and drop the model if it has no migration)"
                     )
+
+        # Ground the concurrency model in reality: a contract must not require asynchronous DB
+        # operations on a synchronous SQLAlchemy stack (QA can never accept such an implementation).
+        async_db_reason = self._contract_demands_async_db(item)
+        if async_db_reason:
+            errors.append(f"{task_id}:{async_db_reason}")
 
         return errors
 
