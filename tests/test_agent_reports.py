@@ -2744,6 +2744,13 @@ def test_developer_failed_write_gets_repair_turn_with_validator_error(monkeypatc
         [{"agent_name": "product-manager", "handoff_summary": "agent: product-manager\nfindings:\n- implement monitoring\nrisks:\n- none\ndecisions:\n- backend only\nrecommended_next_tasks:\n- edit monitoring file"}],
     )
 
+    # Project declares its editable surface (the engine no longer assumes any project's
+    # layout): monitoring.py is allowed, so the write to not_allowed.py is out-of-scope.
+    orchestrator.implementation_scope_policy["allowed_paths"] = [
+        "gateway-v4/app/services/monitoring.py",
+        "README.md",
+        "tests/*",
+    ]
     responses = [
         {"choices": [{"message": {"content": '{"tool":"read_file","path":"gateway-v4/app/services/monitoring.py"}'}}], "model": "anthropic/claude-sonnet-4.6"},
         {"choices": [{"message": {"content": '{"tool":"read_file","path":"README.md"}'}}], "model": "anthropic/claude-sonnet-4.6"},
@@ -2912,6 +2919,10 @@ def test_developer_write_forbidden_path_is_blocked(tmp_path: Path) -> None:
         engine_root=str(engine_root),
         launch_cwd=str(target_workspace),
     )
+
+    # The project declares frontend off-limits (no longer a universal engine default), so the
+    # per-project forbidden declaration is what blocks the write.
+    orchestrator.implementation_scope_policy["forbidden_paths"].append("frontend/*")
 
     result = orchestrator._execute_direct_api_retrieval_request(
         {"tool": "write_file", "path": "frontend/src/App.jsx", "content": "changed"},

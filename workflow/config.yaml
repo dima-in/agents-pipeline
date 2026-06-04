@@ -4,45 +4,17 @@ workflow:
   console_language: ru
   auto_continue_delay: 3
   max_phase_cost_usd:
-  default_implementation_scope: "Implement backend-only MVP provider performance monitoring and smart routing foundation. No marketplace, no Stripe changes, no frontend changes except API client stubs if required."
-  implementation_scope_policy:
-    allowed_paths:
-      - gateway-v4/app/services/monitoring.py
-      - gateway-v4/app/services/routing.py
-      - gateway-v4/app/services/proxy.py
-      - gateway-v4/app/routers/chat.py
-      - gateway-v4/app/routers/admin.py
-      - gateway-v4/app/models.py
-      - gateway-v4/app/database.py
-      - gateway-v4/alembic/versions/*
-      - gateway-v4/tests/*
-      - tests/*
-      - docs/*
-      - README.md
-      - gateway-v4/README.md
-    forbidden_paths:
-      - frontend/*
-      - gateway-v4/app/routers/billing.py
-      - gateway-v4/app/routers/auth.py
-      - gateway-v4/app/services/auth.py
-      - gateway-v4/app/services/billing.py
-      - gateway-v4/app/services/marketplace.py
-      - .github/*
-      - docker-compose.yml
-      - docker-compose.prod.yml
-      - gateway-v4/docker-compose.yml
-      - gateway-v4/docker-compose.prod.yml
-      - gateway-v4/Dockerfile
-      - gateway-v4/Dockerfile.prod
-    forbidden_keywords:
-      - stripe
-      - billing
-      - subscription
-      - payment
-      - checkout
-      - marketplace
-    max_changed_files: 8
-    max_diff_lines: 500
+  default_implementation_scope: "Implement one small, safe, backend-first improvement that fits the target repository's existing architecture and conventions."
+  # Scope policy is project-agnostic by default (see _default_implementation_scope_policy):
+  # only universal infra files are forbidden globally; sensitive files (billing/auth/payment/
+  # marketplace/...) are derived per-target from forbidden_keywords against the repo_map; and
+  # each project declares its own allowed/forbidden paths in its per-project settings.yaml.
+  # Uncomment and edit implementation_scope_policy below ONLY for a machine-wide override
+  # that should apply to every target repository.
+  # implementation_scope_policy:
+  #   forbidden_keywords: [stripe, billing, subscription, payment, checkout, marketplace]
+  #   max_changed_files: 8
+  #   max_diff_lines: 500
   require_registry_preflight: false
   require_model_list_preflight: false
   phase_order:

@@ -2489,57 +2489,93 @@ class WorkflowOrchestrator:
 
     @staticmethod
     def _default_implementation_scope_policy() -> dict[str, Any]:
+        # Project-agnostic defaults. No repository-specific paths live in the engine:
+        # concrete sensitive files (billing/auth/payment/...) are derived per-target from
+        # forbidden_keywords against the repo_map, and a project may declare its own policy
+        # in its per-project settings.yaml. Only universal infra files are forbidden here.
+        # fnmatch '*' spans '/', so each "X" + "*/X" pair covers root and any nested depth.
         return {
-            "allowed_paths": [
-                "gateway-v4/app/services/monitoring.py",
-                "gateway-v4/app/services/routing.py",
-                "gateway-v4/app/services/proxy.py",
-                "gateway-v4/app/routers/chat.py",
-                "gateway-v4/app/routers/admin.py",
-                "gateway-v4/app/models.py",
-                "gateway-v4/app/database.py",
-                "gateway-v4/alembic/versions/*",
-                "gateway-v4/tests/*",
-                "tests/*",
-                "docs/*",
-                "README.md",
-                "gateway-v4/README.md",
-            ],
+            "allowed_paths": [],
             "forbidden_paths": [
-                "frontend/*",
-                "gateway-v4/app/routers/billing.py",
-                "gateway-v4/app/routers/auth.py",
-                "gateway-v4/app/services/auth.py",
-                "gateway-v4/app/services/billing.py",
-                "gateway-v4/app/services/marketplace.py",
                 ".github/*",
-                "docker-compose.yml",
-                "docker-compose.prod.yml",
-                "gateway-v4/docker-compose.yml",
-                "gateway-v4/docker-compose.prod.yml",
-                "gateway-v4/Dockerfile",
-                "gateway-v4/Dockerfile.prod",
+                "*/.github/*",
+                "Dockerfile",
+                "*/Dockerfile",
+                "Dockerfile.*",
+                "*/Dockerfile.*",
+                "docker-compose*.yml",
+                "*/docker-compose*.yml",
+                "docker-compose*.yaml",
+                "*/docker-compose*.yaml",
             ],
             "forbidden_keywords": ["stripe", "billing", "subscription", "payment", "checkout", "marketplace"],
             "max_changed_files": 8,
-            "max_diff_lines": 320,
+            "max_diff_lines": 500,
         }
 
     def _get_implementation_scope_policy(self) -> dict[str, Any]:
         base = self._default_implementation_scope_policy()
-        overrides = self.config.get("workflow", {}).get("implementation_scope_policy", {}) or {}
-        for key in ("allowed_paths", "forbidden_paths", "forbidden_keywords"):
-            value = overrides.get(key)
-            if isinstance(value, list) and value:
-                base[key] = [str(item).replace("\\", "/").strip() for item in value if str(item).strip()]
-        for key in ("max_changed_files", "max_diff_lines"):
-            value = overrides.get(key)
-            if value is not None:
-                try:
-                    base[key] = int(value)
-                except (TypeError, ValueError):
-                    pass
+        # Global operator config first, then the per-project declaration wins. The engine
+        # stays project-agnostic; each project carries its own truth in its settings.yaml.
+        override_sources = [
+            self.config.get("workflow", {}).get("implementation_scope_policy", {}) or {},
+            (getattr(self, "project_settings", {}) or {}).get("implementation_scope_policy", {}) or {},
+        ]
+        for overrides in override_sources:
+            if not isinstance(overrides, dict):
+                continue
+            # allowed_paths: the project defines its own editable surface -> replace.
+            allowed = overrides.get("allowed_paths")
+            if isinstance(allowed, list) and allowed:
+                base["allowed_paths"] = [str(item).replace("\\", "/").strip() for item in allowed if str(item).strip()]
+            # forbidden_paths / forbidden_keywords are a safety fence: a project may ADD to it
+            # but must never drop the universal infra/keyword protections -> union.
+            for key in ("forbidden_paths", "forbidden_keywords"):
+                value = overrides.get(key)
+                if isinstance(value, list) and value:
+                    additions = [str(item).replace("\\", "/").strip() for item in value if str(item).strip()]
+                    base[key] = list(dict.fromkeys(list(base[key]) + additions))
+            for key in ("max_changed_files", "max_diff_lines"):
+                value = overrides.get(key)
+                if value is not None:
+                    try:
+                        base[key] = int(value)
+                    except (TypeError, ValueError):
+                        pass
         return base
+
+    def _derive_forbidden_paths_from_repo_map(self) -> list[str]:
+        """Concrete forbidden file paths inferred from forbidden_keywords against the repo_map.
+
+        Universal protection: on any target, files whose path contains a sensitive keyword
+        (billing, payment, marketplace, ...) are auto-forbidden without per-project config,
+        so the engine protects the right files on a repo it has never seen.
+        """
+        policy = getattr(self, "implementation_scope_policy", None) or {}
+        keywords = [str(k).lower() for k in (policy.get("forbidden_keywords") or []) if str(k).strip()]
+        if not keywords:
+            return []
+        if getattr(self, "_repo_map_cache", None) is None and not getattr(self, "repo_map_path", None):
+            return []
+        try:
+            repo_map = self._load_repo_map()
+        except Exception:
+            return []
+        derived: list[str] = []
+        for entry in repo_map.get("files") or []:
+            path = str(entry.get("path") or "").strip()
+            if not path:
+                continue
+            if any(keyword in path.lower() for keyword in keywords):
+                normalized = self._normalize_repo_relative_path(path)
+                if normalized:
+                    derived.append(normalized)
+        return sorted(dict.fromkeys(derived))
+
+    def _effective_forbidden_paths(self) -> list[str]:
+        """Declared forbidden patterns plus the ones derived from the target's repo_map."""
+        declared = list((getattr(self, "implementation_scope_policy", None) or {}).get("forbidden_paths") or [])
+        return list(dict.fromkeys(declared + self._derive_forbidden_paths_from_repo_map()))
 
     def _get_agent_report_extras(self, phase: str, agent_name: str) -> dict[str, Any]:
         return dict(self._agent_report_extras.get((phase, agent_name), {}))
@@ -4934,15 +4970,20 @@ class WorkflowOrchestrator:
         allowed_patterns = list(self.implementation_scope_policy["allowed_paths"])
         if self._selected_implementation_item and self._selected_implementation_item.get("allowed_paths"):
             allowed_patterns = list(self._selected_implementation_item["allowed_paths"])
+        effective_forbidden = self._effective_forbidden_paths()
+        # An empty allow-list means "no explicit allow constraint" (only the forbidden fence
+        # applies), not "forbid everything". Real runs always carry the selected task's
+        # allowed_paths; this keeps a project that declares no global allow-list workable.
+        enforce_allowlist = bool(allowed_patterns)
         allowed_paths_matched: list[str] = []
         forbidden_hits: list[str] = []
         violations: list[str] = []
         for path in normalized_paths:
-            if self._path_matches_any(path, self.implementation_scope_policy["forbidden_paths"]):
+            if self._path_matches_any(path, effective_forbidden):
                 forbidden_hits.append(f"path:{path}")
                 violations.append(path)
                 continue
-            if self._path_matches_any(path, allowed_patterns):
+            if not enforce_allowlist or self._path_matches_any(path, allowed_patterns):
                 allowed_paths_matched.append(path)
                 continue
             forbidden_hits.append(f"out_of_scope:{path}")
@@ -6533,13 +6574,16 @@ class WorkflowOrchestrator:
                 "Prefer status/resume/doctor/repo-map/validation improvements. "
                 "Do not implement provider marketplace, billing, frontend, or unrelated AI Gateway features."
             )
+        project_scope = str((getattr(self, "project_settings", {}) or {}).get("default_implementation_scope") or "").strip()
+        if project_scope:
+            return project_scope
         return str(
             self.config.get("workflow", {}).get(
                 "default_implementation_scope",
-                "Implement backend-only MVP provider performance monitoring and smart routing foundation. "
-                "No marketplace, no Stripe changes, no frontend changes except API client stubs if required.",
+                "Implement one small, safe, backend-first improvement that fits the target "
+                "repository's existing architecture and conventions.",
             )
-        )
+        ).strip()
 
     def _should_regenerate_implementation_backlog(self) -> bool:
         implementation_config = self.config.get("phases", {}).get("implementation", {})

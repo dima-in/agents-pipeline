@@ -989,3 +989,72 @@ def test_contract_demands_async_db_noop_when_stack_unknown(tmp_path) -> None:
     }
 
     assert orchestrator._contract_demands_async_db(bad_contract) == ""
+
+
+def test_default_scope_policy_is_project_agnostic() -> None:
+    # The engine default must name no project. Only universal infra is fenced; sensitive
+    # files come from keyword-derivation; a project declares its own paths.
+    policy = WorkflowOrchestrator._default_implementation_scope_policy()
+    assert "gateway-v4" not in repr(policy)
+    assert policy["allowed_paths"] == []
+    assert any("Dockerfile" in pattern for pattern in policy["forbidden_paths"])
+    assert "billing" in policy["forbidden_keywords"]
+
+
+def test_scope_policy_per_project_override_wins_and_unions_forbidden(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator.config = {"workflow": {}}
+    orchestrator.project_settings = {
+        "implementation_scope_policy": {
+            "allowed_paths": ["app/models.py"],
+            "forbidden_paths": ["frontend/*"],
+        }
+    }
+
+    policy = orchestrator._get_implementation_scope_policy()
+
+    # Project defines its editable surface -> replace.
+    assert policy["allowed_paths"] == ["app/models.py"]
+    # Project ADDS to the safety fence; the universal infra forbid stays (union).
+    assert "frontend/*" in policy["forbidden_paths"]
+    assert any("Dockerfile" in pattern for pattern in policy["forbidden_paths"])
+
+
+def test_forbidden_paths_derived_from_repo_map_keywords(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator.implementation_scope_policy = {
+        "forbidden_paths": ["Dockerfile"],
+        "forbidden_keywords": ["billing", "payment", "marketplace"],
+    }
+    orchestrator._repo_map_cache = {
+        "files": [
+            {"path": "gateway-v4/app/routers/billing.py"},
+            {"path": "app/services/payment_gateway.py"},
+            {"path": "app/models.py"},
+        ]
+    }
+
+    effective = orchestrator._effective_forbidden_paths()
+
+    assert "Dockerfile" in effective  # declared kept
+    assert "gateway-v4/app/routers/billing.py" in effective  # derived from 'billing'
+    assert "app/services/payment_gateway.py" in effective  # derived from 'payment'
+    assert "app/models.py" not in effective  # no sensitive keyword -> editable
+
+
+def test_getaway_protection_now_comes_from_project_settings(tmp_path) -> None:
+    # Regression: getaway's exact protections survive, but declared by the project, not baked
+    # into the engine. Same mechanism would carry any other project's truth.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator.config = {"workflow": {}}
+    orchestrator.project_settings = {
+        "implementation_scope_policy": {
+            "allowed_paths": ["gateway-v4/app/models.py", "gateway-v4/app/database.py"],
+            "forbidden_paths": ["gateway-v4/app/services/auth.py", "frontend/*"],
+        }
+    }
+
+    policy = orchestrator._get_implementation_scope_policy()
+
+    assert policy["allowed_paths"] == ["gateway-v4/app/models.py", "gateway-v4/app/database.py"]
+    assert "gateway-v4/app/services/auth.py" in policy["forbidden_paths"]
