@@ -545,6 +545,8 @@ class WorkflowOrchestrator:
                     had_failures = True
                     if fail_fast:
                         return False
+            if phase_key == "implementation" and agent["name"] == "architect":
+                self._capture_target_architecture_from_architect()
             if phase_key == "implementation" and agent["name"] == "implementation-planner":
                 if not self._validate_or_repair_implementation_planner(agent, phase_key, index=index, total=total):
                     had_failures = True
@@ -6544,6 +6546,13 @@ class WorkflowOrchestrator:
         if cached is not None and cached.get("repo_map_digest") == digest:
             return cached
 
+        # Preserve a previously captured Target (intended end-state) across rebuilds and runs.
+        existing_target = (cached or {}).get("target_architecture")
+        if existing_target is None:
+            persisted = self._load_persisted_architecture_profile()
+            if persisted:
+                existing_target = persisted.get("target_architecture")
+
         arch = self._extract_db_architecture()
         roots = self._detect_project_roots()
         languages = self._detect_repo_languages()
@@ -6594,7 +6603,7 @@ class WorkflowOrchestrator:
                 "forbidden_paths": list(policy.get("forbidden_paths") or []),
                 "forbidden_keywords": list(policy.get("forbidden_keywords") or []),
             },
-            "target_architecture": None,  # reserved: the architect's intended end-state (Target Profile)
+            "target_architecture": existing_target,  # the architect's intended end-state (Target Profile)
             "open_questions": open_questions,
         }
         self._architecture_profile_cache = profile
@@ -6639,6 +6648,13 @@ class WorkflowOrchestrator:
             )
         if profile["open_questions"]:
             lines.append("- Confirm before relying: " + "; ".join(profile["open_questions"]))
+        target = profile.get("target_architecture")
+        if isinstance(target, dict) and str(target.get("summary") or "").strip():
+            lines.append("")
+            lines.append("Target architecture — intended END-STATE (build toward this; it MUST fit the CURRENT facts above):")
+            lines.append(str(target["summary"])[:1500])
+            if not target.get("fits_current", True) and target.get("consistency_note"):
+                lines.append(f"- WARNING: {target['consistency_note']}")
         return "\n".join(lines)
 
     def _architecture_profile_has_gaps(self, profile: dict[str, Any] | None = None) -> bool:
@@ -6730,6 +6746,45 @@ class WorkflowOrchestrator:
             path.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as exc:
             self.logger.warning(f"Не удалось сохранить профиль архитектуры: {exc}")
+
+    def _load_persisted_architecture_profile(self) -> dict[str, Any] | None:
+        try:
+            path = self.project_state_dir / "context" / "architecture_profile.json"
+            if path.exists():
+                return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        return None
+
+    def _capture_target_architecture_from_architect(self) -> None:
+        """Capture the architect's intended end-state (Target Profile) and check it is reachable
+        from the CURRENT facts — the design-level guard against, e.g., an async-DB target on a
+        synchronous stack (the original TASK-002 failure caught one step earlier)."""
+        try:
+            report = self._load_saved_agent_report("implementation", "architect")
+            text = str((report or {}).get("parsed_output") or "").strip()
+            if not text:
+                return
+            profile = self._build_architecture_profile()
+            concurrency = (profile.get("persistence") or {}).get("concurrency") or {}
+            fits_current = True
+            consistency_note = ""
+            if concurrency.get("confidence") == "verified" and concurrency.get("value") == "sync":
+                if re.search(r"async(?:hronous)?[\s/]*\b(?:db|database)|asynchronous\s+(?:database|persistence)|asyncio\.to_thread", text.lower()):
+                    fits_current = False
+                    consistency_note = "Target предлагает асинхронную БД на синхронном стеке — согласуй до планирования."
+            profile["target_architecture"] = {
+                "summary": text[:4000],
+                "source": "architect",
+                "fits_current": fits_current,
+                "consistency_note": consistency_note,
+            }
+            self._architecture_profile_cache = profile
+            self._persist_architecture_profile(profile)
+            if consistency_note:
+                self.logger.warning(consistency_note)
+        except Exception:
+            return
 
     def _run_codebase_profiler_step(self, agent: dict[str, Any], *, index: int, total: int) -> None:
         """Run the profiler agent only when the deterministic profile has gaps AND there is a

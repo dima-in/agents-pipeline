@@ -1245,3 +1245,46 @@ def test_codebase_profiler_step_runs_and_merges_on_gaps(tmp_path) -> None:
     text = (tmp_path / "state" / "context" / "architecture_profile.json").read_text(encoding="utf-8")
     assert '"value": "raw_dbapi"' in text
     assert '"confidence": "inferred"' in text  # agent fills as inferred, never verified
+
+
+def _sync_stack_orchestrator(tmp_path):
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    _write_sync_db_stack(tmp_path)
+    (tmp_path / "gateway-v4" / "requirements.txt").write_text("sqlalchemy\n", encoding="utf-8")
+    orchestrator._repo_map_cache = {"files": [{"path": "gateway-v4/app/database.py"}, {"path": "gateway-v4/requirements.txt"}]}
+    orchestrator.implementation_scope_policy = {"forbidden_paths": [], "forbidden_keywords": []}
+    orchestrator.project_state_dir = tmp_path / "state"
+    return orchestrator
+
+
+def test_target_architecture_flags_async_on_sync(tmp_path) -> None:
+    orchestrator = _sync_stack_orchestrator(tmp_path)
+    warnings: list[str] = []
+    orchestrator.logger = types.SimpleNamespace(info=lambda *a, **k: None, warning=lambda m, *a, **k: warnings.append(m))
+    orchestrator._load_saved_agent_report = lambda phase, name, run_dir=None: {
+        "parsed_output": "## Target architecture\nAdd asynchronous database operations to the monitor service."
+    }
+
+    orchestrator._capture_target_architecture_from_architect()
+
+    target = orchestrator._build_architecture_profile()["target_architecture"]
+    assert target and target["fits_current"] is False  # async target on a verified-sync stack
+    assert warnings  # the design-level guard warned
+    note = orchestrator._render_architecture_profile_note()
+    assert "Target architecture" in note and "WARNING" in note
+
+
+def test_target_architecture_compatible_is_carried(tmp_path) -> None:
+    orchestrator = _sync_stack_orchestrator(tmp_path)
+    orchestrator.logger = types.SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None)
+    orchestrator._load_saved_agent_report = lambda phase, name, run_dir=None: {
+        "parsed_output": "## Target architecture\nPerformanceMonitor service uses the injected synchronous db session."
+    }
+
+    orchestrator._capture_target_architecture_from_architect()
+
+    assert orchestrator._build_architecture_profile()["target_architecture"]["fits_current"] is True
+    # Persisted -> survives a fresh rebuild (carried across runs).
+    orchestrator._architecture_profile_cache = None
+    reloaded = orchestrator._build_architecture_profile()["target_architecture"]
+    assert reloaded and "PerformanceMonitor" in reloaded["summary"]
