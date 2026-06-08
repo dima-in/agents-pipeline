@@ -1058,3 +1058,49 @@ def test_getaway_protection_now_comes_from_project_settings(tmp_path) -> None:
 
     assert policy["allowed_paths"] == ["gateway-v4/app/models.py", "gateway-v4/app/database.py"]
     assert "gateway-v4/app/services/auth.py" in policy["forbidden_paths"]
+
+
+def test_architecture_profile_verified_for_sync_sqlalchemy(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    _write_sync_db_stack(tmp_path)  # gateway-v4/app/database.py, sync SQLAlchemy
+    (tmp_path / "gateway-v4" / "requirements.txt").write_text("fastapi\nsqlalchemy\n", encoding="utf-8")
+    orchestrator._repo_map_cache = {
+        "files": [
+            {"path": "gateway-v4/app/database.py"},
+            {"path": "gateway-v4/requirements.txt"},
+            {"path": "gateway-v4/alembic/versions/0006_x.py"},
+            {"path": "gateway-v4/tests/test_x.py"},
+        ]
+    }
+    orchestrator.implementation_scope_policy = {"forbidden_paths": ["frontend/*"], "forbidden_keywords": ["billing"]}
+
+    profile = orchestrator._build_architecture_profile()
+
+    assert profile["persistence"]["concurrency"]["value"] == "sync"
+    assert profile["persistence"]["concurrency"]["confidence"] == "verified"
+    assert profile["persistence"]["session_dependency"]["value"] == "get_db"
+    assert profile["persistence"]["migrations"]["value"]["tool"] == "alembic"
+    assert "python" in profile["language"]["value"]
+    assert profile["layout"]["tests_root"]["value"] == "gateway-v4/tests"
+    assert profile["target_architecture"] is None  # reserved for the architect
+    # Rendered note surfaces the injected-session rule.
+    note = orchestrator._render_architecture_profile_note()
+    assert "get_db" in note and "sync" in note
+
+
+def test_architecture_profile_unknown_persistence_for_raw_dbapi(tmp_path) -> None:
+    # Oil-like: raw mysql-connector, no SQLAlchemy -> the deterministic detector can't tell,
+    # so persistence is left unknown for a profiler agent to fill (as inferred) later.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    (tmp_path / "requirements.txt").write_text("fastapi\nmysql-connector-python\n", encoding="utf-8")
+    (tmp_path / "Database.py").write_text("import mysql.connector\n\ndef q(cur):\n    cur.execute('SELECT 1')\n", encoding="utf-8")
+    orchestrator._repo_map_cache = {"files": [{"path": "requirements.txt"}, {"path": "Database.py"}]}
+    orchestrator.implementation_scope_policy = {"forbidden_paths": [], "forbidden_keywords": []}
+
+    profile = orchestrator._build_architecture_profile()
+
+    assert profile["persistence"]["concurrency"]["confidence"] == "unknown"
+    assert profile["persistence"]["migrations"]["value"]["tool"] == "none"
+    assert "python" in profile["language"]["value"]
+    assert any("profiler agent" in question for question in profile["open_questions"])
+    assert any("test harness" in question for question in profile["open_questions"])

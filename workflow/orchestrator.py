@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import http.client
 import json
 import os
@@ -182,6 +183,7 @@ class WorkflowOrchestrator:
         self._repo_map_cache: dict[str, Any] | None = None
         self._db_architecture_cache: dict[str, Any] | None = None
         self._project_roots_cache: list[str] | None = None
+        self._architecture_profile_cache: dict[str, Any] | None = None
         self._repo_map_before: dict[str, Any] | None = None
         self._repo_map_after: dict[str, Any] | None = None
         self._repo_map_delta: dict[str, list[str]] = {
@@ -6339,6 +6341,161 @@ class WorkflowOrchestrator:
                 "- Contracts, method signatures, and tests MUST match this asynchronous model. Do NOT "
                 "require synchronous blocking `db.query(...)` calls on this asynchronous stack."
             )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _fact(value: Any, confidence: str, source: str = "") -> dict[str, Any]:
+        """One profile fact with its trust level. confidence in {verified, inferred, unknown}.
+
+        verified = a deterministic detector confirmed it; inferred = an agent guessed it (no
+        detector); unknown = could not be determined. Downstream guardrails hard-block only on
+        verified facts and soft-warn on inferred ones.
+        """
+        return {"value": value, "confidence": confidence, "source": source}
+
+    def _repo_map_digest(self) -> str:
+        paths = sorted(str(entry.get("path") or "") for entry in (self._load_repo_map().get("files") or []))
+        return hashlib.sha1("\n".join(paths).encode("utf-8", "replace")).hexdigest()[:16]
+
+    def _safe_repo_map_digest(self) -> str:
+        try:
+            return self._repo_map_digest()
+        except Exception:
+            return ""
+
+    def _detect_repo_languages(self) -> list[str]:
+        workspace = Path(getattr(self, "target_workspace", ".") or ".")
+        checks = (
+            ("python", ("requirements.txt", "pyproject.toml", "setup.py", "setup.cfg")),
+            ("javascript", ("package.json",)),
+            ("go", ("go.mod",)),
+            ("rust", ("Cargo.toml",)),
+            ("java", ("pom.xml", "build.gradle")),
+            ("ruby", ("Gemfile",)),
+            ("php", ("composer.json",)),
+        )
+        languages: list[str] = []
+        for language, manifests in checks:
+            for root in self._detect_project_roots():
+                if any((workspace / (f"{root}/{m}" if root else m)).exists() for m in manifests):
+                    languages.append(language)
+                    break
+        return list(dict.fromkeys(languages))
+
+    def _detect_repo_migration_tool(self) -> tuple[str, str]:
+        for entry in (self._load_repo_map().get("files") or []):
+            path = str(entry.get("path") or "").replace("\\", "/")
+            if "alembic/versions/" in path:
+                prefix = path.split("alembic/versions/")[0].rstrip("/")
+                return "alembic", (f"{prefix}/alembic" if prefix else "alembic")
+        return "none", ""
+
+    def _detect_tests_root(self) -> str:
+        candidates: list[str] = []
+        for entry in (self._load_repo_map().get("files") or []):
+            parts = str(entry.get("path") or "").replace("\\", "/").split("/")
+            for index, part in enumerate(parts[:-1]):
+                if part in ("tests", "test", "__tests__"):
+                    candidates.append("/".join(parts[: index + 1]))
+                    break
+        return sorted(candidates, key=len)[0] if candidates else ""
+
+    def _build_architecture_profile(self) -> dict[str, Any]:
+        """Structured, confidence-tagged profile of the target's CURRENT architecture.
+
+        Deterministic-first: every field is filled from existing detectors (marked verified)
+        where a detector exists; gaps are left explicit (unknown) for a profiler agent to fill
+        in later (as inferred). No project name is hardcoded — facts come from whatever repo is
+        targeted. `target_architecture` is reserved for the architect's intended end-state.
+        """
+        digest = self._safe_repo_map_digest()
+        cached = getattr(self, "_architecture_profile_cache", None)
+        if cached is not None and cached.get("repo_map_digest") == digest:
+            return cached
+
+        arch = self._extract_db_architecture()
+        roots = self._detect_project_roots()
+        languages = self._detect_repo_languages()
+        migration_tool, migration_location = self._detect_repo_migration_tool()
+        tests_root = self._detect_tests_root()
+        policy = getattr(self, "implementation_scope_policy", None) or {}
+
+        if arch.get("found") and arch.get("is_async") is not None:
+            db_module = arch.get("db_module") or ""
+            concurrency = self._fact("async" if arch["is_async"] else "sync", "verified", db_module)
+            access = self._fact(
+                "sqlalchemy_core" if arch.get("query_style") == "select_execute" else "sqlalchemy_orm",
+                "verified",
+                db_module,
+            )
+            dependency = arch.get("session_dependency")
+            session = self._fact(dependency or None, "verified" if dependency else "unknown", db_module)
+        else:
+            concurrency = self._fact(None, "unknown", "no SQLAlchemy stack detected")
+            access = self._fact(None, "unknown", "")
+            session = self._fact(None, "unknown", "")
+
+        open_questions: list[str] = []
+        if concurrency["confidence"] == "unknown":
+            open_questions.append("DB concurrency/access not auto-detected; a profiler agent must read the data layer.")
+        if not tests_root:
+            open_questions.append("No tests directory detected; a backend task may need to scaffold the test harness.")
+
+        profile = {
+            "schema_version": 1,
+            "repo_map_digest": digest,
+            "language": self._fact(languages, "verified" if languages else "unknown", "build manifests"),
+            "persistence": {
+                "concurrency": concurrency,
+                "access": access,
+                "session_dependency": session,
+                "migrations": self._fact(
+                    {"tool": migration_tool, "location": migration_location},
+                    "verified" if migration_tool != "none" else "inferred",
+                    migration_location,
+                ),
+            },
+            "layout": {
+                "project_roots": self._fact(roots, "verified", "repo scan"),
+                "tests_root": self._fact(tests_root or None, "verified" if tests_root else "unknown", "repo_map"),
+            },
+            "sensitive_areas": {
+                "forbidden_paths": list(policy.get("forbidden_paths") or []),
+                "forbidden_keywords": list(policy.get("forbidden_keywords") or []),
+            },
+            "target_architecture": None,  # reserved: the architect's intended end-state (Target Profile)
+            "open_questions": open_questions,
+        }
+        self._architecture_profile_cache = profile
+        return profile
+
+    def _render_architecture_profile_note(self) -> str:
+        """Human-readable Project Architecture Profile for injection into agent context."""
+        profile = self._build_architecture_profile()
+        lines = ["Project Architecture Profile — CURRENT codebase (trust verified facts as ground truth):"]
+        languages = profile["language"]["value"]
+        if languages:
+            lines.append(f"- Language(s): {', '.join(languages)} [{profile['language']['confidence']}].")
+        persistence = profile["persistence"]
+        concurrency = persistence["concurrency"]["value"]
+        if concurrency:
+            lines.append(
+                f"- Persistence: {concurrency} [{persistence['concurrency']['confidence']}]"
+                f", access={persistence['access']['value']}."
+            )
+            dependency = persistence["session_dependency"]["value"]
+            if dependency:
+                lines.append(f"- Session is injected via `{dependency}`; use it, do not construct a new session.")
+        else:
+            lines.append("- Persistence: not auto-detected (a profiler agent should read the data layer).")
+        migrations = persistence["migrations"]["value"]
+        lines.append(f"- Migrations: {migrations['tool']}" + (f" @ {migrations['location']}" if migrations["location"] else ""))
+        roots = profile["layout"]["project_roots"]["value"]
+        lines.append("- Project roots: " + ", ".join(root or "(repo root)" for root in roots) + ".")
+        tests_root = profile["layout"]["tests_root"]["value"]
+        lines.append(f"- Tests root: {tests_root or '(none detected)'}.")
+        if profile["open_questions"]:
+            lines.append("- Confirm before relying: " + "; ".join(profile["open_questions"]))
         return "\n".join(lines)
 
     def _contract_demands_async_db(self, item: dict[str, Any]) -> str:
