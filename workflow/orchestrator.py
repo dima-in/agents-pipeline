@@ -6498,6 +6498,57 @@ class WorkflowOrchestrator:
             lines.append("- Confirm before relying: " + "; ".join(profile["open_questions"]))
         return "\n".join(lines)
 
+    def _architecture_profile_has_gaps(self, profile: dict[str, Any] | None = None) -> bool:
+        """True when the deterministic profile left fields unknown — i.e. the profiler agent
+        is worth running. When everything is already verified (e.g. a SQLAlchemy repo), the
+        agent is skipped entirely to save tokens."""
+        profile = profile or self._build_architecture_profile()
+        persistence = profile.get("persistence") or {}
+        for key in ("concurrency", "access", "session_dependency"):
+            if (persistence.get(key) or {}).get("confidence") == "unknown":
+                return True
+        return False
+
+    def _merge_profiler_agent_output(self, profile: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+        """Merge a profiler agent's JSON into the deterministic profile.
+
+        Only fills fields that are unknown/missing; NEVER overrides a verified fact. Anything
+        the agent supplies is marked `inferred` (it read the code, but no detector confirmed it).
+        """
+        if not isinstance(payload, dict):
+            return profile
+
+        def _value_source(raw: Any) -> tuple[Any, str]:
+            if isinstance(raw, dict):
+                return raw.get("value"), str(raw.get("source") or "profiler-agent")
+            return raw, "profiler-agent"
+
+        persistence = profile.setdefault("persistence", {})
+        agent_persistence = payload.get("persistence") or {}
+        if isinstance(agent_persistence, dict):
+            for key in ("concurrency", "access", "session_dependency", "engine", "session_pattern", "models_location"):
+                current = persistence.get(key) or {}
+                if current.get("confidence") == "verified":
+                    continue  # ground truth wins
+                value, source = _value_source(agent_persistence.get(key))
+                if value not in (None, "", []):
+                    persistence[key] = self._fact(value, "inferred", source)
+
+        conventions = payload.get("conventions")
+        if conventions:
+            value, source = _value_source(conventions)
+            if value:
+                profile["conventions"] = self._fact(value, "inferred", source)
+
+        # Drop the now-answered persistence open-question.
+        if (persistence.get("concurrency") or {}).get("value"):
+            profile["open_questions"] = [
+                question for question in (profile.get("open_questions") or [])
+                if "concurrency/access" not in question
+            ]
+        self._architecture_profile_cache = profile
+        return profile
+
     def _contract_demands_async_db(self, item: dict[str, Any]) -> str:
         """Reason string when a contract demands async DB on a synchronous stack (else '').
 

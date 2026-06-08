@@ -1,0 +1,6 @@
+name: codebase-profiler
+phase: implementation
+description: "Profile the target repo's current architecture; fill gaps the deterministic detectors could not"
+timeout: 600
+commands:
+  - echo "Profile codebase architecture"

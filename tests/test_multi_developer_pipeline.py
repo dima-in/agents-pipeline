@@ -1104,3 +1104,56 @@ def test_architecture_profile_unknown_persistence_for_raw_dbapi(tmp_path) -> Non
     assert "python" in profile["language"]["value"]
     assert any("profiler agent" in question for question in profile["open_questions"])
     assert any("test harness" in question for question in profile["open_questions"])
+
+
+def test_profiler_agent_fills_gaps_without_overriding_verified(tmp_path) -> None:
+    # Oil-like repo: deterministic profile leaves persistence unknown -> agent worth running.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    (tmp_path / "requirements.txt").write_text("fastapi\nmysql-connector-python\n", encoding="utf-8")
+    (tmp_path / "Database.py").write_text("import mysql.connector\n", encoding="utf-8")
+    orchestrator._repo_map_cache = {"files": [{"path": "requirements.txt"}, {"path": "Database.py"}]}
+    orchestrator.implementation_scope_policy = {"forbidden_paths": [], "forbidden_keywords": []}
+
+    profile = orchestrator._build_architecture_profile()
+    assert orchestrator._architecture_profile_has_gaps(profile) is True
+
+    merged = orchestrator._merge_profiler_agent_output(
+        profile,
+        {
+            "persistence": {
+                "access": {"value": "raw_dbapi", "source": "cursor.execute in Database.py"},
+                "concurrency": {"value": "sync", "source": "no await on DB calls"},
+                "session_pattern": "UseDatabase context manager",
+            },
+            "conventions": "Flat module layout; FastAPI in main.py; no ORM.",
+        },
+    )
+
+    # Agent-filled gaps are now present but marked inferred (not verified).
+    assert merged["persistence"]["access"]["value"] == "raw_dbapi"
+    assert merged["persistence"]["access"]["confidence"] == "inferred"
+    assert merged["persistence"]["concurrency"]["value"] == "sync"
+    assert merged["persistence"]["concurrency"]["confidence"] == "inferred"
+    assert merged["persistence"]["session_pattern"]["value"] == "UseDatabase context manager"
+    assert merged["conventions"]["confidence"] == "inferred"
+    # The answered open-question is dropped.
+    assert not any("concurrency/access" in question for question in merged["open_questions"])
+
+
+def test_profiler_merge_never_overrides_verified_facts(tmp_path) -> None:
+    # Sync SQLAlchemy repo: concurrency is verified -> a contradicting agent claim is ignored.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    _write_sync_db_stack(tmp_path)
+    (tmp_path / "gateway-v4" / "requirements.txt").write_text("sqlalchemy\n", encoding="utf-8")
+    orchestrator._repo_map_cache = {"files": [{"path": "gateway-v4/app/database.py"}, {"path": "gateway-v4/requirements.txt"}]}
+    orchestrator.implementation_scope_policy = {"forbidden_paths": [], "forbidden_keywords": []}
+
+    profile = orchestrator._build_architecture_profile()
+    assert orchestrator._architecture_profile_has_gaps(profile) is False  # all verified -> skip agent
+
+    merged = orchestrator._merge_profiler_agent_output(
+        profile, {"persistence": {"concurrency": {"value": "async", "source": "hallucinated"}}}
+    )
+    # Verified ground truth is preserved; the agent cannot flip it.
+    assert merged["persistence"]["concurrency"]["value"] == "sync"
+    assert merged["persistence"]["concurrency"]["confidence"] == "verified"
