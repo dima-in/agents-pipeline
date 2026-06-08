@@ -1208,3 +1208,40 @@ def test_agent_result_summary_is_russian(tmp_path) -> None:
     # Unknown/blank cases stay silent (no card).
     orchestrator._selected_implementation_item = {"id": "TASK-009", "contract_source": ""}
     assert orchestrator._build_agent_result_summary("task-designer") == ""
+
+
+def test_codebase_profiler_step_skips_when_no_gaps(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    _write_sync_db_stack(tmp_path)  # verified sync SQLAlchemy -> no gaps
+    (tmp_path / "gateway-v4" / "requirements.txt").write_text("sqlalchemy\n", encoding="utf-8")
+    orchestrator._repo_map_cache = {"files": [{"path": "gateway-v4/app/database.py"}, {"path": "gateway-v4/requirements.txt"}]}
+    orchestrator.implementation_scope_policy = {"forbidden_paths": [], "forbidden_keywords": []}
+    orchestrator.project_state_dir = tmp_path / "state"
+    orchestrator.logger = types.SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None)
+    calls: list[int] = []
+    orchestrator._run_agent = lambda *a, **k: calls.append(1) or True
+
+    orchestrator._run_codebase_profiler_step({"name": "codebase-profiler"}, index=1, total=7)
+
+    assert calls == []  # agent not invoked when there is nothing to fill
+    assert (tmp_path / "state" / "context" / "architecture_profile.json").exists()
+
+
+def test_codebase_profiler_step_runs_and_merges_on_gaps(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    (tmp_path / "requirements.txt").write_text("fastapi\nmysql-connector-python\n", encoding="utf-8")
+    (tmp_path / "Database.py").write_text("import mysql.connector\n", encoding="utf-8")
+    orchestrator._repo_map_cache = {"files": [{"path": "requirements.txt"}, {"path": "Database.py"}]}
+    orchestrator.implementation_scope_policy = {"forbidden_paths": [], "forbidden_keywords": []}
+    orchestrator.project_state_dir = tmp_path / "state"
+    orchestrator.logger = types.SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None)
+    orchestrator._run_agent = lambda *a, **k: True
+    orchestrator._load_saved_agent_report = lambda phase, name, run_dir=None: {
+        "parsed_output": '{"persistence": {"access": {"value": "raw_dbapi", "source": "Database.py"}, "concurrency": {"value": "sync", "source": "no await"}}}'
+    }
+
+    orchestrator._run_codebase_profiler_step({"name": "codebase-profiler"}, index=1, total=7)
+
+    text = (tmp_path / "state" / "context" / "architecture_profile.json").read_text(encoding="utf-8")
+    assert '"value": "raw_dbapi"' in text
+    assert '"confidence": "inferred"' in text  # agent fills as inferred, never verified

@@ -490,6 +490,9 @@ class WorkflowOrchestrator:
             if not self._wait_for_user(f"Запустить агента {agent['name']} ({index}/{total})?"):
                 self.logger.warning(f"Агент пропущен: {agent['name']}")
                 continue
+            if phase_key == "implementation" and agent["name"] == "codebase-profiler":
+                self._run_codebase_profiler_step(agent, index=index, total=total)
+                continue
             if phase_key == "implementation" and agent["name"] in {"implementation-planner", "task-designer", "developer"}:
                 if not self._ensure_repo_map_workspace_consistency(agent["name"]):
                     had_failures = True
@@ -2338,6 +2341,7 @@ class WorkflowOrchestrator:
     @staticmethod
     def _is_implementation_retrieval_enabled(agent_name: str) -> bool:
         return agent_name in {
+            "codebase-profiler",
             "architect",
             "developer",
             "code-developer",
@@ -5648,7 +5652,7 @@ class WorkflowOrchestrator:
         # synchronous SQLAlchemy stack). Placed right after the scope so it is never starved by
         # lower-value sections when the joined context is capped.
         if (
-            agent_name in {"architect", "implementation-planner", "task-designer", "qa", "template-validator"}
+            agent_name in {"codebase-profiler", "architect", "implementation-planner", "task-designer", "qa", "template-validator"}
             or edit_agent
         ):
             architecture_note = self._render_architecture_profile_note()
@@ -6687,6 +6691,64 @@ class WorkflowOrchestrator:
             ]
         self._architecture_profile_cache = profile
         return profile
+
+    def _has_profilable_data_layer(self) -> bool:
+        """True when there is a persistence layer worth profiling (DB-ish files or a DB driver).
+
+        Keeps the profiler agent from running on repos with no data layer at all (and on bare
+        test workspaces), so it is only invoked where it can actually add grounding.
+        """
+        try:
+            db_basenames = {"database.py", "db.py", "models.py", "session.py", "sessions.py"}
+            for entry in (self._load_repo_map().get("files") or []):
+                name = str(entry.get("path") or "").replace("\\", "/").split("/")[-1].lower()
+                if name in db_basenames:
+                    return True
+            drivers = ("sqlalchemy", "psycopg", "asyncpg", "mysql", "mysqlclient", "sqlite", "pymongo", "mongoengine", "tortoise")
+            for manifest in self._project_root_candidates(["requirements.txt", "pyproject.toml"]):
+                text = self._read_target_repo_file(manifest, 4000).lower()
+                if text and any(driver in text for driver in drivers):
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def _parse_profiler_output(self, text: str) -> dict[str, Any]:
+        for candidate in self._planner_payload_candidates(str(text or "")):
+            try:
+                payload = json.loads(candidate)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(payload, dict):
+                return payload
+        return {}
+
+    def _persist_architecture_profile(self, profile: dict[str, Any]) -> None:
+        try:
+            path = self.project_state_dir / "context" / "architecture_profile.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            self.logger.warning(f"Не удалось сохранить профиль архитектуры: {exc}")
+
+    def _run_codebase_profiler_step(self, agent: dict[str, Any], *, index: int, total: int) -> None:
+        """Run the profiler agent only when the deterministic profile has gaps AND there is a
+        data layer to profile. Non-fatal: any failure leaves the verified deterministic profile
+        in place. Fills the unknown fields (as inferred) and persists the profile."""
+        profile = self._build_architecture_profile()
+        if not self._architecture_profile_has_gaps(profile) or not self._has_profilable_data_layer():
+            self.logger.info("Профиль архитектуры достаточен — профайлер кода пропущен.")
+            self._persist_architecture_profile(profile)
+            return
+        if not self._run_agent(agent, "implementation", index=index, total=total):
+            self.logger.warning("Профайлер кода не дал результат; остаюсь на детерминированном профиле.")
+            self._persist_architecture_profile(profile)
+            return
+        report = self._load_saved_agent_report("implementation", "codebase-profiler")
+        payload = self._parse_profiler_output(str((report or {}).get("parsed_output") or ""))
+        if payload:
+            profile = self._merge_profiler_agent_output(profile, payload)
+        self._persist_architecture_profile(profile)
 
     def _contract_demands_async_db(self, item: dict[str, Any]) -> str:
         """Reason string when a contract demands async DB on a synchronous stack (else '').

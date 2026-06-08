@@ -104,6 +104,12 @@ phases:
         model: gpt-5.4
         thinking: medium
     agents:
+      - name: codebase-profiler
+        description: "Profile the target's current architecture; fill gaps the detectors could not"
+        timeout: 600
+        provider: openrouter
+        model: openrouter/anthropic/claude-sonnet-4.5
+        thinking: low
       - name: architect
         description: "Prepare technical plan"
         timeout: 900
