@@ -1,12 +1,10 @@
 project_id: github.com-dima-in-oil
 git_remote: https://github.com/dima-in/Oil
-# Oil = Python/FastAPI oil-orders app: raw MySQL (mysql-connector + UseDatabase/cursor.execute),
-# flat module layout (main.py, Database.py, Catalog.py, ...), no ORM/Alembic, no tests yet.
-# Backend-first; the frontend/ and the local MySQL data dir are off-limits by default.
-default_implementation_scope: "Implement one small, safe, backend-first improvement to the FastAPI oil-orders app that fits its existing raw-MySQL data layer (UseDatabase/cursor.execute) and flat module layout. No frontend changes."
+default_implementation_scope: Implement one small, safe, backend-first improvement
+  to the FastAPI oil-orders app that fits its existing raw-MySQL data layer (UseDatabase/cursor.execute)
+  and flat module layout. No frontend changes.
 implementation_scope_policy:
-  # allowed_paths intentionally omitted: the planner derives the editable surface from repo_map.
-  # forbidden_keywords, universal infra forbids, and limits are inherited from the engine default.
   forbidden_paths:
-    - frontend/*
-    - db_data/*
+  - frontend/*
+  - db_data/*
+completed_implementation_tasks: []

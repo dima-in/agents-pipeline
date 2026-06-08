@@ -3947,7 +3947,7 @@ class WorkflowOrchestrator:
             lines.append(f"По задаче: {task_id}" + (f" — {scope[:80]}" if scope else ""))
         elif scope:
             lines.append(f"Объём: {scope[:110]}")
-        return f"Передача: {predecessor} → {label}", lines
+        return f"Передача: {predecessor} -> {label}", lines
 
     def _build_agent_result_summary(self, agent_name: str) -> str:
         """Short Russian 'what it produced' line for the done card. Best-effort and never raises."""

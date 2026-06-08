@@ -2,40 +2,41 @@ project_id: github.com-dima-in-ai_getaway
 git_remote: https://github.com/dima-in/ai_getaway.git
 completed_implementation_tasks:
 - TASK-001
-# Project-declared scope (moved out of the engine so the engine stays project-agnostic).
-default_implementation_scope: "Implement backend-only MVP provider performance monitoring and smart routing foundation. No marketplace, no Stripe changes, no frontend changes except API client stubs if required."
+default_implementation_scope: Implement backend-only MVP provider performance monitoring
+  and smart routing foundation. No marketplace, no Stripe changes, no frontend changes
+  except API client stubs if required.
 implementation_scope_policy:
   allowed_paths:
-    - gateway-v4/app/services/monitoring.py
-    - gateway-v4/app/services/routing.py
-    - gateway-v4/app/services/proxy.py
-    - gateway-v4/app/routers/chat.py
-    - gateway-v4/app/routers/admin.py
-    - gateway-v4/app/models.py
-    - gateway-v4/app/database.py
-    - gateway-v4/alembic/versions/*
-    - gateway-v4/tests/*
-    - tests/*
-    - docs/*
-    - README.md
-    - gateway-v4/README.md
+  - gateway-v4/app/services/monitoring.py
+  - gateway-v4/app/services/routing.py
+  - gateway-v4/app/services/proxy.py
+  - gateway-v4/app/routers/chat.py
+  - gateway-v4/app/routers/admin.py
+  - gateway-v4/app/models.py
+  - gateway-v4/app/database.py
+  - gateway-v4/alembic/versions/*
+  - gateway-v4/tests/*
+  - tests/*
+  - docs/*
+  - README.md
+  - gateway-v4/README.md
   forbidden_paths:
-    - frontend/*
-    - gateway-v4/app/routers/auth.py
-    - gateway-v4/app/services/auth.py
-    - .github/*
-    - docker-compose.yml
-    - docker-compose.prod.yml
-    - gateway-v4/docker-compose.yml
-    - gateway-v4/docker-compose.prod.yml
-    - gateway-v4/Dockerfile
-    - gateway-v4/Dockerfile.prod
+  - frontend/*
+  - gateway-v4/app/routers/auth.py
+  - gateway-v4/app/services/auth.py
+  - .github/*
+  - docker-compose.yml
+  - docker-compose.prod.yml
+  - gateway-v4/docker-compose.yml
+  - gateway-v4/docker-compose.prod.yml
+  - gateway-v4/Dockerfile
+  - gateway-v4/Dockerfile.prod
   forbidden_keywords:
-    - stripe
-    - billing
-    - subscription
-    - payment
-    - checkout
-    - marketplace
+  - stripe
+  - billing
+  - subscription
+  - payment
+  - checkout
+  - marketplace
   max_changed_files: 8
   max_diff_lines: 500

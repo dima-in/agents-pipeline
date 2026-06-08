@@ -1186,7 +1186,7 @@ def test_agent_handoff_card_is_russian(tmp_path) -> None:
 
     title, lines = orchestrator._build_agent_handoff_card("task-designer", "implementation", bundle)
 
-    assert title == "Передача: Планировщик → Конструктор задачи"
+    assert title == "Передача: Планировщик -> Конструктор задачи"
     assert any(line.startswith("Должен:") for line in lines)
     assert any("архитектурный профиль" in line for line in lines)
     assert any("TASK-002" in line for line in lines)
