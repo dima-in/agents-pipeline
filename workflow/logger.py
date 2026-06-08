@@ -58,6 +58,11 @@ class WorkflowLogger:
         self._log_json("agent_start", {"agent": agent_name, "task": task})
 
     def agent_progress(self, agent_name: str, message: str) -> None:
+        # Low-level diagnostics flood the console (100+ lines per agent). Keep them in the log
+        # file for debugging, but do not print them — the operator reads the handoff cards.
+        if str(message).startswith("Diagnostic"):
+            self.logger.debug("AGENT_PROGRESS: %s - %s", agent_name, message)
+            return
         self._console(Fore.YELLOW, f"  {agent_name}: {message}")
         self.logger.debug("AGENT_PROGRESS: %s - %s", agent_name, message)
 

@@ -46,6 +46,48 @@ DEFAULT_ALEMBIC_DOWN_REVISION = "0005"
 TEST_DEVELOPER_FORBIDDEN_IMPORTS = ("sqlalchemy", "alembic", "pytest")
 TEST_DEVELOPER_ALLOWED_IMPORTS = ("ast", "re", "pathlib", "importlib.util")
 
+# Human-readable Russian labels for the per-agent handoff card (who -> whom, must do, did).
+AGENT_DISPLAY_RU = {
+    "project-analyst": "Аналитик проекта",
+    "product-manager": "Продакт-менеджер",
+    "market-analyst": "Аналитик рынка",
+    "memory-analyst": "Аналитик памяти",
+    "codebase-profiler": "Профайлер кода",
+    "architect": "Архитектор",
+    "implementation-planner": "Планировщик",
+    "task-designer": "Конструктор задачи",
+    "developer": "Разработчик",
+    "code-developer": "Разработчик кода",
+    "infra-developer": "Разработчик инфраструктуры",
+    "test-developer": "Разработчик тестов",
+    "qa": "QA",
+    "template-validator": "Валидатор шаблонов",
+}
+AGENT_DUTY_RU = {
+    "codebase-profiler": "снять текущую архитектуру: БД, раскладка, конвенции",
+    "architect": "составить план изменения под текущую архитектуру",
+    "implementation-planner": "разбить план в бэклог небольших задач",
+    "task-designer": "превратить одну задачу в строгий контракт для разработчика",
+    "developer": "внести правки в код строго по контракту",
+    "code-developer": "внести правки в код строго по контракту",
+    "infra-developer": "изменить инфраструктуру/конфиги по контракту",
+    "test-developer": "написать или обновить тесты по контракту",
+    "qa": "проверить результат против контракта и критериев приёмки",
+    "template-validator": "проверить структуру вывода и шаблоны",
+}
+AGENT_PREDECESSOR_RU = {
+    "architect": "исследование",
+    "codebase-profiler": "исследование",
+    "implementation-planner": "Архитектор",
+    "task-designer": "Планировщик",
+    "developer": "Конструктор задачи",
+    "code-developer": "Конструктор задачи",
+    "infra-developer": "Конструктор задачи",
+    "test-developer": "Конструктор задачи",
+    "qa": "Разработчик",
+    "template-validator": "QA",
+}
+
 
 class WorkflowOrchestrator:
     def __init__(
@@ -1178,7 +1220,10 @@ class WorkflowOrchestrator:
         self.logger.agent_progress(agent_name, f"Diagnostic retrieval_budget_remaining={message_bundle['retrieval_budget_remaining']}")
         self.logger.agent_progress(agent_name, f"Diagnostic retrieval_limit_reason={message_bundle['retrieval_limit_reason']}")
         self.logger.agent_progress(agent_name, f"Diagnostic retrieval_hard_stop_triggered={message_bundle['retrieval_hard_stop_triggered']}")
-        self._log_operator_summary("Prompt brief (RU)", self._build_prompt_brief_lines(agent_name, phase, message_bundle))
+        handoff_title, handoff_lines = self._build_agent_handoff_card(agent_name, phase, message_bundle)
+        self.logger.operator_box(handoff_title, handoff_lines, color="cyan")
+        # Keep the detailed technical brief in the run log only (not the console).
+        self.logger.logger.debug("PROMPT_BRIEF: %s", " | ".join(self._build_prompt_brief_lines(agent_name, phase, message_bundle)))
 
         def save_agent_report(
             status: str,
@@ -3862,6 +3907,40 @@ class WorkflowOrchestrator:
             return
         self.logger.operator_box(title, [f"- {line}" for line in filtered], color="cyan")
 
+    def _build_agent_handoff_card(self, agent_name: str, phase: str, message_bundle: dict[str, Any]) -> tuple[str, list[str]]:
+        """Readable Russian handoff card: who -> whom, what they must do, what they receive.
+
+        Replaces the technical key=value brief on the console so the operator can follow the
+        flow without reading walls of diagnostics.
+        """
+        label = AGENT_DISPLAY_RU.get(agent_name, agent_name)
+        predecessor = AGENT_PREDECESSOR_RU.get(agent_name, "предыдущий шаг")
+        duty = AGENT_DUTY_RU.get(agent_name) or str(message_bundle.get("agent_description") or "").strip() or "выполнить свой шаг"
+        lines = [f"Должен: {duty}"]
+        receives: list[str] = []
+        if message_bundle.get("repository_context_chars"):
+            receives.append("контекст репозитория")
+        if phase == "implementation" and agent_name in {
+            "architect", "implementation-planner", "task-designer",
+            "developer", "code-developer", "infra-developer", "test-developer", "qa", "template-validator",
+        }:
+            receives.append("архитектурный профиль")
+        if message_bundle.get("previous_context"):
+            receives.append("итоги предыдущего агента")
+        if phase == "implementation":
+            receives.append("границы задачи")
+        if message_bundle.get("developer_feedback_source"):
+            receives.append("замечания на доработку")
+        if receives:
+            lines.append("Получает: " + ", ".join(dict.fromkeys(receives)))
+        task_id = str(message_bundle.get("selected_task_id") or "").strip()
+        scope = str(message_bundle.get("selected_task_scope") or "").strip()
+        if task_id:
+            lines.append(f"По задаче: {task_id}" + (f" — {scope[:80]}" if scope else ""))
+        elif scope:
+            lines.append(f"Объём: {scope[:110]}")
+        return f"Передача: {predecessor} → {label}", lines
+
     def _build_prompt_brief_lines(self, agent_name: str, phase: str, message_bundle: dict[str, Any]) -> list[str]:
         lines = [
             f"фаза={phase}",
@@ -5524,13 +5603,13 @@ class WorkflowOrchestrator:
             agent_name in {"architect", "implementation-planner", "task-designer", "qa", "template-validator"}
             or edit_agent
         ):
-            architecture_note = self._build_architecture_ground_truth_note()
+            architecture_note = self._render_architecture_profile_note()
             if architecture_note:
                 insert_at = next(
                     (idx + 1 for idx, (title, _) in enumerate(sections) if title == "Selected implementation scope"),
                     len(sections),
                 )
-                sections.insert(insert_at, ("Backend architecture ground truth", architecture_note))
+                sections.insert(insert_at, ("Project Architecture Profile", architecture_note))
         if (
             agent_name in {"task-designer", "developer", "qa", "template-validator"}
             or self._is_multi_developer_edit_agent(agent_name)
@@ -6494,6 +6573,18 @@ class WorkflowOrchestrator:
         lines.append("- Project roots: " + ", ".join(root or "(repo root)" for root in roots) + ".")
         tests_root = profile["layout"]["tests_root"]["value"]
         lines.append(f"- Tests root: {tests_root or '(none detected)'}.")
+        concurrency_fact = persistence["concurrency"]
+        if concurrency_fact["confidence"] == "verified" and concurrency_fact["value"] == "sync":
+            lines.append(
+                "- MATCH THIS (verified): do NOT introduce async def DB methods, await on DB calls, "
+                "AsyncSession, create_async_engine, or asyncio.to_thread; use the synchronous ORM/DB API. "
+                "Contracts and tests MUST match this synchronous model."
+            )
+        elif concurrency_fact["confidence"] == "verified" and concurrency_fact["value"] == "async":
+            lines.append(
+                "- MATCH THIS (verified): database-touching methods are async and awaited against the injected "
+                "session; do not require synchronous blocking db.query(...) calls."
+            )
         if profile["open_questions"]:
             lines.append("- Confirm before relying: " + "; ".join(profile["open_questions"]))
         return "\n".join(lines)

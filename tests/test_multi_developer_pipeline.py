@@ -1157,3 +1157,36 @@ def test_profiler_merge_never_overrides_verified_facts(tmp_path) -> None:
     # Verified ground truth is preserved; the agent cannot flip it.
     assert merged["persistence"]["concurrency"]["value"] == "sync"
     assert merged["persistence"]["concurrency"]["confidence"] == "verified"
+
+
+def test_render_profile_note_includes_sync_directive(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    _write_sync_db_stack(tmp_path)
+    (tmp_path / "gateway-v4" / "requirements.txt").write_text("sqlalchemy\n", encoding="utf-8")
+    orchestrator._repo_map_cache = {"files": [{"path": "gateway-v4/app/database.py"}, {"path": "gateway-v4/requirements.txt"}]}
+    orchestrator.implementation_scope_policy = {"forbidden_paths": [], "forbidden_keywords": []}
+
+    note = orchestrator._render_architecture_profile_note()
+
+    assert "Project Architecture Profile" in note
+    assert "MATCH THIS" in note
+    assert "async" in note  # the directive warns against introducing async DB
+    assert "get_db" in note
+
+
+def test_agent_handoff_card_is_russian(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    bundle = {
+        "repository_context_chars": 1200,
+        "previous_context": "architect plan...",
+        "selected_task_id": "TASK-002",
+        "selected_task_scope": "Add performance monitoring service",
+        "developer_feedback_source": "",
+    }
+
+    title, lines = orchestrator._build_agent_handoff_card("task-designer", "implementation", bundle)
+
+    assert title == "Передача: Планировщик → Конструктор задачи"
+    assert any(line.startswith("Должен:") for line in lines)
+    assert any("архитектурный профиль" in line for line in lines)
+    assert any("TASK-002" in line for line in lines)
