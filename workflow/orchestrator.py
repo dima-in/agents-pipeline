@@ -561,6 +561,8 @@ class WorkflowOrchestrator:
                 if not self._run_developer_deterministic_checks():
                     had_failures = True
                     return False
+            if phase_key == "implementation":
+                self._log_agent_done_card(agent["name"])
             if self._phase_cost_limit_exceeded(phase_key):
                 had_failures = True
                 break
@@ -3940,6 +3942,52 @@ class WorkflowOrchestrator:
         elif scope:
             lines.append(f"Объём: {scope[:110]}")
         return f"Передача: {predecessor} → {label}", lines
+
+    def _build_agent_result_summary(self, agent_name: str) -> str:
+        """Short Russian 'what it produced' line for the done card. Best-effort and never raises."""
+        try:
+            if agent_name == "codebase-profiler":
+                persistence = (self._build_architecture_profile().get("persistence") or {}).values()
+                inferred = sum(1 for fact in persistence if isinstance(fact, dict) and fact.get("confidence") == "inferred")
+                return "профиль архитектуры обновлён" + (f", полей заполнено агентом: {inferred}" if inferred else "")
+            if agent_name == "architect":
+                return "архитектурный план готов"
+            if agent_name == "implementation-planner":
+                count = self._validated_backlog_task_count or len(self._load_canonical_implementation_backlog())
+                return f"бэклог: {count} задач" if count else ""
+            if agent_name == "task-designer":
+                item = self._selected_implementation_item or {}
+                task_id = str(item.get("id") or "")
+                if str(item.get("contract_source") or "") == "task-designer" and task_id:
+                    must = len(item.get("must_contain") or [])
+                    tests = len(item.get("must_test") or [])
+                    detail = f": {must} требований, {tests} тестов" if (must or tests) else ""
+                    return f"контракт для {task_id}{detail}"
+                return ""
+            if agent_name in {"developer", "code-developer", "infra-developer", "test-developer"}:
+                changed = self._implementation_completion_changed_files()
+                if changed:
+                    preview = ", ".join(changed[:4]) + (f" (+{len(changed) - 4})" if len(changed) > 4 else "")
+                    return f"изменил файлы: {preview}"
+                return "без изменений"
+            if agent_name == "qa":
+                report = self._load_saved_agent_report("implementation", "qa")
+                verdict = self._extract_qa_verdict(str((report or {}).get("parsed_output") or "")) if report else ""
+                return f"вердикт: {verdict}" if verdict else ""
+            if agent_name == "template-validator":
+                report = self._load_saved_agent_report("implementation", "template-validator")
+                status = str((report or {}).get("status") or "") if report else ""
+                return f"проверка шаблонов: {status}" if status else ""
+        except Exception:
+            return ""
+        return ""
+
+    def _log_agent_done_card(self, agent_name: str) -> None:
+        summary = self._build_agent_result_summary(agent_name)
+        if not summary:
+            return
+        label = AGENT_DISPLAY_RU.get(agent_name, agent_name)
+        self.logger.operator_box(f"Готово: {label}", [f"Сделал: {summary}"], color="green")
 
     def _build_prompt_brief_lines(self, agent_name: str, phase: str, message_bundle: dict[str, Any]) -> list[str]:
         lines = [

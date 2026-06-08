@@ -1190,3 +1190,21 @@ def test_agent_handoff_card_is_russian(tmp_path) -> None:
     assert any(line.startswith("Должен:") for line in lines)
     assert any("архитектурный профиль" in line for line in lines)
     assert any("TASK-002" in line for line in lines)
+
+
+def test_agent_result_summary_is_russian(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator._selected_implementation_item = {
+        "id": "TASK-002",
+        "contract_source": "task-designer",
+        "must_contain": ["class PerformanceMonitor:", "def record("],
+        "must_test": ["test_record"],
+    }
+    assert orchestrator._build_agent_result_summary("task-designer") == "контракт для TASK-002: 2 требований, 1 тестов"
+
+    orchestrator._validated_backlog_task_count = 3
+    assert orchestrator._build_agent_result_summary("implementation-planner") == "бэклог: 3 задач"
+    assert orchestrator._build_agent_result_summary("architect") == "архитектурный план готов"
+    # Unknown/blank cases stay silent (no card).
+    orchestrator._selected_implementation_item = {"id": "TASK-009", "contract_source": ""}
+    assert orchestrator._build_agent_result_summary("task-designer") == ""
