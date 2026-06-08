@@ -181,6 +181,7 @@ class WorkflowOrchestrator:
         self._implementation_attempt = 0
         self._repo_map_cache: dict[str, Any] | None = None
         self._db_architecture_cache: dict[str, Any] | None = None
+        self._project_roots_cache: list[str] | None = None
         self._repo_map_before: dict[str, Any] | None = None
         self._repo_map_after: dict[str, Any] | None = None
         self._repo_map_delta: dict[str, list[str]] = {
@@ -2952,28 +2953,94 @@ class WorkflowOrchestrator:
         ]
         return self._build_target_file_excerpts(doc_candidates, per_file_limit=900, total_limit=limit)
 
+    PROJECT_MANIFEST_NAMES = (
+        "requirements.txt",
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "package.json",
+        "go.mod",
+        "Cargo.toml",
+        "pom.xml",
+        "build.gradle",
+        "Gemfile",
+        "composer.json",
+        "Dockerfile",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+    )
+    PROJECT_SOURCE_DIR_NAMES = ("app", "src", "lib", "internal")
+
+    @staticmethod
+    def _dir_is_project_root(directory: Path) -> bool:
+        try:
+            entries = list(directory.iterdir())
+        except OSError:
+            return False
+        for entry in entries:
+            name = entry.name
+            if entry.is_file() and name in WorkflowOrchestrator.PROJECT_MANIFEST_NAMES:
+                return True
+            if entry.is_dir() and name in WorkflowOrchestrator.PROJECT_SOURCE_DIR_NAMES:
+                return True
+        return False
+
+    def _detect_project_roots(self) -> list[str]:
+        """Relative subdirectories that look like project/source roots in the target repo.
+
+        Always includes the repo root (""). Adds any top-level or second-level directory that
+        carries a build/dependency manifest or a conventional source layout, so context builders
+        gather dependency/deployment files from the REAL layout instead of an assumed one
+        (a nested service subdir in one repo, a flat root in another). No project name is hardcoded.
+        """
+        cached = getattr(self, "_project_roots_cache", None)
+        if cached is not None:
+            return cached
+        roots: list[str] = [""]
+        workspace = getattr(self, "target_workspace", None)
+        workspace = Path(workspace) if workspace else None
+        if not workspace or not workspace.exists():
+            self._project_roots_cache = roots
+            return roots
+        excluded = {
+            ".git", ".venv", "venv", "env", "node_modules", "__pycache__", "dist", "build",
+            ".pytest_cache", ".mypy_cache", "site-packages", ".openclaw", ".agents-pipeline", "db_data",
+        }
+        def _scan(base: Path, prefix: str, depth: int) -> None:
+            if depth > 2:
+                return
+            try:
+                children = sorted(p for p in base.iterdir() if p.is_dir())
+            except OSError:
+                return
+            for child in children:
+                if child.name in excluded or child.name.startswith("."):
+                    continue
+                rel = f"{prefix}{child.name}"
+                if self._dir_is_project_root(child):
+                    roots.append(rel)
+                _scan(child, f"{rel}/", depth + 1)
+        _scan(workspace, "", 1)
+        result = list(dict.fromkeys(roots))
+        self._project_roots_cache = result
+        return result
+
+    def _project_root_candidates(self, filenames: list[str]) -> list[str]:
+        """Each filename resolved under every detected project root (repo root included)."""
+        candidates: list[str] = []
+        for root in self._detect_project_roots():
+            for name in filenames:
+                candidates.append(f"{root}/{name}" if root else name)
+        return list(dict.fromkeys(candidates))
+
     def _build_target_dependency_context(self, limit: int = 3200) -> str:
-        candidates = [
-            "package.json",
-            "pyproject.toml",
-            "requirements.txt",
-            "docker-compose.yml",
-            "Dockerfile",
-            ".env.example",
-            "frontend/package.json",
-            "backend/package.json",
-            "gateway-v4/pyproject.toml",
-            "gateway-v4/requirements.txt",
-        ]
+        candidates = self._project_root_candidates(
+            ["package.json", "pyproject.toml", "requirements.txt", "docker-compose.yml", "Dockerfile", ".env.example"]
+        )
         return self._build_target_file_excerpts(candidates, per_file_limit=900, total_limit=limit)
 
     def _build_target_deployment_context(self, limit: int = 2400) -> str:
-        candidates = [
-            "docker-compose.yml",
-            "Dockerfile",
-            "frontend/Dockerfile",
-            "backend/Dockerfile",
-            "gateway-v4/Dockerfile",
+        candidates = self._project_root_candidates(["docker-compose.yml", "Dockerfile"]) + [
             ".github/workflows/deploy.yml",
             ".github/workflows/ci.yml",
         ]
@@ -3026,24 +3093,20 @@ class WorkflowOrchestrator:
         readme = self._read_target_repo_file("README.md", 900)
         if readme:
             lines.append("README summary excerpt available.")
-        package_markers = []
-        for candidate in ("package.json", "frontend/package.json", "backend/package.json"):
-            if (self.target_workspace / candidate).exists():
-                package_markers.append(candidate)
+        package_markers = [c for c in self._project_root_candidates(["package.json"]) if (self.target_workspace / c).exists()]
         if package_markers:
             lines.append("JavaScript package files: " + ", ".join(package_markers))
-        python_markers = []
-        for candidate in ("pyproject.toml", "requirements.txt", "gateway-v4/pyproject.toml", "gateway-v4/requirements.txt"):
-            if (self.target_workspace / candidate).exists():
-                python_markers.append(candidate)
+        python_markers = [
+            c for c in self._project_root_candidates(["pyproject.toml", "requirements.txt"]) if (self.target_workspace / c).exists()
+        ]
         if python_markers:
             lines.append("Python dependency files: " + ", ".join(python_markers))
-        deployment_markers = []
-        for candidate in ("docker-compose.yml", "Dockerfile", "frontend", "backend", "gateway-v4"):
-            if (self.target_workspace / candidate).exists():
-                deployment_markers.append(candidate)
+        deployment_markers: list[str] = [
+            c for c in self._project_root_candidates(["docker-compose.yml", "Dockerfile"]) if (self.target_workspace / c).exists()
+        ]
+        deployment_markers.extend(root for root in self._detect_project_roots() if root and (self.target_workspace / root).is_dir())
         if deployment_markers:
-            lines.append("Visible runtime/deployment structure: " + ", ".join(deployment_markers))
+            lines.append("Visible runtime/deployment structure: " + ", ".join(dict.fromkeys(deployment_markers)))
         return "\n".join(lines)
 
     def _build_target_positioning_summary(self) -> str:
@@ -3074,9 +3137,16 @@ class WorkflowOrchestrator:
 
     def _build_target_backend_frontend_summary(self) -> str:
         sections: list[str] = []
-        for directory in ("frontend", "backend", "gateway-v4", "src", "app"):
+        seen: set[str] = set()
+        # Real detected source roots first, then conventional directory names as a fallback.
+        directories = [root for root in self._detect_project_roots() if root]
+        directories.extend(("frontend", "backend", "src", "app"))
+        for directory in directories:
+            if directory in seen:
+                continue
+            seen.add(directory)
             path = self.target_workspace / directory
-            if path.exists():
+            if path.exists() and path.is_dir():
                 tree = self._build_top_level_tree(root=path, depth=2)
                 if tree:
                     sections.append(f"## {directory}\n{tree}")
@@ -3086,11 +3156,11 @@ class WorkflowOrchestrator:
         lines = [
             "Constraints should be inferred from target docs, dependency files, and repository structure.",
         ]
-        if (self.target_workspace / "docker-compose.yml").exists():
-            lines.append("Deployment orchestration is present via docker-compose.yml.")
-        if (self.target_workspace / "requirements.txt").exists() or (self.target_workspace / "gateway-v4/requirements.txt").exists():
+        if any((self.target_workspace / c).exists() for c in self._project_root_candidates(["docker-compose.yml", "docker-compose.yaml"])):
+            lines.append("Deployment orchestration is present via docker-compose.")
+        if any((self.target_workspace / c).exists() for c in self._project_root_candidates(["requirements.txt", "pyproject.toml"])):
             lines.append("Python runtime dependencies are present.")
-        if (self.target_workspace / "package.json").exists() or (self.target_workspace / "frontend/package.json").exists():
+        if any((self.target_workspace / c).exists() for c in self._project_root_candidates(["package.json"])):
             lines.append("Node/npm dependencies are present.")
         tests_list = self._build_target_tests_file_list(limit=400)
         if not tests_list:
@@ -3297,8 +3367,8 @@ class WorkflowOrchestrator:
                 )
                 return developer_base + (
                     'You may also request write operations with '
-                    '{"tool":"write_file","path":"gateway-v4/app/services/monitoring.py","content":"..."} '
-                    'or {"tool":"apply_patch","path":"gateway-v4/app/services/proxy.py","search":"old","replace":"new"}. '
+                    '{"tool":"write_file","path":"<relative/path/from/repo_map>","content":"..."} '
+                    'or {"tool":"apply_patch","path":"<relative/path/from/repo_map>","search":"old","replace":"new"}. '
                     "Before editing an existing file, inspect it first with read_file. "
                     "For a new file that does not exist yet, do not read it; create it directly with write_file. "
                     "Use only read_file/read_files for contract and reference paths during retrieval. "
@@ -6986,9 +7056,9 @@ class WorkflowOrchestrator:
                 "- Every allowed_path must be explicitly declared in existing_paths, new_files, or new_directories.",
                 "- Do not place a file in allowed_paths unless that same file is also present in existing_paths or new_files.",
                 "- If a later task uses a file created by an earlier task, declare depends_on and place that reused file in existing_paths for the later task.",
-                "- This also applies to package markers like gateway-v4/tests/__init__.py: if reused in a later task, put it in existing_paths for that later task and declare depends_on.",
-                "- If a required test file lives under a new directory such as gateway-v4/tests, declare that directory in new_directories.",
-                "- If adding gateway-v4/tests/__init__.py and it does not already exist, declare it in new_files and include it in allowed_paths.",
+                "- This also applies to package markers like a test package's __init__.py: if reused in a later task, put it in existing_paths for that later task and declare depends_on.",
+                "- If a required test file lives under a new directory (e.g. the repo's tests directory), declare that directory in new_directories.",
+                "- If adding a test package __init__.py that does not already exist, declare it in new_files and include it in allowed_paths.",
                 "- Return only corrected YAML/JSON.",
             ]
         )
@@ -7011,7 +7081,7 @@ class WorkflowOrchestrator:
             + ", ".join(self._planner_dependency_validation_errors[:20] or ["none"])
             + ". Available directories: "
             + available_directories
-            + ". Repair rules: every path in allowed_paths must also appear in existing_paths or new_files; existing_paths must contain exact existing files only, never directories; never guess an existing filename from a directory name or naming pattern; if an exact migration or test file is not present in repo_map, do not place it in existing_paths and treat it as new_files or omit it; if a later task reuses a file created by an earlier task, declare depends_on and list that reused file in existing_paths for the later task; this includes package markers such as gateway-v4/tests/__init__.py and gateway-v4/tests/integration/__init__.py; if a new file lives under a directory missing from repo_map, declare that parent in new_directories; if required_test_paths uses a new test package directory, include that directory in new_directories, add the package __init__.py to new_files, and include that __init__.py in allowed_paths."
+            + ". Repair rules: every path in allowed_paths must also appear in existing_paths or new_files; existing_paths must contain exact existing files only, never directories; never guess an existing filename from a directory name or naming pattern; if an exact migration or test file is not present in repo_map, do not place it in existing_paths and treat it as new_files or omit it; if a later task reuses a file created by an earlier task, declare depends_on and list that reused file in existing_paths for the later task; this includes package markers such as a test package's __init__.py (and any nested test package __init__.py); if a new file lives under a directory missing from repo_map, declare that parent in new_directories; if required_test_paths uses a new test package directory, include that directory in new_directories, add the package __init__.py to new_files, and include that __init__.py in allowed_paths."
             + ". Return corrected YAML/JSON using only paths from repo_map unless declaring a new file under an existing directory."
         ).strip()
 
@@ -8531,12 +8601,20 @@ class WorkflowOrchestrator:
                 f"repo_map_path={self.repo_map_path}",
             ]
             return False
-        if self.target_workspace.name.lower() == "myai":
-            gateway_path = self.target_workspace / "gateway-v4"
-            top_directories = {str(entry).rstrip("/") for entry in (repo_map.get("top_level_tree") or []) if str(entry).endswith("/")}
-            if gateway_path.exists() and "gateway-v4" not in top_directories:
-                self._planner_parse_error = "repo_map_missing_gateway_v4_for_myai_target"
-                self._planner_schema_errors = ["gateway-v4_exists_in_target_workspace_but_missing_from_repo_map"]
+        # A detected top-level project root that exists on disk must appear in repo_map; a
+        # repo_map that omits a real source root is stale/broken and would mislead planning.
+        # Generalizes a former gateway-v4/MYAI-specific guard to any project layout.
+        top_directories = {
+            str(entry).rstrip("/")
+            for entry in (repo_map.get("top_level_tree") or [])
+            if str(entry).endswith("/")
+        }
+        for root in self._detect_project_roots():
+            if not root or "/" in root:
+                continue  # only top-level roots are comparable to the top-level tree
+            if (self.target_workspace / root).is_dir() and root not in top_directories:
+                self._planner_parse_error = "repo_map_missing_project_root"
+                self._planner_schema_errors = [f"{root}_exists_in_target_workspace_but_missing_from_repo_map"]
                 return False
         return True
 

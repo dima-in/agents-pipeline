@@ -4883,7 +4883,7 @@ def test_retry_prompt_includes_previous_feedback_block(tmp_path: Path) -> None:
     assert "Every backend task must include required_test_paths." in prompt
     assert "Every allowed_path must be explicitly declared in existing_paths, new_files, or new_directories." in prompt
     assert "If a later task uses a file created by an earlier task, declare depends_on and place that reused file in existing_paths for the later task." in prompt
-    assert "If adding gateway-v4/tests/__init__.py and it does not already exist, declare it in new_files and include it in allowed_paths." in prompt
+    assert "If adding a test package __init__.py that does not already exist, declare it in new_files and include it in allowed_paths." in prompt
     assert "Return only corrected YAML/JSON." in prompt
     assert orchestrator._planner_feedback_source.endswith("implementation-planner.md")
     assert orchestrator._planner_feedback_chars > 0
