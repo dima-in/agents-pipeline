@@ -6,6 +6,7 @@ import os
 import sys
 from pathlib import Path
 
+from workflow.env_loader import load_env_files
 from workflow.orchestrator import WorkflowOrchestrator
 
 
@@ -146,6 +147,11 @@ def main(argv: list[str] | None = None) -> int:
 
     engine_root = Path(__file__).resolve().parent
     launch_cwd = Path(os.environ.get("AGENTS_PIPELINE_LAUNCH_CWD") or os.getcwd()).resolve()
+    # Optional .env support: fill missing env vars (e.g. OPENROUTER_API_KEY) from a .env file
+    # next to start.py or in the launch directory. Real environment variables always win.
+    loaded_env = load_env_files([engine_root, launch_cwd])
+    if loaded_env:
+        print(f"Loaded environment from: {', '.join(loaded_env)}")
     config_path = Path(args.config)
     if not config_path.is_absolute():
         config_path = engine_root / config_path
