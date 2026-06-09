@@ -23,7 +23,7 @@ def test_manager_reads_agent_registration_override() -> None:
     manager = AgentManager()
     overrides = manager._get_agent_registration_overrides("competitor-analyst", "research")
     assert overrides["provider"] == "openrouter"
-    assert overrides["model"] == "perplexity/sonar"
+    assert overrides["model"] == "openrouter/anthropic/claude-sonnet-4.5"
 
 
 def test_research_agent_routing_overrides_are_configured() -> None:
@@ -55,12 +55,12 @@ def test_research_agents_use_expected_models() -> None:
         for agent in orchestrator.config["phases"]["research"]["agents"]
     }
 
-    assert research_agents["project-analyst"] == "openrouter/deepseek/deepseek-v4-pro"
-    assert research_agents["competitor-analyst"] == "perplexity/sonar"
-    assert research_agents["market-analyst"] == "openrouter/deepseek/deepseek-v4-pro"
-    assert research_agents["tech-analyst"] == "openrouter/deepseek/deepseek-v4-pro"
-    assert research_agents["innovation-scout"] == "perplexity/sonar"
-    assert research_agents["product-manager"] == "openrouter/deepseek/deepseek-v4-pro"
+    assert research_agents["project-analyst"] == "openrouter/anthropic/claude-sonnet-4.5"
+    assert research_agents["competitor-analyst"] == "openrouter/anthropic/claude-sonnet-4.5"
+    assert research_agents["market-analyst"] == "openrouter/anthropic/claude-sonnet-4.5"
+    assert research_agents["tech-analyst"] == "openrouter/anthropic/claude-sonnet-4.5"
+    assert research_agents["innovation-scout"] == "openrouter/anthropic/claude-sonnet-4.5"
+    assert research_agents["product-manager"] == "openrouter/anthropic/claude-sonnet-4.5"
 
 
 def test_implementation_and_deployment_agents_use_expected_models() -> None:

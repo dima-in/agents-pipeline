@@ -1288,3 +1288,13 @@ def test_target_architecture_compatible_is_carried(tmp_path) -> None:
     orchestrator._architecture_profile_cache = None
     reloaded = orchestrator._build_architecture_profile()["target_architecture"]
     assert reloaded and "PerformanceMonitor" in reloaded["summary"]
+
+
+def test_research_agents_force_final_instead_of_giving_up(tmp_path) -> None:
+    # Regression: a research agent that spends its whole retrieval budget reading must be forced
+    # to finalize (not return "Exceeded retrieval rounds"). Surfaced by a live Oil run.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    assert orchestrator._should_force_final_after_retrieval_limit("research", "project-analyst") is True
+    assert orchestrator._should_force_final_after_retrieval_limit("research", "competitor-analyst") is True
+    assert orchestrator._should_force_final_after_retrieval_limit("implementation", "qa") is False
+    assert orchestrator._should_force_final_after_retrieval_limit("deployment", "x") is False

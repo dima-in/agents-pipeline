@@ -2526,6 +2526,10 @@ class WorkflowOrchestrator:
         )
 
     def _should_force_final_after_retrieval_limit(self, phase: str, agent_name: str) -> bool:
+        # Research agents must finalize their analysis with what they read instead of giving up
+        # with "Exceeded retrieval rounds" when a model spends the whole retrieval budget reading.
+        if phase == "research":
+            return True
         if phase != "implementation":
             return False
         if agent_name == "qa":
@@ -2538,7 +2542,8 @@ class WorkflowOrchestrator:
     def _build_retrieval_limit_final_instruction(phase: str, agent_name: str) -> str:
         return (
             "Retrieval budget is now exhausted. Do not request any more tools. "
-            "Use the repository context and local retrieval results already provided to produce your final answer now. "
+            "Use the repository context and local retrieval results already provided to produce your final answer now, "
+            "in the required output format/sections from your instructions. "
             "If information is incomplete, state the assumptions and concrete gaps in the final answer instead of asking for more retrieval. "
             f"Phase: {phase}. Agent: {agent_name}."
         )
@@ -4438,6 +4443,8 @@ class WorkflowOrchestrator:
                 max_turns = 6
             elif phase == "implementation" and agent_name == "qa":
                 max_turns = 2
+            elif phase == "research":
+                max_turns = 4
             else:
                 max_turns = 3
         if message_bundle.get("strict_execution_mode"):

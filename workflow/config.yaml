@@ -47,37 +47,37 @@ phases:
         description: "Analyze the current repository, constraints, gaps, and immediate opportunities"
         timeout: 900
         provider: openrouter
-        model: openrouter/deepseek/deepseek-v4-pro
+        model: openrouter/anthropic/claude-sonnet-4.5
         thinking: low
       - name: competitor-analyst
         description: "Analyze competitors"
         timeout: 600
         provider: openrouter
-        model: perplexity/sonar
+        model: openrouter/anthropic/claude-sonnet-4.5
         thinking: low
       - name: market-analyst
         description: "Analyze market and trends"
         timeout: 600
         provider: openrouter
-        model: openrouter/deepseek/deepseek-v4-pro
+        model: openrouter/anthropic/claude-sonnet-4.5
         thinking: low
       - name: tech-analyst
         description: "Review technical options"
         timeout: 600
         provider: openrouter
-        model: openrouter/deepseek/deepseek-v4-pro
+        model: openrouter/anthropic/claude-sonnet-4.5
         thinking: low
       - name: innovation-scout
         description: "Find adjacent product and workflow innovations"
         timeout: 600
         provider: openrouter
-        model: perplexity/sonar
+        model: openrouter/anthropic/claude-sonnet-4.5
         thinking: low
       - name: product-manager
         description: "Summarize and prepare requirements"
         timeout: 900
         provider: openrouter
-        model: openrouter/deepseek/deepseek-v4-pro
+        model: openrouter/anthropic/claude-sonnet-4.5
         thinking: low
 
   implementation:
