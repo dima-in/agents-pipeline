@@ -1298,3 +1298,25 @@ def test_research_agents_force_final_instead_of_giving_up(tmp_path) -> None:
     assert orchestrator._should_force_final_after_retrieval_limit("research", "competitor-analyst") is True
     assert orchestrator._should_force_final_after_retrieval_limit("implementation", "qa") is False
     assert orchestrator._should_force_final_after_retrieval_limit("deployment", "x") is False
+
+
+def test_safe_is_file_never_raises(tmp_path) -> None:
+    real = tmp_path / "real.txt"
+    real.write_text("x", encoding="utf-8")
+    assert WorkflowOrchestrator._safe_is_file(real) is True
+    assert WorkflowOrchestrator._safe_is_file(tmp_path / "missing") is False
+
+
+def test_target_tests_file_list_excludes_db_data_and_survives(tmp_path) -> None:
+    # Regression: a MySQL db_data/ dir in the target (with special/socket files) crashed the
+    # rglob+is_file scan on Windows. Now db_data is excluded and is_file is stat-safe.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_orders.py").write_text("x", encoding="utf-8")
+    (tmp_path / "db_data").mkdir()
+    (tmp_path / "db_data" / "test_lookalike.bin").write_text("x", encoding="utf-8")
+
+    out = orchestrator._build_target_tests_file_list()
+
+    assert "tests/test_orders.py" in out
+    assert "db_data" not in out  # MySQL data dir excluded

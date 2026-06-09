@@ -3128,17 +3128,30 @@ class WorkflowOrchestrator:
             total += len(chunk) + 2
         return "\n\n".join(chunks)
 
+    @staticmethod
+    def _safe_is_file(path: Path) -> bool:
+        """is_file() that never raises. Special/unstattable files in a target repo (e.g. a
+        MySQL db_data/ Unix socket, FIFOs, permission-denied paths) must not crash scanning.
+        """
+        try:
+            return path.is_file()
+        except OSError:
+            return False
+
     def _build_target_tests_file_list(self, limit: int = 2200) -> str:
         patterns = ("test", "spec")
-        files = sorted(
-            relative_text
-            for path in self.target_workspace.rglob("*")
-            for relative_text in [str(path.relative_to(self.target_workspace)).replace("\\", "/")]
-            if path.is_file()
-            and not is_excluded_path(relative_text)
-            and any(token in path.name.lower() for token in patterns)
-        )
-        return "\n".join(files)[:limit]
+        files: list[str] = []
+        for path in self.target_workspace.rglob("*"):
+            relative_text = str(path.relative_to(self.target_workspace)).replace("\\", "/")
+            # Cheap filters before any stat() so excluded dirs and non-test files never get
+            # is_file()'d (which can raise on special files such as a db_data/ socket).
+            if is_excluded_path(relative_text):
+                continue
+            if not any(token in path.name.lower() for token in patterns):
+                continue
+            if self._safe_is_file(path):
+                files.append(relative_text)
+        return "\n".join(sorted(files))[:limit]
 
     def _build_target_git_diff_excerpt(self, limit: int = 3200) -> str:
         diff_text = self._run_local_capture(["git", "diff", "--"], timeout=10, cwd=self.target_workspace)
@@ -4143,15 +4156,17 @@ class WorkflowOrchestrator:
         results: list[str] = []
         workspace_root = self.target_workspace.resolve()
         for path in sorted(workspace_root.rglob("*")):
-            if not path.is_file():
+            try:
+                relative_text = str(path.relative_to(workspace_root)).replace("\\", "/")
+            except ValueError:
+                continue
+            if is_excluded_path(relative_text):
+                continue
+            if not self._safe_is_file(path):
                 continue
             try:
-                relative = path.relative_to(workspace_root)
-                relative_text = str(relative).replace("\\", "/")
-                if is_excluded_path(relative_text):
-                    continue
                 text = path.read_text(encoding="utf-8", errors="replace")
-            except (OSError, ValueError):
+            except OSError:
                 continue
             for lineno, line in enumerate(text.splitlines(), start=1):
                 if pattern.lower() in line.lower():

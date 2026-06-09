@@ -19,6 +19,7 @@ EXCLUDED_DIR_NAMES = {
     "build",
     ".pytest_cache",
     ".mypy_cache",
+    "db_data",
 }
 
 EXCLUDED_PREFIXES = {
