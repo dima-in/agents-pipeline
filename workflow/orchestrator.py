@@ -4571,6 +4571,23 @@ class WorkflowOrchestrator:
                 output_text = self._extract_direct_api_text(response_payload)
                 retrieval_request = self._parse_direct_api_retrieval_request(output_text)
                 if not retrieval_request:
+                    # Within-turn must_contain gate: refuse a premature "implemented" while the
+                    # target code file still lacks required contract symbols — make the developer
+                    # finish here instead of failing the whole attempt (cheaper + converges).
+                    if (
+                        phase == "implementation"
+                        and agent_name in {"developer", "code-developer"}
+                        and turn < max_turns
+                    ):
+                        missing_symbols = self._within_turn_missing_must_contain()
+                        if missing_symbols:
+                            self.logger.agent_progress(
+                                agent_name,
+                                f"Diagnostic within_turn_must_contain_missing={len(missing_symbols)}",
+                            )
+                            messages.append({"role": "assistant", "content": output_text})
+                            messages.append({"role": "user", "content": self._build_must_contain_repair_instruction(missing_symbols)})
+                            continue
                     break
                 tool_name = str(retrieval_request.get("tool") or "")
                 retrieval_budget_check = self._evaluate_retrieval_budget(
@@ -9807,6 +9824,38 @@ class WorkflowOrchestrator:
         ]
         lines.extend(f"  - {requirement}" for requirement in missing)
         return lines
+
+    def _within_turn_missing_must_contain(self) -> list[str]:
+        """Required def/class symbols still absent from the target file mid-run (the contract's
+        target_file is the code-developer's main file). Used to refuse a premature 'implemented'."""
+        item = self._selected_implementation_item or {}
+        target_file = item.get("target_file") or {}
+        target_path = self._normalize_repo_relative_path(target_file.get("path")) if isinstance(target_file, dict) else ""
+        must_contain = [str(value).strip() for value in (item.get("must_contain") or []) if str(value).strip()]
+        if not target_path or not target_path.endswith(".py") or not must_contain:
+            return []
+        candidate = self.target_workspace / target_path
+        if not self._safe_is_file(candidate):
+            return []
+        try:
+            content = candidate.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return []
+        return self._missing_must_contain(content, must_contain)
+
+    @staticmethod
+    def _build_must_contain_repair_instruction(missing: list[str]) -> str:
+        lines = [
+            "You returned a final answer, but the target file does NOT yet define these required "
+            "contract symbols (must_contain). Do NOT finish yet — add each one now, EXACTLY as "
+            "written, with a real implementation, using write_file or apply_patch:",
+        ]
+        lines.extend(f"- {requirement}" for requirement in missing)
+        lines.append(
+            "Issue the write tool now. Do not return status=implemented until every symbol above is "
+            "actually defined in the file."
+        )
+        return "\n".join(lines)
 
     def _run_developer_deterministic_checks(self) -> bool:
         developer_report = self._load_saved_agent_report("implementation", "developer") or {}

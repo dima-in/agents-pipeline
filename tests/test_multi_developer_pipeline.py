@@ -1472,3 +1472,28 @@ def test_ide_dirs_excluded_from_repo_map() -> None:
     assert is_excluded_path(".vscode/settings.json") is True
     assert is_excluded_path("main.py") is False
     assert is_excluded_path("frontend/src/App.jsx") is False
+
+
+def test_within_turn_must_contain_gate_detects_missing_then_clears(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    # Only an import written so far (exactly the Oil failure: code-developer added UseDatabase only).
+    (tmp_path / "main.py").write_text("from Database import UseDatabase\n", encoding="utf-8")
+    orchestrator._selected_implementation_item = {
+        "target_file": {"path": "main.py"},
+        "must_contain": [
+            "def get_customer_analytics(start_date=None, end_date=None):",
+            "with UseDatabase(config) as cursor:",  # free-form -> not gated
+        ],
+    }
+
+    missing = orchestrator._within_turn_missing_must_contain()
+    assert any("get_customer_analytics" in item for item in missing)
+    assert not any("UseDatabase(config)" in item for item in missing)  # free-form line not gated
+
+    instruction = WorkflowOrchestrator._build_must_contain_repair_instruction(missing)
+    assert "get_customer_analytics" in instruction
+    assert ("write_file" in instruction) or ("apply_patch" in instruction)
+
+    # Once the function is actually defined, the gate clears.
+    (tmp_path / "main.py").write_text("def get_customer_analytics(s=None, e=None):\n    return []\n", encoding="utf-8")
+    assert orchestrator._within_turn_missing_must_contain() == []
