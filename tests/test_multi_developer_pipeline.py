@@ -1346,3 +1346,26 @@ def test_network_failure_stops_phase_fast(tmp_path) -> None:
     assert ok is False
     assert ran == ["project-analyst"]  # aborted after the first; did not grind the rest into the wall
     assert orchestrator._phase_failure_status == "network_unreachable"
+
+
+def test_default_branch_prefers_detected_over_config(tmp_path) -> None:
+    # Regression: git rollback hardcoded "main"; a repo on "master" (Oil) crashed the rollback.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator.config = {"project": {"default_branch": "main"}}
+    orchestrator._default_branch_cache = ""
+    orchestrator._detect_default_branch = lambda: "master"
+    assert orchestrator._default_branch() == "master"  # real repo branch wins over config default
+
+
+def test_default_branch_falls_back_to_config_then_main(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator.config = {"project": {"default_branch": "develop"}}
+    orchestrator._default_branch_cache = ""
+    orchestrator._detect_default_branch = lambda: ""
+    assert orchestrator._default_branch() == "develop"
+
+    orchestrator2 = make_orchestrator_with_workspace(tmp_path)
+    orchestrator2.config = {}
+    orchestrator2._default_branch_cache = ""
+    orchestrator2._detect_default_branch = lambda: ""
+    assert orchestrator2._default_branch() == "main"

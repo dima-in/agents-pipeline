@@ -167,6 +167,7 @@ class WorkflowOrchestrator:
         self.task_counter = 0
         self._phase_failure_status: str | None = None
         self._network_unreachable = False
+        self._default_branch_cache = ""
         self._agent_report_extras: dict[tuple[str, str], dict[str, Any]] = {}
         self._registered_agents_cache: dict[str, dict[str, Any]] | None = None
         self._models_list_cache: set[str] | None = None
@@ -10246,8 +10247,55 @@ class WorkflowOrchestrator:
         except git.NoSuchPathError:
             return None
 
+    def _detect_default_branch(self) -> str:
+        """The target repo's real default branch (master vs main differ per repo)."""
+        repo = getattr(self, "repo", None)
+        if repo is None:
+            return ""
+        # 1) origin/HEAD when set: "refs/remotes/origin/master" -> "master".
+        try:
+            ref = str(repo.git.symbolic_ref("refs/remotes/origin/HEAD")).strip()
+            name = ref.rsplit("/", 1)[-1].strip()
+            if name:
+                return name
+        except Exception:
+            pass
+        # 2) a local branch named main/master.
+        try:
+            local = {head.name for head in repo.heads}
+            for candidate in ("main", "master"):
+                if candidate in local:
+                    return candidate
+        except Exception:
+            pass
+        # 3) a remote/ref named main/master.
+        try:
+            remote_names = {ref.name.rsplit("/", 1)[-1] for ref in repo.refs}
+            for candidate in ("main", "master"):
+                if candidate in remote_names:
+                    return candidate
+        except Exception:
+            pass
+        return ""
+
     def _default_branch(self) -> str:
-        return str(self.config.get("project", {}).get("default_branch", "main"))
+        cached = getattr(self, "_default_branch_cache", "")
+        if cached:
+            return cached
+        # Prefer the target repo's actual default branch over the config default, so git
+        # rollback/merge never assume "main" on a repo that uses "master" (or vice versa).
+        detected = self._detect_default_branch()
+        configured = ""
+        try:
+            configured = str((getattr(self, "config", {}) or {}).get("project", {}).get("default_branch", "") or "").strip()
+        except Exception:
+            configured = ""
+        result = detected or configured or "main"
+        try:
+            self._default_branch_cache = result
+        except Exception:
+            pass
+        return result
 
     def _detect_git_remote(self) -> str:
         if self.repo is None:
