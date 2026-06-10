@@ -226,6 +226,7 @@ class WorkflowOrchestrator:
         self._implementation_attempt = 0
         self._repo_map_cache: dict[str, Any] | None = None
         self._db_architecture_cache: dict[str, Any] | None = None
+        self._raw_sql_schema_cache: dict[str, list[str]] | None = None
         self._project_roots_cache: list[str] | None = None
         self._architecture_profile_cache: dict[str, Any] | None = None
         self._repo_map_before: dict[str, Any] | None = None
@@ -5695,6 +5696,20 @@ class WorkflowOrchestrator:
                     len(sections),
                 )
                 sections.insert(insert_at, ("Migration ground truth", ground_truth))
+        # Raw-SQL schema ground truth (repos with no ORM/Alembic, e.g. mysql-connector apps):
+        # gives planners and developers the EXACT table/column names so SQL doesn't reference
+        # tables/columns the LLM merely guessed.
+        if (
+            agent_name in {"architect", "implementation-planner", "task-designer", "qa", "template-validator"}
+            or edit_agent
+        ):
+            sql_schema_note = self._build_raw_sql_schema_note()
+            if sql_schema_note:
+                insert_at = next(
+                    (idx + 1 for idx, (title, _) in enumerate(sections) if title == "Selected implementation scope"),
+                    len(sections),
+                )
+                sections.insert(insert_at, ("Database schema ground truth", sql_schema_note))
         # Ground the planning and edit agents in the codebase's real DB concurrency model and
         # session-injection pattern so contracts are achievable (e.g. no async DB demands on a
         # synchronous SQLAlchemy stack). Placed right after the scope so it is never starved by
@@ -6218,6 +6233,108 @@ class WorkflowOrchestrator:
             "rename, or remove columns; do NOT invent a primary key (e.g. a composite provider+model key) "
             "different from the one above; do NOT assert tables, columns, indexes, revisions, or downgrade "
             "behavior that are not listed."
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _parse_create_tables(text: str) -> list[tuple[str, list[str]]]:
+        """Parse `CREATE TABLE name (col type, ...)` blocks into (table, [columns]).
+
+        Handles `IF NOT EXISTS`, quoted identifiers, and nested parens in types
+        (VARCHAR(255), DECIMAL(10,2)); skips constraint lines (PRIMARY KEY, FOREIGN KEY, ...).
+        """
+        results: list[tuple[str, list[str]]] = []
+        constraint_keywords = {"PRIMARY", "FOREIGN", "UNIQUE", "KEY", "CONSTRAINT", "INDEX", "CHECK", "FULLTEXT", "SPATIAL"}
+        for match in re.finditer(r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[`"\[]?(\w+)[`"\]]?\s*\(', text, re.IGNORECASE):
+            table = match.group(1)
+            depth = 0
+            index = match.end() - 1
+            length = len(text)
+            while index < length:
+                char = text[index]
+                if char == "(":
+                    depth += 1
+                elif char == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                index += 1
+            body = text[match.end():index]
+            columns: list[str] = []
+            depth = 0
+            current = ""
+
+            def _flush(segment: str) -> None:
+                segment = segment.strip()
+                if not segment:
+                    return
+                first = segment.split()[0].strip('`"[]')
+                if not first or first.upper() in constraint_keywords:
+                    return
+                columns.append(first)
+
+            for char in body:
+                if char == "(":
+                    depth += 1
+                    current += char
+                elif char == ")":
+                    depth -= 1
+                    current += char
+                elif char == "," and depth == 0:
+                    _flush(current)
+                    current = ""
+                else:
+                    current += char
+            _flush(current)
+            results.append((table, columns))
+        return results
+
+    def _extract_raw_sql_schema(self) -> dict[str, list[str]]:
+        """Real table->columns parsed from CREATE TABLE statements in the target (ground truth).
+
+        Covers repos whose schema lives in raw SQL (e.g. mysql-connector apps with no ORM/Alembic),
+        so contracts use real table/column names instead of LLM-guessed ones.
+        """
+        cached = getattr(self, "_raw_sql_schema_cache", None)
+        if cached is not None:
+            return cached
+        schema: dict[str, list[str]] = {}
+        try:
+            files = [str(entry.get("path") or "") for entry in (self._load_repo_map().get("files") or [])]
+        except Exception:
+            files = []
+        candidates = [path for path in files if path.endswith((".py", ".sql"))]
+        parsed = 0
+        for rel in candidates:
+            if parsed >= 60:
+                break
+            try:
+                text = (self.target_workspace / rel).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if "create table" not in text.lower():
+                continue
+            parsed += 1
+            for table, columns in self._parse_create_tables(text):
+                if table and columns and table not in schema:
+                    schema[table] = columns
+        self._raw_sql_schema_cache = schema
+        return schema
+
+    def _build_raw_sql_schema_note(self) -> str:
+        schema = self._extract_raw_sql_schema()
+        if not schema:
+            return ""
+        lines = [
+            "Authoritative database schema parsed from CREATE TABLE in the target source "
+            "(ground truth — use these EXACT table and column names; do NOT invent tables or columns not listed):",
+        ]
+        for table in sorted(schema):
+            columns = schema[table]
+            lines.append(f"- {table}: {', '.join(columns) if columns else '(no columns parsed)'}")
+        lines.append(
+            "Any SQL (e.g. cursor.execute) MUST reference only the tables and columns above. "
+            "Do NOT use a table or column name that is not in this list."
         )
         return "\n".join(lines)
 

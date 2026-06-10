@@ -1415,3 +1415,40 @@ def test_missing_must_contain_findings_gives_exact_repair_lines(tmp_path) -> Non
         "def get_customer_analytics(c):\n    pass\n\ndef get_summary_analytics(c):\n    pass\n", encoding="utf-8"
     )
     assert orchestrator._missing_must_contain_findings(item, ["main.py"]) == []
+
+
+def test_parse_create_tables_extracts_real_columns_skips_constraints() -> None:
+    sql = (
+        'cursor.execute("""CREATE TABLE IF NOT EXISTS order_details (\n'
+        '    id INT PRIMARY KEY AUTO_INCREMENT,\n'
+        '    order_id INT,\n'
+        '    oil_name VARCHAR(255),\n'
+        '    volume DECIMAL(10,2),\n'
+        '    count INT,\n'
+        '    price DECIMAL(10,2),\n'
+        '    FOREIGN KEY (order_id) REFERENCES orders(id)\n'
+        ')""")\n'
+        'cursor.execute("""CREATE TABLE production_profiles (\n'
+        '    id INT, oil_name VARCHAR(100), batch_seed_weight_kg DECIMAL(10,2), yield_percent FLOAT)""")\n'
+    )
+    tables = dict(WorkflowOrchestrator._parse_create_tables(sql))
+    assert tables["order_details"] == ["id", "order_id", "oil_name", "volume", "count", "price"]  # FK line skipped, DECIMAL(10,2) not split
+    assert "batch_seed_weight_kg" in tables["production_profiles"]
+    assert "yield_percent" in tables["production_profiles"]
+    assert "seed_weight_kg" not in tables["production_profiles"]  # the hallucinated name is genuinely absent
+
+
+def test_raw_sql_schema_note_lists_real_tables(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    (tmp_path / "Database.py").write_text(
+        'def create(cur):\n    cur.execute("""CREATE TABLE IF NOT EXISTS order_details (id INT, count INT, price DECIMAL(10,2))""")\n',
+        encoding="utf-8",
+    )
+    orchestrator._repo_map_cache = {"files": [{"path": "Database.py"}]}
+    orchestrator._raw_sql_schema_cache = None
+
+    note = orchestrator._build_raw_sql_schema_note()
+
+    assert "order_details" in note
+    assert "count" in note
+    assert "EXACT" in note
