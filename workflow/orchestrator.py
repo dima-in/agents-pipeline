@@ -9074,7 +9074,9 @@ class WorkflowOrchestrator:
 
     def _should_skip_implementation_agent(self, agent_name: str) -> bool:
         if self._implementation_retry_from_agent == "developer":
-            return agent_name in {"architect", "implementation-planner", "task-designer"}
+            # Reuse the stable upstream work on a developer retry — re-running them re-pays for
+            # nothing (the profile and the contract do not change between developer attempts).
+            return agent_name in {"codebase-profiler", "architect", "implementation-planner", "task-designer"}
         if (
             agent_name == "implementation-planner"
             and not self._should_regenerate_implementation_backlog()
