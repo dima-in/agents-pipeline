@@ -9626,6 +9626,63 @@ class WorkflowOrchestrator:
                 )
         return issues
 
+    @staticmethod
+    def _missing_must_contain(content: str, must_contain: list[str]) -> list[str]:
+        """Required def/class symbols from the contract that are NOT defined in the code.
+
+        Gates ONLY on declared symbols (functions/classes), matched by AST name — robust to
+        signature whitespace/annotations and with no false positives on arbitrary code-line
+        requirements (those are left to the behavioral test). This is the direct "result vs
+        task" diff: it tells the developer exactly which contract symbol is missing instead of
+        making it reverse-engineer that from a failing test.
+        """
+        try:
+            tree = ast.parse(content)
+        except SyntaxError:
+            return []  # cannot analyze reliably; py_compile already reports syntax errors
+        defined = {
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        }
+        missing: list[str] = []
+        for requirement in must_contain:
+            req = str(requirement).strip()
+            if not req:
+                continue
+            symbol_match = re.match(r"(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(|class\s+([A-Za-z_]\w*)\b", req)
+            if not symbol_match:
+                continue  # only gate on declared symbols, never on free-form code lines
+            name = symbol_match.group(1) or symbol_match.group(2)
+            if name not in defined:
+                missing.append(req)
+        return missing
+
+    def _missing_must_contain_findings(self, item: dict[str, Any], changed_files: list[str]) -> list[str]:
+        target_file = item.get("target_file") or {}
+        target_path = self._normalize_repo_relative_path(target_file.get("path")) if isinstance(target_file, dict) else ""
+        must_contain = [str(value).strip() for value in (item.get("must_contain") or []) if str(value).strip()]
+        if not target_path or not target_path.endswith(".py") or not must_contain:
+            return []
+        # Only gate a file the developer actually changed this attempt — not a pre-existing stub.
+        if target_path not in set(changed_files):
+            return []
+        candidate = self.target_workspace / target_path
+        if not self._safe_is_file(candidate):
+            return []
+        try:
+            content = candidate.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return []
+        missing = self._missing_must_contain(content, must_contain)
+        if not missing:
+            return []
+        lines = [
+            f"{target_path} is missing required contract symbols (must_contain) — define each one EXACTLY as written:",
+        ]
+        lines.extend(f"  - {requirement}" for requirement in missing)
+        return lines
+
     def _run_developer_deterministic_checks(self) -> bool:
         developer_report = self._load_saved_agent_report("implementation", "developer") or {}
         changed_files = [
@@ -9670,6 +9727,7 @@ class WorkflowOrchestrator:
                         findings.append(f"pytest failed for selected test file: {test_file_path}")
                         findings.append(stderr or stdout or "unknown pytest failure")
 
+        findings.extend(self._missing_must_contain_findings(item, changed_files))
         findings.extend(self._validate_changed_migration_files(changed_python_files))
 
         if findings:

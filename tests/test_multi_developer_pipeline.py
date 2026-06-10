@@ -1369,3 +1369,49 @@ def test_default_branch_falls_back_to_config_then_main(tmp_path) -> None:
     orchestrator2._default_branch_cache = ""
     orchestrator2._detect_default_branch = lambda: ""
     assert orchestrator2._default_branch() == "main"
+
+
+def test_missing_must_contain_flags_absent_symbols_robustly() -> None:
+    content = "def get_customer_analytics(cfg):\n    return []\n\nclass Foo:\n    pass\n"
+    must = [
+        "def get_customer_analytics(config: dict) -> list[dict]:",  # present by NAME despite different signature
+        "def get_product_analytics(config: dict) -> list[dict]:",   # ABSENT
+        "class Foo:",                                                # present
+        "class Bar:",                                                # ABSENT
+        "with UseDatabase(config) as cursor:",                       # free-form line -> NOT gated (no false positive)
+        "profit = revenue - cost",                                   # free-form line -> NOT gated
+    ]
+    missing = WorkflowOrchestrator._missing_must_contain(content, must)
+    assert "def get_product_analytics(config: dict) -> list[dict]:" in missing
+    assert "class Bar:" in missing
+    assert "def get_customer_analytics(config: dict) -> list[dict]:" not in missing  # name defined
+    assert "class Foo:" not in missing
+    assert "with UseDatabase(config) as cursor:" not in missing  # free-form -> ignored
+    assert "profit = revenue - cost" not in missing
+
+
+def test_missing_must_contain_findings_gives_exact_repair_lines(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    (tmp_path / "main.py").write_text("def get_customer_analytics(cfg):\n    return []\n", encoding="utf-8")
+    item = {
+        "target_file": {"path": "main.py"},
+        "must_contain": [
+            "def get_customer_analytics(config: dict) -> list[dict]:",
+            "def get_summary_analytics(config: dict) -> dict:",  # absent
+        ],
+    }
+
+    findings = orchestrator._missing_must_contain_findings(item, ["main.py"])
+
+    assert any("must_contain" in line for line in findings)
+    assert any("get_summary_analytics" in line for line in findings)
+    assert not any(line.strip() == "- def get_customer_analytics(config: dict) -> list[dict]:" for line in findings)
+
+    # Only gates a file the developer changed this attempt.
+    assert orchestrator._missing_must_contain_findings(item, []) == []
+
+    # All symbols present -> no findings.
+    (tmp_path / "main.py").write_text(
+        "def get_customer_analytics(c):\n    pass\n\ndef get_summary_analytics(c):\n    pass\n", encoding="utf-8"
+    )
+    assert orchestrator._missing_must_contain_findings(item, ["main.py"]) == []
