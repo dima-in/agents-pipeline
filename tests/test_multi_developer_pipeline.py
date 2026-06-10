@@ -1452,3 +1452,23 @@ def test_raw_sql_schema_note_lists_real_tables(tmp_path) -> None:
     assert "order_details" in note
     assert "count" in note
     assert "EXACT" in note
+
+
+def test_qa_verdict_recognizes_rejection_phrasings() -> None:
+    # Regression: QA said "Не принято" but the engine only knew "не пройдено" -> false pass -> merge.
+    verdict = WorkflowOrchestrator._extract_qa_verdict
+    assert verdict("Вердикт QA:\nНе принято. Обнаружены критические регрессии.") == "failed"
+    assert verdict("Вердикт QA: Не пройдено.") == "failed"
+    assert verdict("Вердикт QA: Отклонено") == "failed"
+    assert verdict("Вердикт QA:\nПринято. Всё ок.") == "passed"
+    assert verdict("Вердикт QA: Пройдено") == "passed"
+    assert verdict("no verdict line here") == ""
+
+
+def test_ide_dirs_excluded_from_repo_map() -> None:
+    from tools.repo_map import is_excluded_path
+    assert is_excluded_path(".idea/Oil.iml") is True
+    assert is_excluded_path(".vs/Oil/v17/.wsuo") is True
+    assert is_excluded_path(".vscode/settings.json") is True
+    assert is_excluded_path("main.py") is False
+    assert is_excluded_path("frontend/src/App.jsx") is False

@@ -9587,13 +9587,19 @@ class WorkflowOrchestrator:
     @staticmethod
     def _extract_qa_verdict(parsed_output: str) -> str:
         text = str(parsed_output or "")
-        match = re.search(r"Вердикт QA:\s*(.+)", text, re.IGNORECASE)
+        match = re.search(r"Вердикт QA:\s*(.{0,200})", text, re.IGNORECASE | re.DOTALL)
         if not match:
             return ""
         verdict = match.group(1).strip().lower()
-        if "не пройдено" in verdict:
+        # Check fail phrasings FIRST (negations like "не принято" contain the pass stem "принят").
+        fail_markers = (
+            "не пройден", "не принят", "не одобрен", "не соответств", "отклон",
+            "rejected", "not accepted", "not passed", "regression",
+        )
+        pass_markers = ("пройден", "принят", "одобрен", "passed", "accepted", "approved")
+        if any(marker in verdict for marker in fail_markers):
             return "failed"
-        if "пройдено" in verdict:
+        if any(marker in verdict for marker in pass_markers):
             return "passed"
         return ""
 

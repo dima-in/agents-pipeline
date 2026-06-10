@@ -20,6 +20,9 @@ EXCLUDED_DIR_NAMES = {
     ".pytest_cache",
     ".mypy_cache",
     "db_data",
+    ".idea",
+    ".vs",
+    ".vscode",
 }
 
 EXCLUDED_PREFIXES = {
