@@ -166,6 +166,7 @@ class WorkflowOrchestrator:
         self.current_branch: str | None = None
         self.task_counter = 0
         self._phase_failure_status: str | None = None
+        self._network_unreachable = False
         self._agent_report_extras: dict[tuple[str, str], dict[str, Any]] = {}
         self._registered_agents_cache: dict[str, dict[str, Any]] | None = None
         self._models_list_cache: set[str] | None = None
@@ -545,6 +546,13 @@ class WorkflowOrchestrator:
                     had_failures = True
                     if fail_fast:
                         return False
+            if self._network_unreachable:
+                self.logger.error(
+                    "Сеть недоступна — останавливаю фазу.",
+                    "Не удалось подключиться к API (DNS/VPN/прокси). Нет смысла гнать остальных агентов в стену — проверь связь и перезапусти.",
+                )
+                self._phase_failure_status = "network_unreachable"
+                return False
             if phase_key == "implementation" and agent["name"] == "architect":
                 self._capture_target_architecture_from_architect()
             if phase_key == "implementation" and agent["name"] == "implementation-planner":
@@ -4797,6 +4805,21 @@ class WorkflowOrchestrator:
             self.logger.error(f"Direct API returned invalid JSON: {agent_name}", self._tail_text(last_raw_body))
             save_agent_report("failed", "invalid direct_api response", elapsed, last_raw_body, "", "", command, 1)
             self.logger.agent_end(agent_name, "failed", "invalid direct_api response")
+            return False
+        except urllib_error.URLError as exc:
+            # DNS/connection failure (gaierror, refused, no route): the host is unreachable, so
+            # every other agent will fail identically. Flag it so the phase stops fast instead of
+            # grinding the whole backlog into a dead network.
+            elapsed = time.monotonic() - started_at
+            self._network_unreachable = True
+            reason = getattr(exc, "reason", exc)
+            detail = (
+                f"Сеть недоступна: не удалось подключиться к API ({reason}). "
+                "Проверь интернет/VPN/прокси и перезапусти."
+            )
+            self.logger.error(f"Direct API request failed (network): {agent_name}", str(reason))
+            save_agent_report("failed", "network unreachable", elapsed, "", detail, "", command, 1)
+            self.logger.agent_end(agent_name, "failed", "network unreachable")
             return False
         except Exception:
             elapsed = time.monotonic() - started_at

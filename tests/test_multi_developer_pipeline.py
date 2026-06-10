@@ -1320,3 +1320,29 @@ def test_target_tests_file_list_excludes_db_data_and_survives(tmp_path) -> None:
 
     assert "tests/test_orders.py" in out
     assert "db_data" not in out  # MySQL data dir excluded
+
+
+def test_network_failure_stops_phase_fast(tmp_path) -> None:
+    # Regression: a DNS/connection failure made every agent fail and the phase auto-continued
+    # through all of them. Now the first connectivity error stops the phase immediately.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator._network_unreachable = False
+    orchestrator._phase_failure_status = None
+    orchestrator.logger = types.SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None, error=lambda *a, **k: None)
+    orchestrator._phase_cost_limit_exceeded = lambda phase: False
+    orchestrator._wait_for_user = lambda prompt: True
+    ran: list[str] = []
+
+    def fake_run_agent(agent, phase, *, index=None, total=None):
+        ran.append(agent["name"])
+        orchestrator._network_unreachable = True  # simulate a connectivity failure inside the agent
+        return False
+
+    orchestrator._run_agent = fake_run_agent
+    phase = {"agents": [{"name": "project-analyst"}, {"name": "competitor-analyst"}, {"name": "market-analyst"}]}
+
+    ok = orchestrator._run_phase_agents(phase, "research")
+
+    assert ok is False
+    assert ran == ["project-analyst"]  # aborted after the first; did not grind the rest into the wall
+    assert orchestrator._phase_failure_status == "network_unreachable"
