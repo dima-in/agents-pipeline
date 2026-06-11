@@ -136,7 +136,10 @@ class WorkflowOrchestrator:
         self.repository_context_root = self.engine_root if self.context_mode == "engine_self_analysis" else self.target_workspace
         self.retrieval_root = self.target_workspace
         logs_root = self._engine_path(self.config.get("paths", {}).get("logs_dir", ".openclaw/logs"))
-        self.logger = WorkflowLogger(log_dir=str(logs_root / self.project_id))
+        self.logger = WorkflowLogger(
+            log_dir=str(logs_root / self.project_id),
+            console_verbosity=str((self.config.get("logging") or {}).get("console_verbosity", "compact")),
+        )
         self.handoff_summary_root = self.logger.run_dir / "agents" / "research"
         self.logs_root = self.logger.log_dir
         self.repo_map_before_path = self.logger.run_dir / "repo_map_before.json"

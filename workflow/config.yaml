@@ -176,5 +176,10 @@ git:
 logging:
   level: INFO
   console: true
+  # compact: console shows only the operator cards (Передача/Готово/Human summary),
+  # agent start/end with status+reason, git and phase lines; all service output
+  # (Diagnostic, prompt dumps, raw agent responses, retrieval turns) goes to the
+  # log file only. Set to "verbose" to print everything as before.
+  console_verbosity: compact
   file: true
   json: true

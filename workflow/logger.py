@@ -12,9 +12,23 @@ init(autoreset=True)
 
 
 class WorkflowLogger:
-    def __init__(self, log_dir: str = ".openclaw/logs") -> None:
+    # Console noise prefixes hidden in compact mode (full text always goes to the log file).
+    COMPACT_INFO_NOISE_PREFIXES = (
+        "Diagnostic",
+        "rollback_",
+        "selected_python",
+        "pytest_available",
+        "Skipping implementation agent",
+        "Multi developer allowed paths",
+    )
+    # Operator boxes shown on the console in compact mode (everything else is file-only):
+    # the handoff card, the result card, and the human-readable failure summary.
+    COMPACT_BOX_TITLE_PREFIXES = ("Передача", "Готово", "Human summary", "План multi-developer")
+
+    def __init__(self, log_dir: str = ".openclaw/logs", console_verbosity: str = "compact") -> None:
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.console_verbosity = console_verbosity if console_verbosity in {"compact", "verbose"} else "compact"
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.run_id = timestamp
@@ -63,7 +77,11 @@ class WorkflowLogger:
         if str(message).startswith("Diagnostic"):
             self.logger.debug("AGENT_PROGRESS: %s - %s", agent_name, message)
             return
-        self._console(Fore.YELLOW, f"  {agent_name}: {message}")
+        # In compact mode ALL per-agent progress (executor command, prompt stats, system
+        # prompt dumps, retrieval turns, model/provider lines) is file-only: the operator
+        # follows the handoff/result cards instead.
+        if self.console_verbosity != "compact":
+            self._console(Fore.YELLOW, f"  {agent_name}: {message}")
         self.logger.debug("AGENT_PROGRESS: %s - %s", agent_name, message)
 
     def agent_end(self, agent_name: str, status: str = "success", result: str = "") -> None:
@@ -81,6 +99,9 @@ class WorkflowLogger:
         self._log_json("git_operation", {"operation": operation, "details": details})
 
     def info(self, message: str) -> None:
+        if self.console_verbosity == "compact" and str(message).startswith(self.COMPACT_INFO_NOISE_PREFIXES):
+            self.logger.info("INFO: %s", message)
+            return
         self._console(Fore.WHITE, message)
         self.logger.info("INFO: %s", message)
 
@@ -95,6 +116,12 @@ class WorkflowLogger:
         }
         selected = palette.get(color, Fore.CYAN)
         clean_title = str(title or "").strip()
+        # Compact mode: only the cards that answer "кто получил задачу, что сделал,
+        # успех/неуспех и почему" reach the console; prompt/feedback/raw-response dumps
+        # stay in the log file.
+        if self.console_verbosity == "compact" and not clean_title.startswith(self.COMPACT_BOX_TITLE_PREFIXES):
+            self.logger.info("OPERATOR_BOX: %s - %s", clean_title, " | ".join(str(line) for line in (lines or [])))
+            return
         self._console(selected + Style.BRIGHT, f"+-- {clean_title}")
         for line in lines or []:
             self._console(selected, f"| {line}")
@@ -389,16 +416,17 @@ class WorkflowLogger:
             "rejected": "отклонено",
             "timeout": "таймаут",
             "invalid_output": "некорректный вывод",
+            "qa_failed": "QA отклонил",
+            "template_validation_failed": "валидатор отклонил",
+            "developer_checks_failed": "проверки кода не пройдены",
+            "no_changes": "без изменений",
+            "scope_violation": "выход за рамки задачи",
+            "strict_retrieval_blocked": "превышен бюджет чтения",
+            "planner_invalid": "план невалиден",
+            "task_designer_invalid": "контракт невалиден",
+            "rollback_failed": "откат не удался",
         }
         return fixed_mapping.get(status, status)
-        mapping = {
-            "success": "успех",
-            "failed": "ошибка",
-            "rejected": "отклонено",
-            "timeout": "таймаут",
-            "invalid_output": "некорректный вывод",
-        }
-        return mapping.get(status, status)
 
     @staticmethod
     def _safe_name(value: str) -> str:
