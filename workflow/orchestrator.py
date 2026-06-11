@@ -9220,13 +9220,25 @@ class WorkflowOrchestrator:
 
     @staticmethod
     def _extract_task_evidence_tokens(item: dict[str, Any]) -> list[str]:
-        """URL-like tokens from the backlog item's title/acceptance criteria — checkable facts
-        for verifying an 'already implemented' claim (e.g. /api/analytics/customers)."""
+        """Checkable code facts from the backlog item's title/acceptance criteria, for
+        verifying an 'already implemented' claim: URL paths (/api/analytics/customers),
+        camelCase identifiers (fetchCustomerAnalytics) and snake_case identifiers
+        (get_customer_analytics). Plain prose words never match."""
         blob = " ".join(
             [str(item.get("title") or "")]
             + [str(value) for value in (item.get("acceptance_criteria") or [])]
         )
         tokens = re.findall(r"/(?:[\w\-{}]+/)+[\w\-{}]+", blob)
+        tokens += [
+            token
+            for token in re.findall(r"\b[a-z][a-z0-9]*(?:[A-Z][a-zA-Z0-9]*)+\b", blob)
+            if len(token) >= 5
+        ]
+        tokens += [
+            token
+            for token in re.findall(r"\b[a-z][a-z0-9]+(?:_[a-z0-9]+)+\b", blob)
+            if len(token) >= 5
+        ]
         return list(dict.fromkeys(tokens))
 
     def _check_obsolescence_claim(self, item: dict[str, Any]) -> tuple[bool, list[str]]:

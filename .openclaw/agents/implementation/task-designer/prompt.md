@@ -44,6 +44,7 @@ Strict rules:
 - If the task outline is underspecified, do not guess broadly. Return:
   - `status: contract_invalid`
   - `reason: <short concrete reason>`
+- NEVER declare a task obsolete/already-implemented unless EVERY symbol, function name, and URL named in the acceptance criteria literally exists in the task's files (verify with search_text). A similarly named function does NOT count: `getAnalytics()` calling `/admin/analytics` does not satisfy a criterion that requires `fetchCustomerAnalytics` or `/api/analytics/customers`. If any required name is absent, the task is NOT obsolete — produce the contract for exactly the missing pieces.
 - `must_contain` must contain at least 2 exact code signatures, declarations, or statements.
 - `must_contain` must be code-like, not prose.
 - Each `must_contain` item MUST be a definition signature or call token that contains `(`, `:`, or `=` — e.g. `def get_customer_analytics(start_date=None, end_date=None):` or `cursor.execute(`. The validator REJECTS any item lacking one of those (bare SQL clauses like `SELECT customers.id`, `FROM customers`, `JOIN ...`, `GROUP BY ...`) as `vague_must_contain`, which hard-fails the whole task. For query functions, list ONLY the `def ...(...):` signatures in `must_contain`; describe which tables/columns to query in `integration` and `notes` (prose), never as SQL clauses in `must_contain` or `must_test`.

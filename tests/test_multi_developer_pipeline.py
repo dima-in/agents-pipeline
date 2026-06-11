@@ -1543,6 +1543,30 @@ def test_obsolescence_claim_disproven_when_endpoints_absent(tmp_path) -> None:
     assert supported is True and missing == []
 
 
+def test_obsolescence_claim_disproven_for_identifier_criteria(tmp_path) -> None:
+    # run_20260611_214950: TASK-003's criteria name FUNCTIONS, not URLs
+    # ("api.js exports fetchCustomerAnalytics, ..."), and the URL-only extractor found
+    # nothing checkable -> the claim could not be disproven -> designer refused 3x again.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    (tmp_path / "api.js").write_text(
+        "export const api = { getAnalytics: () => request('/admin/analytics') }\n", encoding="utf-8"
+    )
+    item = {
+        "id": "TASK-003",
+        "title": "Add AdminAnalytics component API client stub",
+        "acceptance_criteria": [
+            "api.js exports fetchCustomerAnalytics, fetchProductAnalytics, fetchSummaryAnalytics",
+            "AdminAnalytics.jsx calls the new API functions",
+        ],
+        "allowed_paths": ["api.js"],
+    }
+    tokens = orchestrator._extract_task_evidence_tokens(item)
+    assert {"fetchCustomerAnalytics", "fetchProductAnalytics", "fetchSummaryAnalytics"}.issubset(set(tokens))
+    supported, missing = orchestrator._check_obsolescence_claim(item)
+    assert supported is False
+    assert "fetchCustomerAnalytics" in missing
+
+
 def test_handoff_card_includes_task_essence(tmp_path) -> None:
     orchestrator = make_orchestrator_with_workspace(tmp_path)
     orchestrator._selected_implementation_item = {
