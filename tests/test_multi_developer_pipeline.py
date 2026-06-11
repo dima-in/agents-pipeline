@@ -1515,6 +1515,45 @@ def test_qa_verdict_recognizes_rejection_phrasings() -> None:
     assert verdict("Вердикт QA: Принято, блокирующих замечаний нет.") == "passed"
 
 
+def test_must_contain_gates_decorators_quote_insensitively() -> None:
+    # run_20260611_173952: qa/validator read a truncated excerpt and falsely reported the
+    # registered FastAPI routes missing. Decorators are now gated deterministically by the
+    # engine against the FULL file, quote- and whitespace-normalized.
+    gate = WorkflowOrchestrator._missing_must_contain
+    content = (
+        "@app.get('/api/analytics/customers')\n"
+        "def get_customer_analytics(start_date=None, end_date=None):\n"
+        "    return []\n"
+    )
+    requirements = [
+        '@app.get("/api/analytics/customers")',  # double quotes vs single in file -> still found
+        '@app.get("/api/analytics/products")',   # genuinely absent -> reported
+        "def get_customer_analytics(start_date: Optional[str] = None, end_date: Optional[str] = None):",
+    ]
+    missing = gate(content, requirements)
+    assert missing == ['@app.get("/api/analytics/products")']
+
+
+def test_qa_verdict_fail_closed_on_unrecognized_phrasing() -> None:
+    # run_20260611_173952: 'Требуется доработка' matched no marker -> qa passed -> merged.
+    verdict = WorkflowOrchestrator._extract_qa_verdict
+    assert verdict("Вердикт QA:\nТребуется доработка.") == "failed"
+    assert verdict("Вердикт QA: Какая-то новая формулировка отказа") == "failed"  # fail-closed
+    assert verdict("Вердикт QA: ПРИНЯТО") == "passed"
+    assert verdict("Итог: строки вердикта нет вовсе") == ""
+
+
+def test_validator_verdict_falls_back_to_body_tokens() -> None:
+    # run_20260611_173952: the validator skipped the status line; its report was full of
+    # '**FAILED** - ...' sections yet was treated as success.
+    verdict = WorkflowOrchestrator._extract_validator_verdict
+    report_failed = "# Отчет валидации\n\n#### Эндпоинты\n**FAILED** - Отсутствуют декораторы\n\n**PASSED** - Сигнатуры верны"
+    assert verdict(report_failed) == "failed"  # FAILED wins over section-level PASSED
+    report_passed = "# Отчет\n**PASSED** - всё на месте"
+    assert verdict(report_passed) == "passed"
+    assert verdict("просто текст без вердикта") == ""
+
+
 def test_dropped_tool_request_detection_and_repair_instruction() -> None:
     # run_20260611_164017: a whole-file write_file JSON was truncated by max_tokens, failed to
     # parse, and was silently accepted as a successful final answer (the write never happened).

@@ -9814,7 +9814,7 @@ class WorkflowOrchestrator:
             verdict = verdict.replace(clean_phrase, "")
         fail_markers = (
             "не пройден", "не принят", "не одобрен", "не соответств", "отклон",
-            "не выполнен", "блокирующ",
+            "не выполнен", "блокирующ", "доработ",
             "rejected", "not accepted", "not passed", "regression",
         )
         pass_markers = ("пройден", "принят", "одобрен", "passed", "accepted", "approved")
@@ -9822,6 +9822,12 @@ class WorkflowOrchestrator:
             return "failed"
         if any(marker in verdict for marker in pass_markers):
             return "passed"
+        # Fail-closed: QA keeps inventing new rejection phrasings ("Требуется доработка",
+        # "Блокирующие замечания", "Не принято", ...). An explicit verdict line whose text
+        # matches no known PASS phrasing is a rejection by default — never a silent merge
+        # (run_20260611_173952 merged on an unrecognized rejection).
+        if verdict.strip():
+            return "failed"
         return ""
 
     @staticmethod
@@ -9839,6 +9845,14 @@ class WorkflowOrchestrator:
             re.IGNORECASE,
         )
         if not match:
+            # No labeled status line (the validator ignored the format) — fall back to strong
+            # standalone verdict tokens in the report body; FAILED sections win over PASSED ones
+            # (run_20260611_173952: a report full of '**FAILED** - ...' was treated as success).
+            lowered = text.lower()
+            if "**failed**" in lowered or "## failed" in lowered:
+                return "failed"
+            if "**passed**" in lowered or "## passed" in lowered:
+                return "passed"
             return ""
         candidate = match.group(1).strip().lower()
         # Check fail phrasings FIRST (negations like "не пройден" contain "пройден").
@@ -10019,9 +10033,20 @@ class WorkflowOrchestrator:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
         }
         missing: list[str] = []
+        normalized_content = ""
         for requirement in must_contain:
             req = str(requirement).strip()
             if not req:
+                continue
+            if req.startswith("@"):
+                # Decorator requirements (e.g. FastAPI routes) are gated by quote/whitespace-
+                # normalized substring against the FULL file. This is deterministic and immune
+                # to the truncated read excerpts that made qa/template-validator falsely report
+                # registered routes as missing (run_20260611_173952).
+                if not normalized_content:
+                    normalized_content = WorkflowOrchestrator._normalize_code_line(content)
+                if WorkflowOrchestrator._normalize_code_line(req) not in normalized_content:
+                    missing.append(req)
                 continue
             symbol_match = re.match(r"(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(|class\s+([A-Za-z_]\w*)\b", req)
             if not symbol_match:
@@ -10030,6 +10055,11 @@ class WorkflowOrchestrator:
             if name not in defined:
                 missing.append(req)
         return missing
+
+    @staticmethod
+    def _normalize_code_line(text: str) -> str:
+        """Quote- and whitespace-insensitive form for substring matching of code lines."""
+        return re.sub(r"\s+", " ", str(text).replace("'", '"')).strip()
 
     def _missing_must_contain_findings(self, item: dict[str, Any], changed_files: list[str]) -> list[str]:
         target_file = item.get("target_file") or {}
