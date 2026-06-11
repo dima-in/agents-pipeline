@@ -1510,6 +1510,31 @@ def test_qa_verdict_recognizes_rejection_phrasings() -> None:
     assert verdict("no verdict line here") == ""
 
 
+def test_request_is_read_only_classifies_tools_and_batches() -> None:
+    # Regression run_20260611_162021: 3 reads consumed all turns, the write never happened,
+    # and the run died with no_changes. Edit agents now get write-reserved turns where
+    # read-only requests are bounced with a force-write instruction.
+    is_read_only = WorkflowOrchestrator._request_is_read_only
+    assert is_read_only({"tool": "read_file", "path": "main.py"}) is True
+    assert is_read_only({"tool": "search_text", "pattern": "def"}) is True
+    assert is_read_only({"tool": "apply_patch", "path": "main.py"}) is False
+    assert is_read_only({"tool": "write_file", "path": "main.py"}) is False
+    assert is_read_only({"tool": "tool_batch", "requests": [{"tool": "read_file"}, {"tool": "read_files"}]}) is True
+    assert is_read_only({"tool": "tool_batch", "requests": [{"tool": "read_file"}, {"tool": "apply_patch"}]}) is False
+
+
+def test_force_write_instruction_names_allowed_paths_and_write_tools() -> None:
+    instruction = WorkflowOrchestrator._build_force_write_instruction(
+        {"selected_task_allowed_paths": ["main.py", "tests/test_analytics_api.py"]}
+    )
+    assert "main.py" in instruction
+    assert "apply_patch" in instruction
+    assert "write_file" in instruction
+    assert "status=implemented" in instruction
+    fallback = WorkflowOrchestrator._build_force_write_instruction({})
+    assert "allowed contract paths" in fallback
+
+
 def test_template_validator_verdict_is_parsed() -> None:
     # Regression: template-validator returned "## Статус: FAILED" but was marked success -> bad output merged.
     verdict = WorkflowOrchestrator._extract_validator_verdict

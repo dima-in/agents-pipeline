@@ -2550,6 +2550,33 @@ class WorkflowOrchestrator:
         return True
 
     @staticmethod
+    def _request_is_read_only(retrieval_request: dict[str, Any]) -> bool:
+        """True when the parsed tool request performs no write (including tool_batch of reads)."""
+        tool = str(retrieval_request.get("tool") or "")
+        if tool in {"write_file", "apply_patch"}:
+            return False
+        if tool == "tool_batch":
+            return all(
+                str(request.get("tool") or "") not in {"write_file", "apply_patch"}
+                for request in retrieval_request.get("requests") or []
+                if isinstance(request, dict)
+            )
+        return True
+
+    @staticmethod
+    def _build_force_write_instruction(message_bundle: dict[str, Any]) -> str:
+        allowed = ", ".join(
+            str(path) for path in (message_bundle.get("selected_task_allowed_paths") or [])
+        ) or "the allowed contract paths"
+        return (
+            "Read budget is exhausted: do NOT request read_file, read_files, search_text or list_files again. "
+            "You already have enough file content. Respond now with exactly ONE JSON write request — "
+            '{"tool":"apply_patch","path":...,"search":...,"replace":...} or '
+            '{"tool":"write_file","path":...,"content":...} — for: ' + allowed + ". "
+            "After the write succeeds, reply exactly status=implemented."
+        )
+
+    @staticmethod
     def _build_retrieval_limit_final_instruction(phase: str, agent_name: str) -> str:
         return (
             "Retrieval budget is now exhausted. Do not request any more tools. "
@@ -4475,6 +4502,16 @@ class WorkflowOrchestrator:
                 max_turns = 3
         if message_bundle.get("strict_execution_mode"):
             max_turns = min(max_turns, 3)
+        # Edit agents must always have room to WRITE after reading: reads may consume the
+        # base budget, but the loop reserves extra turns where read requests are rejected
+        # with a force-write instruction instead of ending the agent with "Exceeded
+        # retrieval rounds" -> no_changes (run_20260611_162021: 3 reads, no write, dead run).
+        read_turns_cap = max_turns
+        edit_agent_loop = phase == "implementation" and (
+            agent_name == "developer" or self._is_multi_developer_edit_agent(agent_name)
+        )
+        if edit_agent_loop and message_bundle.get("retrieval_enabled"):
+            max_turns += 2
 
         self.logger.agent_progress(agent_name, "Executor command:")
         self.logger.agent_progress(agent_name, command)
@@ -4591,6 +4628,20 @@ class WorkflowOrchestrator:
                             continue
                     break
                 tool_name = str(retrieval_request.get("tool") or "")
+                if (
+                    edit_agent_loop
+                    and turn > read_turns_cap
+                    and self._request_is_read_only(retrieval_request)
+                ):
+                    # Write-reserved turns: reads are over; bounce the request back with a
+                    # concrete write instruction instead of executing it.
+                    self.logger.agent_progress(
+                        agent_name,
+                        f"Direct API retrieval turn {turn}: {tool_name} rejected (read budget spent), forcing write",
+                    )
+                    messages.append({"role": "assistant", "content": output_text})
+                    messages.append({"role": "user", "content": self._build_force_write_instruction(message_bundle)})
+                    continue
                 retrieval_budget_check = self._evaluate_retrieval_budget(
                     message_bundle,
                     tool_name,
@@ -4691,6 +4742,9 @@ class WorkflowOrchestrator:
                         "content": "Local retrieval result:\n" + (retrieval_output or "No matching local results."),
                     }
                 )
+                if edit_agent_loop and turn == read_turns_cap and self._request_is_read_only(retrieval_request):
+                    # Last read turn just got spent — tell the model the next response must write.
+                    messages[-1]["content"] += "\n\n" + self._build_force_write_instruction(message_bundle)
                 if turn >= max_turns and self._should_force_final_after_retrieval_limit(phase, agent_name):
                     messages.append(
                         {
