@@ -1515,6 +1515,56 @@ def test_qa_verdict_recognizes_rejection_phrasings() -> None:
     assert verdict("Вердикт QA: Принято, блокирующих замечаний нет.") == "passed"
 
 
+def test_obsolescence_claim_disproven_when_endpoints_absent(tmp_path) -> None:
+    # run_20260611_213539: designer declared TASK-003 obsolete because getAnalytics() exists,
+    # but it calls /admin/analytics - the required /api/analytics/* paths appear nowhere.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    (tmp_path / "api.js").write_text(
+        "export const api = { getAnalytics: () => request('/admin/analytics') }\n", encoding="utf-8"
+    )
+    item = {
+        "id": "TASK-003",
+        "title": "Wire AdminAnalytics to analytics endpoints",
+        "acceptance_criteria": [
+            "fetch /api/analytics/customers with date filters",
+            "fetch /api/analytics/products",
+        ],
+        "allowed_paths": ["api.js"],
+    }
+    supported, missing = orchestrator._check_obsolescence_claim(item)
+    assert supported is False
+    assert "/api/analytics/customers" in missing and "/api/analytics/products" in missing
+
+    # And when the file really wires those paths, the claim stands.
+    (tmp_path / "api.js").write_text(
+        "request('/api/analytics/customers'); request('/api/analytics/products')\n", encoding="utf-8"
+    )
+    supported, missing = orchestrator._check_obsolescence_claim(item)
+    assert supported is True and missing == []
+
+
+def test_handoff_card_includes_task_essence(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator._selected_implementation_item = {
+        "id": "TASK-003",
+        "title": "Add AdminAnalytics component API client stub",
+        "target_file": {"path": "frontend/src/lib/api.js"},
+        "acceptance_criteria": ["GET /api/analytics/customers returns customer analytics"],
+    }
+    title, lines = orchestrator._build_agent_handoff_card("code-developer", "implementation", {})
+    joined = "\n".join(lines)
+    assert "Суть: Add AdminAnalytics component API client stub -> frontend/src/lib/api.js" in joined
+    assert "Критерий: GET /api/analytics/customers" in joined
+
+
+def test_digest_output_lines_extracts_meaningful_summary() -> None:
+    digest = WorkflowOrchestrator._digest_output_lines
+    qa_output = "Вердикт QA:\nТребуется доработка.\n\n```python\ncode\n```\n- деталь раз\n"
+    assert digest(qa_output, 3) == ["Вердикт QA:", "Требуется доработка.", "деталь раз"]
+    assert digest("status=implemented", 3) == []  # protocol echo carries no info
+    assert digest("", 3) == []
+
+
 def test_must_contain_gates_decorators_quote_insensitively() -> None:
     # run_20260611_173952: qa/validator read a truncated excerpt and falsely reported the
     # registered FastAPI routes missing. Decorators are now gated deterministically by the

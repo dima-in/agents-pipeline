@@ -4038,6 +4038,19 @@ class WorkflowOrchestrator:
             lines.append(f"По задаче: {task_id}" + (f" — {scope[:80]}" if scope else ""))
         elif scope:
             lines.append(f"Объём: {scope[:110]}")
+        # The concrete assignment, not the generic duty: task title -> target file + first
+        # acceptance criterion, so the operator sees WHAT exactly was handed over.
+        item = getattr(self, "_selected_implementation_item", None) or {}
+        if phase == "implementation" and isinstance(item, dict):
+            title = str(item.get("title") or "").strip()
+            target = ""
+            if isinstance(item.get("target_file"), dict):
+                target = str((item.get("target_file") or {}).get("path") or "").strip()
+            if title:
+                lines.append(f"Суть: {title[:100]}" + (f" -> {target}" if target else ""))
+            acceptance = [str(value).strip() for value in (item.get("acceptance_criteria") or []) if str(value).strip()]
+            if acceptance:
+                lines.append(f"Критерий: {acceptance[0][:110]}")
         return f"Передача: {predecessor} -> {label}", lines
 
     def _build_agent_result_summary(self, agent_name: str) -> str:
@@ -4081,10 +4094,47 @@ class WorkflowOrchestrator:
 
     def _log_agent_done_card(self, agent_name: str) -> None:
         summary = self._build_agent_result_summary(agent_name)
-        if not summary:
+        digest = self._build_agent_output_digest(agent_name)
+        if not summary and not digest:
             return
         label = AGENT_DISPLAY_RU.get(agent_name, agent_name)
-        self.logger.operator_box(f"Готово: {label}", [f"Сделал: {summary}"], color="green")
+        lines: list[str] = []
+        if summary:
+            lines.append(f"Сделал: {summary}")
+        for index, line in enumerate(digest):
+            lines.append(("Вывод: " if index == 0 else "       ") + line)
+        self.logger.operator_box(f"Готово: {label}", lines, color="green")
+
+    def _build_agent_output_digest(self, agent_name: str, limit_lines: int = 4) -> list[str]:
+        """First meaningful lines of the agent's own answer — the operator-facing 'что он выдал'."""
+        try:
+            report = self._load_saved_agent_report("implementation", agent_name) or {}
+            return self._digest_output_lines(str(report.get("parsed_output") or ""), limit_lines)
+        except Exception:
+            return []
+
+    @staticmethod
+    def _digest_output_lines(text: str, limit_lines: int = 4) -> list[str]:
+        text = str(text or "").strip()
+        # Protocol echoes carry no information for the operator.
+        if not text or text.lower().startswith(("status=implemented", "status=no_changes")):
+            return []
+        lines: list[str] = []
+        in_fence = False
+        for raw in text.splitlines():
+            line = raw.strip()
+            if line.startswith("```"):
+                in_fence = not in_fence
+                continue
+            if in_fence:
+                continue
+            line = line.lstrip("#*->•| ").rstrip("|").strip()
+            if not line or set(line) <= set("-=+*|_~"):
+                continue
+            lines.append(line[:110])
+            if len(lines) >= limit_lines:
+                break
+        return lines
 
     def _build_prompt_brief_lines(self, agent_name: str, phase: str, message_bundle: dict[str, Any]) -> list[str]:
         lines = [
@@ -9168,6 +9218,43 @@ class WorkflowOrchestrator:
             return {"item": normalized, "errors": contract_errors}
         return {"item": None, "errors": [f"task-designer:parse_error:{'; '.join(parse_errors[:3]) or 'unable_to_parse'}"]}
 
+    @staticmethod
+    def _extract_task_evidence_tokens(item: dict[str, Any]) -> list[str]:
+        """URL-like tokens from the backlog item's title/acceptance criteria — checkable facts
+        for verifying an 'already implemented' claim (e.g. /api/analytics/customers)."""
+        blob = " ".join(
+            [str(item.get("title") or "")]
+            + [str(value) for value in (item.get("acceptance_criteria") or [])]
+        )
+        tokens = re.findall(r"/(?:[\w\-{}]+/)+[\w\-{}]+", blob)
+        return list(dict.fromkeys(tokens))
+
+    def _check_obsolescence_claim(self, item: dict[str, Any]) -> tuple[bool, list[str]]:
+        """Verify a designer's 'task is obsolete' claim against the task's own files.
+
+        Returns (claim_supported, missing_tokens): supported only when every URL token from
+        the acceptance criteria already appears in the files the task is allowed to touch.
+        No checkable tokens -> cannot disprove -> treated as supported.
+        """
+        tokens = self._extract_task_evidence_tokens(item)
+        if not tokens:
+            return True, []
+        texts: list[str] = []
+        for rel in item.get("allowed_paths") or []:
+            normalized = self._normalize_repo_relative_path(rel)
+            if not normalized:
+                continue
+            candidate = self.target_workspace / normalized
+            if not self._safe_is_file(candidate):
+                continue
+            try:
+                texts.append(candidate.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                continue
+        combined = "\n".join(texts)
+        missing = [token for token in tokens if token not in combined]
+        return (not missing), missing
+
     def _apply_task_designer_contract_from_report(self, report: dict[str, Any]) -> bool:
         if not self._selected_implementation_item:
             selection = self._prepare_implementation_backlog_selection(require_backlog=True)
@@ -9189,6 +9276,24 @@ class WorkflowOrchestrator:
         parsed = self._parse_task_designer_output(parsed_text, planner_item)
         contract_item = parsed["item"]
         errors = [str(error).strip() for error in (parsed.get("errors") or []) if str(error).strip()]
+        # The designer sometimes refuses with "task is obsolete / already implemented" after
+        # pattern-matching a similarly NAMED symbol without checking what it actually calls
+        # (run_20260611_213539: getAnalytics() hits /admin/analytics, yet the designer declared
+        # the /api/analytics/* wiring complete). Disprove such claims with evidence: every
+        # URL-like token from the task's acceptance criteria must already exist in the task's
+        # files, otherwise the claim is false and the retry feedback says so explicitly.
+        joined_errors = " ".join(errors).lower()
+        if "contract_invalid" in joined_errors and any(
+            marker in joined_errors for marker in ("obsolete", "already", "уже реализован", "уже есть", "complete", "выполнен")
+        ):
+            claim_supported, missing_tokens = self._check_obsolescence_claim(planner_item)
+            if not claim_supported:
+                errors.append(
+                    "obsolescence_claim_disproven: these endpoints/paths required by the task's acceptance criteria "
+                    "are NOT present in the task files: " + ", ".join(missing_tokens[:5]) + ". A similarly named "
+                    "symbol may exist but it does not call these paths. The task is NOT obsolete — produce the "
+                    "executable contract that wires exactly these paths."
+                )
         self._task_designer_validation_errors = errors
         if not contract_item or errors:
             feedback = "Task designer validation errors\n\n```text\n" + ("\n".join(errors) or "unknown_error") + "\n```"
