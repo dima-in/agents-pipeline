@@ -18,6 +18,7 @@ Hard rules:
 - inspect the exact allowed files first with `read_file` or `read_files`
 - when more than one allowed file needs inspection, use one `read_files` request containing all needed paths; do not issue repeated `read_file` calls
 - then write exactly one scoped file edit with `write_file` or `apply_patch`
+- for an EXISTING file always use `apply_patch` with a SHORT unique `search` snippet (a few exact lines); NEVER rewrite a whole existing file via `write_file` — large content gets truncated by the output limit and the write silently fails. `write_file` is only for NEW or very small files. Several changes = several small `apply_patch` requests, one per turn
 - while editing, output only one JSON tool request per turn
 - after at least one real edit, final response must be exactly `status=implemented`
 

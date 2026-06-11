@@ -2577,6 +2577,38 @@ class WorkflowOrchestrator:
         )
 
     @staticmethod
+    def _looks_like_dropped_tool_request(output_text: str) -> bool:
+        """True when a final response was meant to be a tool call but did not parse.
+
+        Typical case: the model rewrites a whole large file via write_file and the JSON
+        is truncated by max_tokens, so the parser returns None and the 'final' text is
+        a half-emitted tool request. Accepting it as a final answer silently drops the
+        write; the caller must repair instead.
+        """
+        text = str(output_text or "").strip()
+        if not text:
+            return False
+        head = text
+        if head.startswith("```"):
+            head = head.lstrip("`").lstrip()
+            if head.lower().startswith("json"):
+                head = head[4:].lstrip()
+        if not head.startswith("{"):
+            return False
+        return '"tool"' in head[:200]
+
+    @staticmethod
+    def _build_truncated_write_repair_instruction() -> str:
+        return (
+            "Your last JSON tool request was invalid or truncated by the output limit, so NO write happened. "
+            "Do NOT rewrite a whole existing file with write_file - large content exceeds the output budget and "
+            "gets cut off. Recover with small steps: emit ONE apply_patch request whose `search` is a SHORT "
+            "unique snippet (a few exact lines copied from the file) and whose `replace` adds the new code. "
+            "If several places must change, send several small apply_patch requests, one per turn. "
+            "After the writes succeed, reply exactly status=implemented."
+        )
+
+    @staticmethod
     def _build_retrieval_limit_final_instruction(phase: str, agent_name: str) -> str:
         return (
             "Retrieval budget is now exhausted. Do not request any more tools. "
@@ -4609,6 +4641,22 @@ class WorkflowOrchestrator:
                 output_text = self._extract_direct_api_text(response_payload)
                 retrieval_request = self._parse_direct_api_retrieval_request(output_text)
                 if not retrieval_request:
+                    # A tool-request-looking final that failed to parse = a write that silently
+                    # never happened (e.g. a whole-file write_file truncated by max_tokens,
+                    # run_20260611_164017). Never accept it as a final answer — repair within
+                    # the turn budget by demanding small apply_patch hunks instead.
+                    if (
+                        edit_agent_loop
+                        and turn < max_turns
+                        and self._looks_like_dropped_tool_request(output_text)
+                    ):
+                        self.logger.agent_progress(
+                            agent_name,
+                            "Diagnostic dropped_tool_request=True (truncated or malformed write request)",
+                        )
+                        messages.append({"role": "assistant", "content": output_text})
+                        messages.append({"role": "user", "content": self._build_truncated_write_repair_instruction()})
+                        continue
                     # Within-turn must_contain gate: refuse a premature "implemented" while the
                     # target code file still lacks required contract symbols — make the developer
                     # finish here instead of failing the whole attempt (cheaper + converges).
@@ -9757,8 +9805,13 @@ class WorkflowOrchestrator:
             return ""
         verdict = match.group(1).strip().lower()
         # Check fail phrasings FIRST (negations like "не принято" contain the pass stem "принят").
+        # Strip negated-clean phrases first so a pass verdict like "блокирующих замечаний нет"
+        # does not trip the "блокирующ" fail marker below.
+        for clean_phrase in ("блокирующих замечаний нет", "нет блокирующих", "без блокирующих"):
+            verdict = verdict.replace(clean_phrase, "")
         fail_markers = (
             "не пройден", "не принят", "не одобрен", "не соответств", "отклон",
+            "не выполнен", "блокирующ",
             "rejected", "not accepted", "not passed", "regression",
         )
         pass_markers = ("пройден", "принят", "одобрен", "passed", "accepted", "approved")
@@ -11685,8 +11738,10 @@ class WorkflowOrchestrator:
             # Developer-class agents emit whole files via write_file, so they need a large
             # output budget. A tight cap truncates the write_file JSON mid-content, which then
             # fails to parse as a tool call and is silently dropped (the file is never written).
+            # 8000 proved too small once a target file grew past ~400 lines (run_20260611_164017);
+            # the loop also detects truncated tool requests and demands apply_patch hunks instead.
             if agent_name == "developer" or agent_name in {"code-developer", "infra-developer", "test-developer"}:
-                return 8000
+                return 16000
             if agent_name == "qa":
                 return 1600
             if agent_name == "template-validator":

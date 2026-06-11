@@ -40,6 +40,7 @@ Strict rules:
 - `test_file.path` must be one exact file already approved by the selected task outline.
 - Do not add new files, new directories, or new allowed paths.
 - Do not invent imports from modules that are not supported by repo_map or reference excerpts.
+- Ground `must_contain` in EXISTING code: when the target file already defines a function/class that fulfills part of the task (check the injected file excerpts), reference its EXACT existing name and signature — never demand a renamed near-duplicate (e.g. do not require `get_analytics_summary(...)` when the file already defines `get_summary_analytics(...)`), and never re-specify an existing function's signature with different annotations.
 - If the task outline is underspecified, do not guess broadly. Return:
   - `status: contract_invalid`
   - `reason: <short concrete reason>`

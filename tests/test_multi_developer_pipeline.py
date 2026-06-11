@@ -1508,6 +1508,26 @@ def test_qa_verdict_recognizes_rejection_phrasings() -> None:
     assert verdict("Вердикт QA:\nПринято. Всё ок.") == "passed"
     assert verdict("Вердикт QA: Пройдено") == "passed"
     assert verdict("no verdict line here") == ""
+    # run_20260611_164017: this phrasing was not recognized -> qa marked [успех] on a rejected result.
+    assert verdict("Вердикт QA:\nБлокирующие замечания. Реализация частичная и контракт TASK-002 не выполнен.") == "failed"
+    assert verdict("Вердикт QA: Контракт не выполнен") == "failed"
+    # Negated-clean phrasing must stay a pass despite containing the 'блокирующ' stem.
+    assert verdict("Вердикт QA: Принято, блокирующих замечаний нет.") == "passed"
+
+
+def test_dropped_tool_request_detection_and_repair_instruction() -> None:
+    # run_20260611_164017: a whole-file write_file JSON was truncated by max_tokens, failed to
+    # parse, and was silently accepted as a successful final answer (the write never happened).
+    looks = WorkflowOrchestrator._looks_like_dropped_tool_request
+    truncated = '{"tool":"write_file","path":"main.py","content":"import math\\nimport secrets'  # no closing brace
+    assert looks(truncated) is True
+    assert looks('```json\n{"tool":"apply_patch","path":"main.py"') is True
+    assert looks("status=implemented") is False
+    assert looks("") is False
+    assert looks("Обычный текстовый ответ без JSON") is False
+    instruction = WorkflowOrchestrator._build_truncated_write_repair_instruction()
+    assert "apply_patch" in instruction
+    assert "status=implemented" in instruction
 
 
 def test_request_is_read_only_classifies_tools_and_batches() -> None:
