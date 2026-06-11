@@ -1,247 +1,135 @@
 # agents-pipeline
 
-`agents-pipeline` is a local-first multi-phase agent workflow that can run from its own engine repository while analyzing or modifying another project directory.
+`agents-pipeline` is a local-first, multi-phase agent workflow that autonomously implements backlog tasks INTO a target repository. It is **universal**: the engine names zero projects; every fact about the target (language, persistence model, schema, join paths, layout, conventions) is detected from the target repo itself or filled in by a profiler agent. The same engine onboards a SQLAlchemy/Alembic service and a hand-written raw-MySQL FastAPI app without code changes.
 
-## Architecture
+## Quick start
 
-The pipeline has two separate roots:
+```powershell
+git clone <YOUR_GITHUB_URL>
+cd agents-pipeline
+Copy-Item .env.example .env   # put OPENROUTER_API_KEY here (start.py loads .env for missing vars)
+.\install.bat
 
-- `engine_root`: the `agents-pipeline` repository itself
-- `target_workspace`: the project being analyzed or changed
+# research once per project (builds the backlog), then implement task by task:
+venv\Scripts\python.exe start.py --phase research --workspace D:\SomeProject --goal "..."
+venv\Scripts\python.exe start.py --phase implementation --workspace D:\SomeProject --mode auto --task-id TASK-001
+```
 
-Engine-owned assets stay under `engine_root`:
+A green implementation run costs around $0.10–0.35 (OpenRouter, mixed sonnet/gpt models).
 
-- `workflow/config.yaml`
-- `workflow/*.py`
-- `.openclaw/agents/**`
-- `manage_agents.py`
-- `run.bat`
-- tests and docs
+## Architecture: two roots
 
-Workspace-owned operations stay under `target_workspace`:
+- `engine_root`: this repository — config, prompts, orchestrator, logs, per-project state
+- `target_workspace`: the project being analyzed or changed (`--workspace`)
 
-- repository context collection
-- retrieval-loop file access
-- `git status`, `git log`
-- implementation branch, merge, and rollback operations
+The engine never edits itself while targeting another repo; the target repo never receives engine files. Logs stay under `engine_root/.openclaw/logs/<project_id>/run_*`. Per-project state persists under `.agents-pipeline/projects/<project_id>/`:
 
-Logs stay under `engine_root/.openclaw/logs/<project_id>/run_*` even when the target workspace points somewhere else.
+- `settings.yaml` — user goal, scope policy (allowed/forbidden paths), completed tasks
+- `context/architecture_profile.json` — the Architecture Profile (see below)
+- `context/repo_map.json` — repo map snapshot
+- `codex.md` / `resume.md` — durable project notes + resume checkpoint (synced via git)
+- `state/implementation_backlog.json` — the canonical task backlog
 
-Project-specific state stays under:
+`project_id` derives from the target's git remote (e.g. `github.com-user-repo`).
 
-- `.agents-pipeline/projects/<project_id>/context`
-- `.agents-pipeline/projects/<project_id>/memory`
-- `.agents-pipeline/projects/<project_id>/logs`
-- `.agents-pipeline/projects/<project_id>/summaries`
-- `.agents-pipeline/projects/<project_id>/settings.yaml`
+## Phases and agents
+
+**Research** (once per goal): project-analyst, competitor/market/tech-analyst, innovation-scout, product-manager. Produces requirements and a backlog. Each role gets a tailored context profile and a deterministic ≤2000-char handoff summary for the next agent.
+
+**Implementation** (per task, up to 3 attempts with git rollback between):
+
+1. `codebase-profiler` — fills `unknown` fields of the Architecture Profile by reading the data layer (skipped when deterministic detectors verified everything)
+2. `architect` — technical plan + persisted `## Target architecture` end-state
+3. `implementation-planner` — backlog (skipped when the canonical backlog exists)
+4. `task-designer` — turns one backlog item into a machine-executable contract (`must_contain`, `must_import`, `must_test`, `forbidden`, ...), validated deterministically; on validation failure it regenerates with the validation feedback (2 retries)
+5. `developer` — in `multi_developer_json` mode the work is routed to `code-developer` / `infra-developer` / `test-developer` by file type; edit agents use a JSON tool protocol (`read_file(s)`, `search_text`, `list_files`, `write_file`, `apply_patch`, `tool_batch`)
+6. deterministic developer checks — `py_compile`, pytest on the contract's test file, `must_contain` symbol gate
+7. `qa` — verdict against the contract (mandatory first line `Вердикт QA: ПРИНЯТО|ОТКЛОНЕНО`)
+8. `template-validator` — structure check (explicit `Статус: PASSED|FAILED` line)
+
+**Deployment readiness** (optional): production-readiness-checker, launch-strategist.
+
+## Grounding (why agents don't hallucinate the stack)
+
+- **Architecture Profile** — confidence-tagged facts `{verified|inferred|unknown}` about the CURRENT codebase: language, persistence (engine, access style, sync/async, session pattern), migrations, layout, tests root. Deterministic detectors fill what they can (`verified`); the profiler agent fills gaps (`inferred`); verified facts are never overridden. The architect's intended END-STATE is captured and carried across tasks as the Target architecture.
+- **DB schema ground truth** — for raw-SQL repos, `CREATE TABLE` statements are parsed into exact table/column lists **and FOREIGN KEY join paths**. Planners see which tables are linked and which are NOT ("the ONLY declared join paths"), so a metric that needs an impossible join gets narrowed by the architect itself instead of shipping invented columns.
+- **Sync/async guardrail** — AST detection of the real DB concurrency + injected-session pattern; contracts demanding async DB on a sync stack are rejected at design time.
+- **Evidence-checked obsolescence** — when the task-designer claims a task is "already implemented", the engine extracts checkable tokens (URLs, camelCase/snake_case identifiers) from the acceptance criteria and greps the task's files; a false claim gets an explicit disproof in the retry feedback.
+
+## Deterministic gates (fail-closed)
+
+- `must_contain` gate: def/class symbols matched by AST name, decorators (e.g. `@app.get("/api/...")`) by quote/whitespace-normalized substring against the FULL file — immune to truncated read excerpts. Runs both post-hoc and **within-turn** (a developer cannot finalize while required symbols are missing).
+- Write-reserved turns: reads can spend the retrieval budget, but edit agents always keep extra turns where read requests are bounced with a force-write instruction — reads can no longer starve the write.
+- Truncated-write repair: a tool-request-looking final answer that failed to parse (e.g. a whole-file `write_file` cut by max_tokens) is never accepted; the loop demands small `apply_patch` hunks instead.
+- QA/validator verdicts are **fail-closed**: an unrecognized verdict phrasing is a rejection by default; a validator report full of `**FAILED**` sections fails even without a status line. Import placement (module-level vs function-local) is non-blocking style, not a violation.
+- Scope policy: per-project `forbidden_paths` (checked first, always win) + per-task `allowed_paths` (the only editable files). Sensitive files (billing/auth/payment...) are auto-derived from the repo map by keyword. Test-less tasks (frontend/docs/config) don't demand a test contract.
+
+## Console observability (Russian, compact by default)
+
+`logging.console_verbosity: compact` shows only the operator story; everything else goes to the run log file:
+
+```text
+Агент запущен: task-designer
++-- Передача: Планировщик -> Конструктор задачи
+| Должен: превратить одну задачу в строгий контракт
+| По задаче: TASK-003 — frontend-only
+| Суть: Add AdminAnalytics component API client stub -> frontend/src/lib/api.js
+| Критерий: api.js exports fetchCustomerAnalytics, ...
++--
+Агент завершен: task-designer [успех]
+Стоимость: агент $0.0317 | фаза $0.1126 | прогон $0.1126
++-- Готово: Конструктор задачи
+| Сделал: контракт для TASK-003: 8 требований
+| Вывод: <первые строки ответа агента>
++--
+```
+
+Failure statuses are translated (`[QA отклонил]`, `[валидатор отклонил]`, `[без изменений]`, ...). Cost lines are first-class and never hidden. Set `verbose` to restore the full stream. Tip for Windows consoles: `setx PYTHONUTF8 1`.
 
 ## Executors
 
-There are two execution modes in the codebase:
+- `direct_api` (current): calls OpenRouter chat completions directly; owns prompt assembly, retrieval, gates, reports, cost accounting. Requires `OPENROUTER_API_KEY` (env or `.env`).
+- `openclaw` (legacy): shells out to the OpenClaw CLI.
 
-- `openclaw`: the legacy runtime path that shells out to the OpenClaw CLI
-- `direct_api`: the current independent runtime path that calls OpenRouter chat completions directly
+Note: OpenAI *codex* models do not work as edit agents in the JSON-in-content protocol (they loop retrieval and never write); use chat models for developer/qa.
 
-`direct_api` exists because workflow execution should not depend on OpenClaw runtime stability or OpenClaw-local agent execution semantics. The pipeline still keeps OpenClaw-compatible prompts, agent directories, and registration helpers, but the orchestration path now owns prompt assembly, local repository context, retrieval, report persistence, and runtime accounting itself.
-
-## direct_api Flow
-
-`WorkflowOrchestrator` is the control plane for:
-
-- phase sequencing
-- runtime resolution
-- prompt assembly
-- target workspace selection
-- report persistence
-- usage and cost tracking
-
-For `direct_api` research agents the orchestrator:
-
-1. loads the agent prompt from `engine_root`
-2. builds a role-specific repository context profile
-3. injects previous-agent handoff summaries when needed
-4. optionally enables a bounded retrieval loop
-5. sends the final request to OpenRouter
-6. saves normalized JSON and Markdown reports under `.openclaw/logs`
-
-## Retrieval Loop
-
-The retrieval loop is available only for research agents that actually need deeper local inspection:
-
-- `project-analyst`
-- `tech-analyst`
-
-Supported tools:
-
-- `read_files`
-- `search_text`
-- `list_files`
-
-Safety rules:
-
-- paths are resolved relative to `target_workspace`
-- escaping `target_workspace` is blocked
-- retrieval diagnostics are logged per run
-
-The retrieval loop is intentionally disabled for the other research roles so their context stays constrained to the intended abstraction level.
-
-## Research Context Profiles
-
-Each active research role gets a different context shape.
-
-`project-analyst`
-- full repo overview
-- target repo git status/log
-- target README
-- workflow config
-- orchestrator outline
-- runtime excerpt
-- tests list
-- direct access to retrieval
-
-`competitor-analyst`
-- compressed project summary
-- target README
-- workflow architecture summary
-- no full orchestrator dump
-- no raw implementation detail dump
-
-`market-analyst`
-- project positioning
-- workflow goals
-- target users and use cases
-- no code context
-
-`tech-analyst`
-- execution architecture
-- orchestrator outline
-- direct_api sections
-- retrieval-loop sections
-- runtime excerpt
-- relevant tests
-
-`innovation-scout`
-- compressed project summary
-- architecture summary
-- current constraints
-- roadmap context
-- no raw repo dump
-
-`product-manager`
-- summaries from all previous research agents
-- no raw repository context
-- no retrieval loop
-
-## Research Handoffs
-
-After every successful research agent, the orchestrator writes a compressed deterministic handoff summary with this structure:
-
-```text
-agent: <agent-name>
-findings:
-- ...
-risks:
-- ...
-decisions:
-- ...
-recommended_next_tasks:
-- ...
-```
-
-Rules:
-
-- capped at 2000 characters
-- deterministic formatting
-- reusable by downstream agents
-- `product-manager` consumes these summaries instead of a raw repo dump
-
-## Cost Guardrails
-
-Set a phase budget in `workflow/config.yaml`:
+## Cost guardrails
 
 ```yaml
 workflow:
   max_phase_cost_usd: 2.50
 ```
 
-Behavior:
+Per-agent/phase/run cost is printed after every agent and accumulated from saved reports; the phase stops before scheduling more agents once the limit is exceeded.
 
-- cost is accumulated from saved agent reports
-- phase and run totals are logged continuously
-- once the current phase total exceeds the limit, the phase stops before scheduling more agents
+## CLI reference (most used)
 
-## Running Against Another Workspace
-
-Default behavior:
-
-- if `--workspace` is passed, it becomes `target_workspace`
-- if `--project-id` is passed, it overrides automatic project identity detection
-- if omitted, the current launch directory becomes `target_workspace`
-- if launched from `engine_root`, the fallback target is `project.workspace` from `workflow/config.yaml`
-
-Examples:
-
-Run against the current directory:
-
-```powershell
-cd /d D:\SomeProject
-D:\agentic-dev-loop\agents-pipeline\run.bat research
-```
-
-Run against an explicit directory:
-
-```powershell
-D:\agentic-dev-loop\agents-pipeline\run.bat --phase research --workspace D:\SomeProject
-```
-
-Shortcut aliases also work with extra flags:
-
-```powershell
-.\run.bat research --skip-git
-.\run.bat r --log-level DEBUG
-.\run.bat impl --mode interactive
-.\run.bat auto
+```text
+--phase research|implementation|deployment|full
+--workspace <dir>          target repo (else: launch dir)
+--mode auto                no blocking prompts; stops after the selected task
+--goal "..."               business-level objective for research/implementation
+--task-id TASK-001         pick a backlog item (or --next-task)
+--rerun-completed          allow re-running a task recorded as completed
+--list-tasks               print the persisted backlog and exit
+--mark-selected-complete   mark the selected task complete without running agents
+--from-agent X / --retry-agent X / --reuse-architect   partial reruns
+--skip-git                 disable branch/merge/rollback
 ```
 
 ## Reports
 
-Each run writes:
+Each run writes JSON+Markdown per agent, a phase summary, `run_summary.json` (tokens, estimated cost) and `human_report.md` under `.openclaw/logs/<project_id>/run_*/`.
 
-- `.openclaw/logs/<project_id>/run_*/agents/<phase>/<agent>.json`
-- `.openclaw/logs/<project_id>/run_*/agents/<phase>/<agent>.md`
-- `.openclaw/logs/<project_id>/run_*/<phase>-summary.md`
-- `.openclaw/logs/<project_id>/run_*/run_summary.json`
+## Known limitations
 
-Research reports also carry:
-
-- `context_profile`
-- `repository_context_chars`
-- `handoff_summary_chars`
-- `retrieval_enabled`
-- `retrieval_rounds`
-- `target_workspace`
-- `project_id`
-
-## Setup
-
-```powershell
-git clone <YOUR_GITHUB_URL>
-cd agents-pipeline
-Copy-Item .env.example .env
-.\install.bat
-.\run.bat python manage_agents.py bootstrap
-```
-
-If you still use OpenClaw registration for compatibility, you can also run:
-
-```powershell
-.\run.bat python manage_agents.py register-all
-```
+- The engine does **not commit** the delivered work in the target repo: a successful run leaves the changes in the working tree (the feature-branch merge is a no-op branch dance). Commit manually before the next run, or the next rollback stash may eat the result.
+- Old TASK helpers can become shadowed dead code when a later task re-implements them inline — review merged results.
 
 ## Tests
 
-Run the full suite with:
-
 ```powershell
-.\run.bat python -m pytest
+venv\Scripts\python.exe -m pytest
 ```
+
+370+ tests; live-run regressions get a test named after the run id that exposed them.
