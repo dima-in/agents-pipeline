@@ -11846,11 +11846,15 @@ class WorkflowOrchestrator:
         agent_cost = usage.get("estimated_cost_usd")
         phase_totals = self.logger.get_phase_totals(phase)
         run_totals = self.logger.get_run_totals()
-        self.logger.agent_progress(agent_name, f"Agent cost: {self._format_cost(agent_cost)}")
-        self.logger.agent_progress(agent_name, f"Phase total so far: {self._format_cost(phase_totals['estimated_cost_usd'])}")
-        self.logger.agent_progress(agent_name, f"Run total so far: {self._format_cost(run_totals['estimated_cost_usd'])}")
+        # Cost is a first-class operator signal (owner request) — one Russian console line,
+        # never hidden by compact mode (logger.info is shown unless noise-prefixed).
+        self.logger.info(
+            f"Стоимость: агент {self._format_cost(agent_cost)}"
+            f" | фаза {self._format_cost(phase_totals['estimated_cost_usd'])}"
+            f" | прогон {self._format_cost(run_totals['estimated_cost_usd'])}"
+        )
         if self.max_phase_cost_usd is not None:
-            self.logger.agent_progress(agent_name, f"Phase cost limit: {self._format_cost(self.max_phase_cost_usd)}")
+            self.logger.info(f"Лимит стоимости фазы: {self._format_cost(self.max_phase_cost_usd)}")
 
     def _phase_cost_limit_exceeded(self, phase: str) -> bool:
         if self.max_phase_cost_usd is None:
@@ -11867,8 +11871,8 @@ class WorkflowOrchestrator:
     @staticmethod
     def _format_cost(value: Any) -> str:
         if value is None:
-            return "unavailable"
-        return f"${float(value):.6f}"
+            return "н/д"
+        return f"${float(value):.4f}"
 
     @staticmethod
     def _direct_api_max_tokens(phase: str, agent_name: str) -> int | None:

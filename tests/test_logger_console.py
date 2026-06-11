@@ -65,6 +65,14 @@ def test_compact_keeps_full_detail_in_log_file(tmp_path) -> None:
     assert "rollback_dirty_worktree" in text
 
 
+def test_compact_console_shows_cost_lines(tmp_path, capsys) -> None:
+    # Owner: cost per agent/phase/run is a first-class signal and must never be hidden.
+    logger = _make(tmp_path, "compact")
+    logger.info("Стоимость: агент $0.0317 | фаза $0.1126 | прогон $0.1126")
+    out = capsys.readouterr().out
+    assert "Стоимость: агент $0.0317" in out
+
+
 def test_failure_statuses_translated_for_operator() -> None:
     translate = WorkflowLogger._translate_status
     assert translate("template_validation_failed") == "валидатор отклонил"
