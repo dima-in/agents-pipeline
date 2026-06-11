@@ -11,6 +11,17 @@
         "tests/__init__.py",
         "tests/test_analytics.py"
       ]
+    },
+    {
+      "task_id": "TASK-002",
+      "title": "Add analytics API endpoints to main.py",
+      "completed_at": "2026-06-11T18:39:28.779060",
+      "commit": "3490b7f19bd99015e0a4c144b4ff511eb9abaf12",
+      "run_id": "run_20260611_173952",
+      "changed_files": [
+        "main.py",
+        "tests/test_analytics_api.py"
+      ]
     }
   ]
 }

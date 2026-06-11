@@ -1,14 +1,16 @@
 project_id: github.com-dima-in-oil
 git_remote: https://github.com/dima-in/Oil
-default_implementation_scope: Implement one small, safe, backend-first improvement
-  to the FastAPI oil-orders app that fits its existing raw-MySQL data layer (UseDatabase/cursor.execute)
-  and flat module layout. No frontend changes.
+default_implementation_scope: Implement one small, safe improvement to the FastAPI
+  oil-orders app that fits its existing raw-MySQL data layer (UseDatabase/cursor.execute)
+  and flat module layout. Backend-first; frontend changes are allowed only within
+  the selected task's allowed_paths (e.g. API client stubs and components wired to
+  existing endpoints).
 implementation_scope_policy:
   forbidden_paths:
-  - frontend/*
   - db_data/*
 completed_implementation_tasks:
 - TASK-001
+- TASK-002
 user_goal: "\u0425\u043E\u0447\u0443 \u0432\u0438\u0434\u0435\u0442\u044C \u043F\u0440\
   \u0438\u0431\u044B\u043B\u044C \u0438 \u0440\u0430\u0441\u0445\u043E\u0434\u044B\
   \ \u043F\u043E \u0431\u0438\u0437\u043D\u0435\u0441\u0443: \u0441\u043A\u043E\u043B\
