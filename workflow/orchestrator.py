@@ -9073,16 +9073,21 @@ class WorkflowOrchestrator:
         must_contain = [str(value).strip() for value in (item.get("must_contain") or []) if str(value).strip()]
         must_test = [str(value).strip() for value in (item.get("must_test") or []) if str(value).strip()]
         errors: list[str] = []
+        # Frontend/docs/config tasks carry no pytest requirement: demanding a test_file whose
+        # path must come from an EMPTY required_test_paths list is unsatisfiable (run
+        # run_20260611_215559: the designer could not emit any valid contract for a
+        # frontend-only task and fell back to a false "obsolete" refusal).
+        requires_tests = self._task_requires_tests(item)
 
         if not item.get("_target_file_declared", False):
             errors.append(f"{task_id}:missing_target_file")
-        if not item.get("_test_file_declared", False):
+        if requires_tests and not item.get("_test_file_declared", False):
             errors.append(f"{task_id}:missing_test_file_contract")
         if not item.get("_depends_on_declared", False):
             errors.append(f"{task_id}:missing_depends_on")
         if not item.get("_must_contain_declared", False):
             errors.append(f"{task_id}:missing_must_contain_contract")
-        if not item.get("_must_test_declared", False):
+        if requires_tests and not item.get("_must_test_declared", False):
             errors.append(f"{task_id}:missing_must_test_contract")
 
         if target_file_path and target_file_path not in allowed_paths:
@@ -9092,11 +9097,11 @@ class WorkflowOrchestrator:
         if target_file_action not in {"create", "update", "modify"}:
             errors.append(f"{task_id}:invalid_target_file_action")
 
-        if test_file_path and test_file_path not in required_test_paths:
+        if test_file_path and required_test_paths and test_file_path not in required_test_paths:
             errors.append(f"{task_id}:test_file_path_not_in_required_test_paths")
         if test_file_path and test_file_path not in existing_paths and test_file_path not in new_files:
             errors.append(f"{task_id}:test_file_path_not_declared")
-        if test_file_action not in {"create", "update", "modify"}:
+        if (test_file_path or requires_tests) and test_file_action not in {"create", "update", "modify"}:
             errors.append(f"{task_id}:invalid_test_file_action")
 
         if len(must_contain) < 2:
@@ -9105,7 +9110,7 @@ class WorkflowOrchestrator:
             if self._is_vague_contract_item(value):
                 errors.append(f"{task_id}:vague_must_contain:{value[:80]}")
 
-        if len(must_test) < 1:
+        if requires_tests and len(must_test) < 1:
             errors.append(f"{task_id}:must_test_empty")
         for value in must_test:
             if self._is_vague_contract_item(value):

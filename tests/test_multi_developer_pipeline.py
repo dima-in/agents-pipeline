@@ -1515,6 +1515,47 @@ def test_qa_verdict_recognizes_rejection_phrasings() -> None:
     assert verdict("Вердикт QA: Принято, блокирующих замечаний нет.") == "passed"
 
 
+def test_contract_validation_allows_testless_frontend_task(tmp_path) -> None:
+    # run_20260611_215559: a frontend-only task has no required_test_paths, but the contract
+    # validator demanded a test_file whose path must come from that EMPTY list - unsatisfiable,
+    # so the designer could never produce a valid contract.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    base = {
+        "id": "TASK-003",
+        "title": "Add AdminAnalytics component API client stub",
+        "scope": "frontend-only",
+        "allowed_paths": ["frontend/src/lib/api.js", "frontend/src/components/AdminAnalytics.jsx"],
+        "existing_paths": ["frontend/src/lib/api.js", "frontend/src/components/AdminAnalytics.jsx"],
+        "new_files": [],
+        "required_test_paths": [],
+        "target_file": {"path": "frontend/src/lib/api.js", "action": "update"},
+        "test_file": {},
+        "must_contain": ["fetchCustomerAnalytics(", "fetchProductAnalytics("],
+        "must_test": [],
+        "_target_file_declared": True,
+        "_test_file_declared": False,
+        "_depends_on_declared": True,
+        "_must_contain_declared": True,
+        "_must_test_declared": False,
+    }
+    assert orchestrator._validate_backend_task_contract(dict(base)) == []
+
+    # A backend task still demands the test contract.
+    backend = dict(base)
+    backend.update(
+        {
+            "title": "Add analytics helpers",
+            "scope": "backend-only",
+            "allowed_paths": ["main.py"],
+            "existing_paths": ["main.py"],
+            "target_file": {"path": "main.py", "action": "update"},
+        }
+    )
+    backend_errors = orchestrator._validate_backend_task_contract(backend)
+    assert any("missing_test_file_contract" in error for error in backend_errors)
+    assert any("must_test_empty" in error for error in backend_errors)
+
+
 def test_obsolescence_claim_disproven_when_endpoints_absent(tmp_path) -> None:
     # run_20260611_213539: designer declared TASK-003 obsolete because getAnalytics() exists,
     # but it calls /admin/analytics - the required /api/analytics/* paths appear nowhere.

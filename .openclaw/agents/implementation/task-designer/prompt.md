@@ -53,6 +53,7 @@ Strict rules:
 - `reference_files` must be exact existing files from repo_map.
 - `reference_excerpts` must summarize concrete patterns from the provided excerpts context. Do not fabricate code not grounded in those excerpts.
 - `must_test` must contain at least 1 concrete test name with exact assertion intent.
+- EXCEPTION — tasks without tests: when the selected task has NO `required_test_paths` (e.g. frontend-only, docs or config work), OMIT `test_file` entirely and set `must_test: []`. Never invent a test file path for such a task — any invented path fails validation.
 - `must_test` and `must_contain` describe PUBLIC STRUCTURE and RETURN SHAPE, never SQL internals. Never require a test to assert that a function body contains a specific table name, column name, SQL keyword, or `%s` substring — body-text / string-literal checks are brittle and fail against correct implementations (e.g. a query assigned to a `query` variable instead of inlined). For a data-query function, `must_test` asserts that it exists with the right argument-name signature and returns the expected shape (e.g. a dict with named keys); HOW the SQL is written is the developer's choice.
 - `forbidden` must list concrete things the developer must not do in this task.
 

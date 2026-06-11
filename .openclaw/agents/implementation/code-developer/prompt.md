@@ -3,7 +3,7 @@
 Use the direct API JSON tool protocol to make real file edits.
 
 Scope:
-- write application Python code only
+- write application code only, in the language of the target file (Python module, JS/JSX component, etc.)
 - do not write tests
 - do not write Alembic migrations
 - do not write docker/env/yaml/config files
