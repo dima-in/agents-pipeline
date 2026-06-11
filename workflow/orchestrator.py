@@ -227,6 +227,7 @@ class WorkflowOrchestrator:
         self._repo_map_cache: dict[str, Any] | None = None
         self._db_architecture_cache: dict[str, Any] | None = None
         self._raw_sql_schema_cache: dict[str, list[str]] | None = None
+        self._raw_sql_relations_cache: list[tuple[str, str, str, str]] | None = None
         self._project_roots_cache: list[str] | None = None
         self._architecture_profile_cache: dict[str, Any] | None = None
         self._repo_map_before: dict[str, Any] | None = None
@@ -459,7 +460,7 @@ class WorkflowOrchestrator:
                 return True
 
             self._save_feedback(task_id, "qa", f"Попытка {attempt} завершилась ошибкой. Проверь логи и исправь регрессии.")
-            if self._phase_failure_status in {"qa_failed", "developer_checks_failed", "invalid_output"}:
+            if self._phase_failure_status in {"qa_failed", "template_validation_failed", "developer_checks_failed", "invalid_output"}:
                 self._capture_developer_retry_feedback(task_id)
                 self._implementation_retry_from_agent = "developer"
             if self.config["git"]["enabled"] and self.config["git"]["auto_rollback"]:
@@ -4920,6 +4921,23 @@ class WorkflowOrchestrator:
                 )
                 return False
 
+        if phase == "implementation" and agent_name == "template-validator":
+            validator_verdict = self._extract_validator_verdict(parsed_output)
+            if validator_verdict == "failed":
+                result = "template-validator reported template or structure violations"
+                save_agent_report("template_validation_failed", result, elapsed, stdout, "", parsed_output, command, 0)
+                self.logger.agent_end(agent_name, "template_validation_failed", result)
+                self._phase_failure_status = "template_validation_failed"
+                self._log_retry_outcome_summary(
+                    "Human summary (RU)",
+                    [
+                        "Template-validator нашёл нарушения структуры или шаблона вывода.",
+                        "Следующий шаг: сформировать repair-feedback и вернуть задачу в developer.",
+                        "Подробности смотри в сохранённом template-validator.md и в следующем developer feedback.",
+                    ],
+                )
+                return False
+
         if phase == "implementation" and agent_name == "developer":
             developer_extras = self._get_agent_report_extras("implementation", "developer")
             write_tools_used = developer_extras.get("write_tools_used", [])
@@ -6254,14 +6272,9 @@ class WorkflowOrchestrator:
         return "\n".join(lines)
 
     @staticmethod
-    def _parse_create_tables(text: str) -> list[tuple[str, list[str]]]:
-        """Parse `CREATE TABLE name (col type, ...)` blocks into (table, [columns]).
-
-        Handles `IF NOT EXISTS`, quoted identifiers, and nested parens in types
-        (VARCHAR(255), DECIMAL(10,2)); skips constraint lines (PRIMARY KEY, FOREIGN KEY, ...).
-        """
-        results: list[tuple[str, list[str]]] = []
-        constraint_keywords = {"PRIMARY", "FOREIGN", "UNIQUE", "KEY", "CONSTRAINT", "INDEX", "CHECK", "FULLTEXT", "SPATIAL"}
+    def _iter_create_table_bodies(text: str) -> list[tuple[str, str]]:
+        """Yield (table_name, body) for each `CREATE TABLE name (...)` block (balanced parens)."""
+        bodies: list[tuple[str, str]] = []
         for match in re.finditer(r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[`"\[]?(\w+)[`"\]]?\s*\(', text, re.IGNORECASE):
             table = match.group(1)
             depth = 0
@@ -6276,7 +6289,19 @@ class WorkflowOrchestrator:
                     if depth == 0:
                         break
                 index += 1
-            body = text[match.end():index]
+            bodies.append((table, text[match.end():index]))
+        return bodies
+
+    @staticmethod
+    def _parse_create_tables(text: str) -> list[tuple[str, list[str]]]:
+        """Parse `CREATE TABLE name (col type, ...)` blocks into (table, [columns]).
+
+        Handles `IF NOT EXISTS`, quoted identifiers, and nested parens in types
+        (VARCHAR(255), DECIMAL(10,2)); skips constraint lines (PRIMARY KEY, FOREIGN KEY, ...).
+        """
+        results: list[tuple[str, list[str]]] = []
+        constraint_keywords = {"PRIMARY", "FOREIGN", "UNIQUE", "KEY", "CONSTRAINT", "INDEX", "CHECK", "FULLTEXT", "SPATIAL"}
+        for table, body in WorkflowOrchestrator._iter_create_table_bodies(text):
             columns: list[str] = []
             depth = 0
             current = ""
@@ -6306,6 +6331,38 @@ class WorkflowOrchestrator:
             results.append((table, columns))
         return results
 
+    @staticmethod
+    def _parse_foreign_keys(text: str) -> list[tuple[str, str, str, str]]:
+        """Parse FOREIGN KEY constraints into (table, column, ref_table, ref_column).
+
+        Captures both `FOREIGN KEY (col) REFERENCES ref(refcol)` constraint lines and
+        inline `col TYPE REFERENCES ref(refcol)` column definitions. These are the
+        declared join paths — the planners use them to tell which cross-table metrics
+        are actually computable.
+        """
+        relations: list[tuple[str, str, str, str]] = []
+        fk_pattern = re.compile(
+            r'FOREIGN\s+KEY\s*\(\s*[`"\[]?(\w+)[`"\]]?\s*\)\s*'
+            r'REFERENCES\s+[`"\[]?(\w+)[`"\]]?\s*\(\s*[`"\[]?(\w+)[`"\]]?\s*\)',
+            re.IGNORECASE,
+        )
+        inline_pattern = re.compile(
+            r'^\s*[`"\[]?(\w+)[`"\]]?\s+\w+[^,\n]*?\bREFERENCES\s+[`"\[]?(\w+)[`"\]]?\s*\(\s*[`"\[]?(\w+)[`"\]]?\s*\)',
+            re.IGNORECASE | re.MULTILINE,
+        )
+        for table, body in WorkflowOrchestrator._iter_create_table_bodies(text):
+            for column, ref_table, ref_column in fk_pattern.findall(body):
+                entry = (table, column, ref_table, ref_column)
+                if entry not in relations:
+                    relations.append(entry)
+            for column, ref_table, ref_column in inline_pattern.findall(body):
+                if column.upper() in {"FOREIGN", "CONSTRAINT"}:
+                    continue
+                entry = (table, column, ref_table, ref_column)
+                if entry not in relations:
+                    relations.append(entry)
+        return relations
+
     def _extract_raw_sql_schema(self) -> dict[str, list[str]]:
         """Real table->columns parsed from CREATE TABLE statements in the target (ground truth).
 
@@ -6316,6 +6373,7 @@ class WorkflowOrchestrator:
         if cached is not None:
             return cached
         schema: dict[str, list[str]] = {}
+        relations: list[tuple[str, str, str, str]] = []
         try:
             files = [str(entry.get("path") or "") for entry in (self._load_repo_map().get("files") or [])]
         except Exception:
@@ -6335,8 +6393,20 @@ class WorkflowOrchestrator:
             for table, columns in self._parse_create_tables(text):
                 if table and columns and table not in schema:
                     schema[table] = columns
+            for relation in self._parse_foreign_keys(text):
+                if relation not in relations:
+                    relations.append(relation)
         self._raw_sql_schema_cache = schema
+        self._raw_sql_relations_cache = relations
         return schema
+
+    def _extract_raw_sql_relations(self) -> list[tuple[str, str, str, str]]:
+        """Declared FK join paths from the same CREATE TABLE pass as _extract_raw_sql_schema."""
+        cached = getattr(self, "_raw_sql_relations_cache", None)
+        if cached is None:
+            self._extract_raw_sql_schema()
+            cached = getattr(self, "_raw_sql_relations_cache", None) or []
+        return cached
 
     def _build_raw_sql_schema_note(self) -> str:
         schema = self._extract_raw_sql_schema()
@@ -6349,6 +6419,28 @@ class WorkflowOrchestrator:
         for table in sorted(schema):
             columns = schema[table]
             lines.append(f"- {table}: {', '.join(columns) if columns else '(no columns parsed)'}")
+        relations = self._extract_raw_sql_relations()
+        if relations:
+            lines.append("")
+            lines.append(
+                "Table relationships parsed from FOREIGN KEY constraints "
+                "(ground truth — the ONLY declared join paths between tables):"
+            )
+            for table, column, ref_table, ref_column in relations:
+                lines.append(f"- {table}.{column} -> {ref_table}.{ref_column}")
+            linked = {table for table, _, _, _ in relations} | {ref_table for _, _, ref_table, _ in relations}
+            unlinked = sorted(set(schema) - linked)
+            if unlinked:
+                lines.append(
+                    "Tables with NO declared foreign-key link to or from any other table: "
+                    + ", ".join(unlinked) + "."
+                )
+            lines.append(
+                "A metric that combines data from multiple tables is only computable along the join paths above. "
+                "If no path connects two tables, do NOT invent a join, a bridge key, or move a column from one "
+                "table onto another: either compute the metric at the granularity the schema supports (e.g. "
+                "aggregate totals instead of per-row attribution), or state the limitation explicitly."
+            )
         lines.append(
             "Any SQL (e.g. cursor.execute) MUST reference only the tables and columns above. "
             "Do NOT use a table or column name that is not in this list."
@@ -9619,6 +9711,35 @@ class WorkflowOrchestrator:
         if any(marker in verdict for marker in fail_markers):
             return "failed"
         if any(marker in verdict for marker in pass_markers):
+            return "passed"
+        return ""
+
+    @staticmethod
+    def _extract_validator_verdict(parsed_output: str) -> str:
+        """Parse the template-validator status line (e.g. '## Статус: FAILED').
+
+        Returns 'failed', 'passed', or '' when no explicit status line is present.
+        Mirrors _extract_qa_verdict so a FAILED validator verdict is actually acted
+        on (previously it was silently treated as success).
+        """
+        text = str(parsed_output or "")
+        match = re.search(
+            r"(?:Статус|Status|Вердикт)[^:\n]{0,40}:\s*(.{0,80})",
+            text,
+            re.IGNORECASE,
+        )
+        if not match:
+            return ""
+        candidate = match.group(1).strip().lower()
+        # Check fail phrasings FIRST (negations like "не пройден" contain "пройден").
+        fail_markers = (
+            "failed", "не пройден", "не принят", "не соответств",
+            "отклон", "rejected", "not passed",
+        )
+        pass_markers = ("passed", "пройден", "принят", "одобрен", "accepted", "approved")
+        if any(marker in candidate for marker in fail_markers):
+            return "failed"
+        if any(marker in candidate for marker in pass_markers):
             return "passed"
         return ""
 

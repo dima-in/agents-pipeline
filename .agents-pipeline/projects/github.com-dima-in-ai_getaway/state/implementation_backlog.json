@@ -1,0 +1,406 @@
+{
+  "backlog_id": "github.com-dima-in-ai_getaway:run_20260529_230112:2026-05-29T23:02:15.254849",
+  "created_at": "2026-05-29T23:02:15.254849",
+  "source_run_id": "run_20260529_230112",
+  "tasks": [
+    {
+      "id": "TASK-001",
+      "title": "Add provider metrics database migration and models",
+      "priority": "P0",
+      "scope": "backend-only",
+      "existing_paths": [
+        "gateway-v4/app/models.py",
+        "gateway-v4/app/database.py",
+        "gateway-v4/alembic/versions/0006_provider_metrics.py"
+      ],
+      "new_directories": [
+        "gateway-v4/tests"
+      ],
+      "new_files": [
+        "gateway-v4/tests/__init__.py",
+        "gateway-v4/tests/test_provider_metrics_migration.py"
+      ],
+      "allowed_paths": [
+        "gateway-v4/app/models.py",
+        "gateway-v4/app/database.py",
+        "gateway-v4/alembic/versions/0006_provider_metrics.py",
+        "gateway-v4/tests/__init__.py",
+        "gateway-v4/tests/test_provider_metrics_migration.py"
+      ],
+      "forbidden_paths": [
+        "gateway-v4/app/routers/billing.py",
+        "frontend"
+      ],
+      "required_test_paths": [
+        "gateway-v4/tests/test_provider_metrics_migration.py"
+      ],
+      "depends_on": [],
+      "acceptance_criteria": [
+        "migration creates provider_metrics table with required columns",
+        "ProviderMetrics model maps to the new table",
+        "migration test validates table structure"
+      ],
+      "reason_each_path_is_needed": {
+        "gateway-v4/app/models.py": "Add ProviderMetrics and ProviderHealth model classes",
+        "gateway-v4/app/database.py": "Reference for existing database session setup",
+        "gateway-v4/alembic/versions/0006_provider_metrics.py": "Existing migration file to verify or extend",
+        "gateway-v4/tests/__init__.py": "Package marker for new test directory",
+        "gateway-v4/tests/test_provider_metrics_migration.py": "Test migration table creation and indexes"
+      },
+      "_target_file_declared": true,
+      "_test_file_declared": true,
+      "_must_contain_declared": false,
+      "_must_test_declared": false,
+      "_depends_on_declared": true,
+      "target_file": {
+        "path": "gateway-v4/app/models.py",
+        "action": "update",
+        "purpose": "Add ProviderMetrics and ProviderHealth model classes"
+      },
+      "must_contain": [],
+      "must_import": [],
+      "integration": [
+        "backend-only"
+      ],
+      "reference_files": [
+        "gateway-v4/app/database.py",
+        "gateway-v4/alembic/versions/0006_provider_metrics.py"
+      ],
+      "reference_excerpts": {},
+      "test_file": {
+        "path": "gateway-v4/tests/test_provider_metrics_migration.py",
+        "action": "create"
+      },
+      "must_test": [
+        "gateway-v4/tests/test_provider_metrics_migration.py"
+      ],
+      "forbidden": [
+        "gateway-v4/app/routers/billing.py",
+        "frontend"
+      ],
+      "contract_completeness": true,
+      "risk_level": "low",
+      "estimated_effort": "2-3 HOURS"
+    },
+    {
+      "id": "TASK-002",
+      "title": "Add performance monitoring service",
+      "priority": "P0",
+      "scope": "backend-only",
+      "existing_paths": [
+        "gateway-v4/app/models.py",
+        "gateway-v4/app/database.py",
+        "gateway-v4/tests/__init__.py"
+      ],
+      "new_directories": [],
+      "new_files": [
+        "gateway-v4/app/services/performance_monitor.py",
+        "gateway-v4/tests/test_performance_monitor.py"
+      ],
+      "allowed_paths": [
+        "gateway-v4/app/models.py",
+        "gateway-v4/app/database.py",
+        "gateway-v4/app/services/performance_monitor.py",
+        "gateway-v4/tests/__init__.py",
+        "gateway-v4/tests/test_performance_monitor.py"
+      ],
+      "forbidden_paths": [
+        "gateway-v4/app/routers/billing.py",
+        "frontend"
+      ],
+      "required_test_paths": [
+        "gateway-v4/tests/test_performance_monitor.py"
+      ],
+      "depends_on": [
+        "TASK-001"
+      ],
+      "acceptance_criteria": [
+        "service records request metrics asynchronously",
+        "service calculates provider health scores",
+        "test validates metric recording and health calculation"
+      ],
+      "reason_each_path_is_needed": {
+        "gateway-v4/app/models.py": "Reference ProviderMetrics model from TASK-001",
+        "gateway-v4/app/database.py": "Use existing database session",
+        "gateway-v4/app/services/performance_monitor.py": "New monitoring service implementation",
+        "gateway-v4/tests/__init__.py": "Test package marker created by TASK-001",
+        "gateway-v4/tests/test_performance_monitor.py": "Test monitoring service logic"
+      },
+      "_target_file_declared": true,
+      "_test_file_declared": true,
+      "_must_contain_declared": false,
+      "_must_test_declared": false,
+      "_depends_on_declared": true,
+      "target_file": {
+        "path": "gateway-v4/app/services/performance_monitor.py",
+        "action": "create",
+        "purpose": "Implement performance monitoring service"
+      },
+      "must_contain": [],
+      "must_import": [],
+      "integration": [
+        "backend-only"
+      ],
+      "reference_files": [
+        "gateway-v4/app/models.py",
+        "gateway-v4/app/database.py"
+      ],
+      "reference_excerpts": {},
+      "test_file": {
+        "path": "gateway-v4/tests/test_performance_monitor.py",
+        "action": "create"
+      },
+      "must_test": [
+        "gateway-v4/tests/test_performance_monitor.py"
+      ],
+      "forbidden": [
+        "gateway-v4/app/routers/billing.py",
+        "frontend"
+      ],
+      "contract_completeness": true,
+      "risk_level": "low",
+      "estimated_effort": "3-4 HOURS"
+    },
+    {
+      "id": "TASK-003",
+      "title": "Add smart routing service",
+      "priority": "P1",
+      "scope": "backend-only",
+      "existing_paths": [
+        "gateway-v4/app/models.py",
+        "gateway-v4/app/database.py",
+        "gateway-v4/app/services/performance_monitor.py",
+        "gateway-v4/tests/__init__.py"
+      ],
+      "new_directories": [],
+      "new_files": [
+        "gateway-v4/app/services/smart_router.py",
+        "gateway-v4/tests/test_smart_router.py"
+      ],
+      "allowed_paths": [
+        "gateway-v4/app/models.py",
+        "gateway-v4/app/database.py",
+        "gateway-v4/app/services/performance_monitor.py",
+        "gateway-v4/app/services/smart_router.py",
+        "gateway-v4/tests/__init__.py",
+        "gateway-v4/tests/test_smart_router.py"
+      ],
+      "forbidden_paths": [
+        "gateway-v4/app/routers/billing.py",
+        "frontend"
+      ],
+      "required_test_paths": [
+        "gateway-v4/tests/test_smart_router.py"
+      ],
+      "depends_on": [
+        "TASK-001",
+        "TASK-002"
+      ],
+      "acceptance_criteria": [
+        "router selects optimal provider based on health metrics",
+        "router falls back to default when metrics unavailable",
+        "test validates routing decisions"
+      ],
+      "reason_each_path_is_needed": {
+        "gateway-v4/app/models.py": "Reference ProviderHealth model",
+        "gateway-v4/app/database.py": "Use existing database session",
+        "gateway-v4/app/services/performance_monitor.py": "Use monitoring service from TASK-002",
+        "gateway-v4/app/services/smart_router.py": "New smart routing service implementation",
+        "gateway-v4/tests/__init__.py": "Test package marker created by TASK-001",
+        "gateway-v4/tests/test_smart_router.py": "Test routing logic"
+      },
+      "_target_file_declared": true,
+      "_test_file_declared": true,
+      "_must_contain_declared": false,
+      "_must_test_declared": false,
+      "_depends_on_declared": true,
+      "target_file": {
+        "path": "gateway-v4/app/services/smart_router.py",
+        "action": "create",
+        "purpose": "Implement smart routing service"
+      },
+      "must_contain": [],
+      "must_import": [],
+      "integration": [
+        "backend-only"
+      ],
+      "reference_files": [
+        "gateway-v4/app/models.py",
+        "gateway-v4/app/services/performance_monitor.py"
+      ],
+      "reference_excerpts": {},
+      "test_file": {
+        "path": "gateway-v4/tests/test_smart_router.py",
+        "action": "create"
+      },
+      "must_test": [
+        "gateway-v4/tests/test_smart_router.py"
+      ],
+      "forbidden": [
+        "gateway-v4/app/routers/billing.py",
+        "frontend"
+      ],
+      "contract_completeness": true,
+      "risk_level": "medium",
+      "estimated_effort": "3-4 HOURS"
+    },
+    {
+      "id": "TASK-004",
+      "title": "Integrate monitoring into proxy service",
+      "priority": "P1",
+      "scope": "backend-only",
+      "existing_paths": [
+        "gateway-v4/app/services/proxy.py",
+        "gateway-v4/app/services/performance_monitor.py",
+        "gateway-v4/tests/__init__.py"
+      ],
+      "new_directories": [],
+      "new_files": [
+        "gateway-v4/tests/test_proxy_monitoring.py"
+      ],
+      "allowed_paths": [
+        "gateway-v4/app/services/proxy.py",
+        "gateway-v4/app/services/performance_monitor.py",
+        "gateway-v4/tests/__init__.py",
+        "gateway-v4/tests/test_proxy_monitoring.py"
+      ],
+      "forbidden_paths": [
+        "gateway-v4/app/routers/billing.py",
+        "frontend"
+      ],
+      "required_test_paths": [
+        "gateway-v4/tests/test_proxy_monitoring.py"
+      ],
+      "depends_on": [
+        "TASK-001",
+        "TASK-002"
+      ],
+      "acceptance_criteria": [
+        "proxy records metrics after each request",
+        "metrics include response time and token usage",
+        "test validates metric recording integration"
+      ],
+      "reason_each_path_is_needed": {
+        "gateway-v4/app/services/proxy.py": "Existing proxy service to integrate monitoring",
+        "gateway-v4/app/services/performance_monitor.py": "Monitoring service from TASK-002",
+        "gateway-v4/tests/__init__.py": "Test package marker created by TASK-001",
+        "gateway-v4/tests/test_proxy_monitoring.py": "Test proxy monitoring integration"
+      },
+      "_target_file_declared": true,
+      "_test_file_declared": true,
+      "_must_contain_declared": false,
+      "_must_test_declared": false,
+      "_depends_on_declared": true,
+      "target_file": {
+        "path": "gateway-v4/app/services/proxy.py",
+        "action": "update",
+        "purpose": "Add monitoring integration to proxy service"
+      },
+      "must_contain": [],
+      "must_import": [],
+      "integration": [
+        "backend-only"
+      ],
+      "reference_files": [
+        "gateway-v4/app/services/performance_monitor.py"
+      ],
+      "reference_excerpts": {},
+      "test_file": {
+        "path": "gateway-v4/tests/test_proxy_monitoring.py",
+        "action": "create"
+      },
+      "must_test": [
+        "gateway-v4/tests/test_proxy_monitoring.py"
+      ],
+      "forbidden": [
+        "gateway-v4/app/routers/billing.py",
+        "frontend"
+      ],
+      "contract_completeness": true,
+      "risk_level": "medium",
+      "estimated_effort": "2-3 HOURS"
+    },
+    {
+      "id": "TASK-005",
+      "title": "Add admin endpoints for provider health monitoring",
+      "priority": "P2",
+      "scope": "backend-only",
+      "existing_paths": [
+        "gateway-v4/app/routers/admin.py",
+        "gateway-v4/app/services/performance_monitor.py",
+        "gateway-v4/app/services/smart_router.py",
+        "gateway-v4/tests/__init__.py"
+      ],
+      "new_directories": [],
+      "new_files": [
+        "gateway-v4/tests/test_admin_monitoring.py"
+      ],
+      "allowed_paths": [
+        "gateway-v4/app/routers/admin.py",
+        "gateway-v4/app/services/performance_monitor.py",
+        "gateway-v4/app/services/smart_router.py",
+        "gateway-v4/tests/__init__.py",
+        "gateway-v4/tests/test_admin_monitoring.py"
+      ],
+      "forbidden_paths": [
+        "gateway-v4/app/routers/billing.py",
+        "frontend"
+      ],
+      "required_test_paths": [
+        "gateway-v4/tests/test_admin_monitoring.py"
+      ],
+      "depends_on": [
+        "TASK-001",
+        "TASK-002",
+        "TASK-003"
+      ],
+      "acceptance_criteria": [
+        "GET /provider-health returns all provider health status",
+        "GET /provider-health/{provider}/{model} returns specific status",
+        "test validates endpoint responses"
+      ],
+      "reason_each_path_is_needed": {
+        "gateway-v4/app/routers/admin.py": "Existing admin router to add monitoring endpoints",
+        "gateway-v4/app/services/performance_monitor.py": "Monitoring service from TASK-002",
+        "gateway-v4/app/services/smart_router.py": "Routing service from TASK-003",
+        "gateway-v4/tests/__init__.py": "Test package marker created by TASK-001",
+        "gateway-v4/tests/test_admin_monitoring.py": "Test admin monitoring endpoints"
+      },
+      "_target_file_declared": true,
+      "_test_file_declared": true,
+      "_must_contain_declared": false,
+      "_must_test_declared": false,
+      "_depends_on_declared": true,
+      "target_file": {
+        "path": "gateway-v4/app/routers/admin.py",
+        "action": "update",
+        "purpose": "Add provider health monitoring endpoints"
+      },
+      "must_contain": [],
+      "must_import": [],
+      "integration": [
+        "backend-only"
+      ],
+      "reference_files": [
+        "gateway-v4/app/services/performance_monitor.py",
+        "gateway-v4/app/services/smart_router.py"
+      ],
+      "reference_excerpts": {},
+      "test_file": {
+        "path": "gateway-v4/tests/test_admin_monitoring.py",
+        "action": "create"
+      },
+      "must_test": [
+        "gateway-v4/tests/test_admin_monitoring.py"
+      ],
+      "forbidden": [
+        "gateway-v4/app/routers/billing.py",
+        "frontend"
+      ],
+      "contract_completeness": true,
+      "risk_level": "low",
+      "estimated_effort": "2-3 HOURS"
+    }
+  ],
+  "selected_task_id": "TASK-002"
+}

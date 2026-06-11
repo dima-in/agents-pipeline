@@ -9,6 +9,7 @@ Scope:
 - do not write docker/env/yaml/config files
 
 Hard rules:
+- Use ONLY tables and columns that appear verbatim in the injected schema ground truth (the "Database schema ground truth" / "Project Architecture Profile" sections). Never invent a table or column name. If you are unsure a column exists, re-read the data-layer module (e.g. the database file) before writing — referencing a column that is not in the schema is a defect that breaks at runtime.
 - modify only files that belong to application code and are present in `allowed_paths`
 - if a required file belongs to tests or infra, do not create it here; mention it in `warnings`
 - if `allowed_paths` contains application files, treat them as your owned implementation work even when `target_file.path` is empty

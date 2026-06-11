@@ -1446,12 +1446,57 @@ def test_raw_sql_schema_note_lists_real_tables(tmp_path) -> None:
     )
     orchestrator._repo_map_cache = {"files": [{"path": "Database.py"}]}
     orchestrator._raw_sql_schema_cache = None
+    orchestrator._raw_sql_relations_cache = None
 
     note = orchestrator._build_raw_sql_schema_note()
 
     assert "order_details" in note
     assert "count" in note
     assert "EXACT" in note
+
+
+def test_raw_sql_schema_note_lists_fk_join_paths_and_unlinked_tables(tmp_path) -> None:
+    # Regression: the architect planned per-customer cost because the ground truth showed
+    # production cost COLUMNS but hid that production_batches has NO join path to orders.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    (tmp_path / "Database.py").write_text(
+        'def create(cur):\n'
+        '    cur.execute("""CREATE TABLE IF NOT EXISTS customers (id INT PRIMARY KEY, name VARCHAR(50))""")\n'
+        '    cur.execute("""CREATE TABLE IF NOT EXISTS orders (\n'
+        '        id INT PRIMARY KEY,\n'
+        '        customer_id INT NOT NULL,\n'
+        '        FOREIGN KEY (customer_id) REFERENCES customers(id)\n'
+        '    )""")\n'
+        '    cur.execute("""CREATE TABLE IF NOT EXISTS production_batches (id INT, labor_cost FLOAT)""")\n',
+        encoding="utf-8",
+    )
+    orchestrator._repo_map_cache = {"files": [{"path": "Database.py"}]}
+    orchestrator._raw_sql_schema_cache = None
+    orchestrator._raw_sql_relations_cache = None
+
+    note = orchestrator._build_raw_sql_schema_note()
+
+    assert "orders.customer_id -> customers.id" in note
+    assert "NO declared foreign-key link" in note
+    assert "production_batches" in note.split("NO declared foreign-key link", 1)[1]
+    assert "do NOT invent a join" in note
+
+
+def test_parse_foreign_keys_handles_constraint_and_inline_forms() -> None:
+    sql = (
+        'CREATE TABLE order_details (\n'
+        '    id INT PRIMARY KEY,\n'
+        '    order_id INT,\n'
+        '    FOREIGN KEY (order_id) REFERENCES orders(id)\n'
+        ');\n'
+        'CREATE TABLE payments (\n'
+        '    id INT,\n'
+        '    order_id INT REFERENCES orders (id)\n'
+        ');\n'
+    )
+    relations = WorkflowOrchestrator._parse_foreign_keys(sql)
+    assert ("order_details", "order_id", "orders", "id") in relations
+    assert ("payments", "order_id", "orders", "id") in relations
 
 
 def test_qa_verdict_recognizes_rejection_phrasings() -> None:
@@ -1463,6 +1508,17 @@ def test_qa_verdict_recognizes_rejection_phrasings() -> None:
     assert verdict("Вердикт QA:\nПринято. Всё ок.") == "passed"
     assert verdict("Вердикт QA: Пройдено") == "passed"
     assert verdict("no verdict line here") == ""
+
+
+def test_template_validator_verdict_is_parsed() -> None:
+    # Regression: template-validator returned "## Статус: FAILED" but was marked success -> bad output merged.
+    verdict = WorkflowOrchestrator._extract_validator_verdict
+    assert verdict("## Статус: ❌ FAILED\n\nИмпорт внутри функции.") == "failed"
+    assert verdict("## Статус: ✅ PASSED") == "passed"
+    assert verdict("Status: FAILED - wrong file") == "failed"
+    assert verdict("Статус проверки: ПРОЙДЕНО") == "passed"
+    assert verdict("Статус: не пройден") == "failed"
+    assert verdict("no status line at all") == ""
 
 
 def test_ide_dirs_excluded_from_repo_map() -> None:

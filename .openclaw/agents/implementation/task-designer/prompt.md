@@ -34,6 +34,7 @@ Strict rules:
   - If the stack is synchronous SQLAlchemy, `must_contain` must use synchronous `def` methods for database work (never `async def`), `must_import` must not introduce `AsyncSession`/`create_async_engine`/`async_sessionmaker`, and `integration`/`forbidden`/`notes` must not require "asynchronous database operations", "async/await for DB", or `asyncio.to_thread` DB wrappers, nor forbid "synchronous database calls".
   - The service/repository must use the injected session (e.g. a `db`/`db_session: Session` parameter or `Depends(get_db)`); do not require it to construct its own `SessionLocal()`.
   - If the stack is asynchronous, mirror the opposite: `async def` DB methods awaited against the injected `AsyncSession`.
+- Do not pin import PLACEMENT. `must_contain` and `must_import` specify which symbols must be imported and used, never WHERE an import statement sits. Never require an import to be module-level (top of file) versus function-local; the developer may place import statements either way. (This does not apply to Alembic `revision`/`down_revision` assignments, which must remain module-level.)
 - Use only the selected task's `allowed_paths`, `required_test_paths`, `existing_paths`, `new_files`, and `reference_files`.
 - `target_file.path` must be one exact file already approved by the selected task outline.
 - `test_file.path` must be one exact file already approved by the selected task outline.
@@ -44,11 +45,13 @@ Strict rules:
   - `reason: <short concrete reason>`
 - `must_contain` must contain at least 2 exact code signatures, declarations, or statements.
 - `must_contain` must be code-like, not prose.
+- Each `must_contain` item MUST be a definition signature or call token that contains `(`, `:`, or `=` — e.g. `def get_customer_analytics(start_date=None, end_date=None):` or `cursor.execute(`. The validator REJECTS any item lacking one of those (bare SQL clauses like `SELECT customers.id`, `FROM customers`, `JOIN ...`, `GROUP BY ...`) as `vague_must_contain`, which hard-fails the whole task. For query functions, list ONLY the `def ...(...):` signatures in `must_contain`; describe which tables/columns to query in `integration` and `notes` (prose), never as SQL clauses in `must_contain` or `must_test`.
 - `must_import` must list concrete imports required for the target file.
 - `integration` must describe concrete connections to existing code, based on the selected task and references.
 - `reference_files` must be exact existing files from repo_map.
 - `reference_excerpts` must summarize concrete patterns from the provided excerpts context. Do not fabricate code not grounded in those excerpts.
 - `must_test` must contain at least 1 concrete test name with exact assertion intent.
+- `must_test` and `must_contain` describe PUBLIC STRUCTURE and RETURN SHAPE, never SQL internals. Never require a test to assert that a function body contains a specific table name, column name, SQL keyword, or `%s` substring — body-text / string-literal checks are brittle and fail against correct implementations (e.g. a query assigned to a `query` variable instead of inlined). For a data-query function, `must_test` asserts that it exists with the right argument-name signature and returns the expected shape (e.g. a dict with named keys); HOW the SQL is written is the developer's choice.
 - `forbidden` must list concrete things the developer must not do in this task.
 
 Quality bar:

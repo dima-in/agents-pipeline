@@ -12,20 +12,20 @@ Manual handoff:
 <!-- AUTO-GENERATED:RESUME-CONTEXT START -->
 ## Resume Checkpoint
 
-- updated_at: 2026-05-27T17:41:08
-- last_run_id: run_20260527_173519
+- updated_at: 2026-05-31T01:50:45
+- last_run_id: run_20260531_014431
 - last_phase: implementation
 - last_agent: test-developer
 - last_status: success
-- next_step: Inspect failed agent developer-checks: developer deterministic checks failed
+- next_step: Inspect failed agent qa: qa reported regressions
 
 ### Current Task
 
-- id: TASK-001
+- id: TASK-002
 - scope: backend-only
-- allowed_paths: gateway-v4/app/database.py, gateway-v4/app/models.py, gateway-v4/alembic/versions/20240801_add_provider_metrics.py, gateway-v4/tests/__init__.py, gateway-v4/tests/test_provider_metrics_migration.py
+- allowed_paths: gateway-v4/app/models.py, gateway-v4/app/database.py, gateway-v4/app/services/performance_monitor.py, gateway-v4/tests/__init__.py, gateway-v4/tests/test_performance_monitor.py
 
 ### Attention
 
-- developer-checks [failed]: developer deterministic checks failed
+- qa [qa_failed]: qa reported regressions
 <!-- AUTO-GENERATED:RESUME-CONTEXT END -->
