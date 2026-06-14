@@ -157,17 +157,16 @@
     },
     {
       "id": "TASK-003",
-      "title": "Add AdminAnalytics component API client stub",
+      "title": "Wire AdminAnalytics.jsx to the new analytics API functions",
       "priority": "P2",
       "scope": "frontend-only",
       "existing_paths": [
-        "frontend/src/lib/api.js",
-        "frontend/src/components/AdminAnalytics.jsx"
+        "frontend/src/components/AdminAnalytics.jsx",
+        "frontend/src/lib/api.js"
       ],
       "new_directories": [],
       "new_files": [],
       "allowed_paths": [
-        "frontend/src/lib/api.js",
         "frontend/src/components/AdminAnalytics.jsx"
       ],
       "forbidden_paths": [],
@@ -176,12 +175,11 @@
         "TASK-002"
       ],
       "acceptance_criteria": [
-        "api.js exports fetchCustomerAnalytics, fetchProductAnalytics, fetchSummaryAnalytics",
-        "AdminAnalytics.jsx calls the new API functions"
+        "AdminAnalytics.jsx imports fetchCustomerAnalytics, fetchProductAnalytics, fetchSummaryAnalytics from ../lib/api",
+        "AdminAnalytics.jsx calls fetchCustomerAnalytics, fetchProductAnalytics and fetchSummaryAnalytics to load analytics data"
       ],
       "reason_each_path_is_needed": {
-        "frontend/src/lib/api.js": "Existing API client module where analytics fetch functions will be added",
-        "frontend/src/components/AdminAnalytics.jsx": "Existing analytics component that will use the new API client functions"
+        "frontend/src/components/AdminAnalytics.jsx": "The component to wire to the new analytics API functions"
       },
       "_target_file_declared": true,
       "_test_file_declared": false,
@@ -189,9 +187,9 @@
       "_must_test_declared": false,
       "_depends_on_declared": true,
       "target_file": {
-        "path": "frontend/src/lib/api.js",
+        "path": "frontend/src/components/AdminAnalytics.jsx",
         "action": "update",
-        "purpose": "Add API client functions for analytics endpoints"
+        "purpose": "Import and call the new fetchCustomer/Product/SummaryAnalytics functions"
       },
       "must_contain": [],
       "must_import": [],
@@ -199,8 +197,7 @@
         "frontend-only"
       ],
       "reference_files": [
-        "frontend/src/lib/api.js",
-        "frontend/src/components/AdminAnalytics.jsx"
+        "frontend/src/lib/api.js"
       ],
       "reference_excerpts": {},
       "test_file": {
@@ -211,8 +208,9 @@
       "forbidden": [],
       "contract_completeness": false,
       "risk_level": "low",
-      "estimated_effort": "1-2 HOURS"
+      "estimated_effort": "1-2 HOURS",
+      "title_note": "api.js part delivered in Oil commit 27a1263"
     }
   ],
-  "selected_task_id": "TASK-002"
+  "selected_task_id": "TASK-003"
 }

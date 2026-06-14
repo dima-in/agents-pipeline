@@ -1515,6 +1515,45 @@ def test_qa_verdict_recognizes_rejection_phrasings() -> None:
     assert verdict("Вердикт QA: Принято, блокирующих замечаний нет.") == "passed"
 
 
+def test_contract_validation_flags_multi_file_edit_task(tmp_path) -> None:
+    # run_20260613_131603: TASK-003 needed edits to BOTH api.js and AdminAnalytics.jsx, but a
+    # single contract edits one target file; the second file was never editable, so QA rejected
+    # it on every attempt until the run died. The guard now fails fast with an actionable reason.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    base = {
+        "id": "TASK-003",
+        "scope": "frontend-only",
+        "target_file": {"path": "frontend/src/lib/api.js", "action": "update"},
+        "test_file": {},
+        "existing_paths": ["frontend/src/lib/api.js", "frontend/src/components/AdminAnalytics.jsx"],
+        "new_files": [],
+        "required_test_paths": [],
+        "must_contain": ["export const fetchCustomerAnalytics =", "const response = await fetch("],
+        "must_test": [],
+        "_target_file_declared": True,
+        "_depends_on_declared": True,
+        "_must_contain_declared": True,
+    }
+    # A criterion names a SECOND allowed file as needing changes, but only api.js is the
+    # editable target -> the second file is unreachable -> flagged.
+    two_file = dict(base)
+    two_file["allowed_paths"] = ["frontend/src/lib/api.js", "frontend/src/components/AdminAnalytics.jsx"]
+    two_file["acceptance_criteria"] = [
+        "api.js exports fetchCustomerAnalytics",
+        "AdminAnalytics.jsx calls the new API functions",
+    ]
+    errors = orchestrator._validate_backend_task_contract(two_file)
+    assert any("task_needs_split_multiple_editable_files" in e and "AdminAnalytics.jsx" in e for e in errors)
+
+    # A passive dependency artifact in allowed_paths that NO criterion asks to change
+    # (e.g. a package marker) is NOT flagged.
+    passive = dict(base)
+    passive["allowed_paths"] = ["frontend/src/lib/api.js", "frontend/src/components/AdminAnalytics.jsx"]
+    passive["acceptance_criteria"] = ["api.js exports the analytics fetch functions"]
+    errors = orchestrator._validate_backend_task_contract(passive)
+    assert not any("task_needs_split_multiple_editable_files" in e for e in errors)
+
+
 def test_contract_validation_allows_testless_frontend_task(tmp_path) -> None:
     # run_20260611_215559: a frontend-only task has no required_test_paths, but the contract
     # validator demanded a test_file whose path must come from that EMPTY list - unsatisfiable,

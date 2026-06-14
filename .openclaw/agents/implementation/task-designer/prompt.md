@@ -37,6 +37,7 @@ Strict rules:
 - Do not pin import PLACEMENT. `must_contain` and `must_import` specify which symbols must be imported and used, never WHERE an import statement sits. Never require an import to be module-level (top of file) versus function-local; the developer may place import statements either way. (This does not apply to Alembic `revision`/`down_revision` assignments, which must remain module-level.)
 - Use only the selected task's `allowed_paths`, `required_test_paths`, `existing_paths`, `new_files`, and `reference_files`.
 - `target_file.path` must be one exact file already approved by the selected task outline.
+- A contract edits exactly ONE file (`target_file`) plus its optional test file; every other `allowed_paths` entry is READ-ONLY and MUST be listed in `reference_files`. If the selected task's acceptance criteria require editing TWO or more source files (e.g. add functions in `api.js` AND make `Component.jsx` call them), you CANNOT express that in one contract — return `status: contract_invalid` with `reason: task requires editing multiple files (<list>); it must be split into one task per edited file`. Do NOT silently drop the second file.
 - `test_file.path` must be one exact file already approved by the selected task outline.
 - Do not add new files, new directories, or new allowed paths.
 - Do not invent imports from modules that are not supported by repo_map or reference excerpts.

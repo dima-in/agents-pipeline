@@ -9097,6 +9097,28 @@ class WorkflowOrchestrator:
         if target_file_action not in {"create", "update", "modify"}:
             errors.append(f"{task_id}:invalid_target_file_action")
 
+        # Multi-file-edit guard: a single contract edits exactly one target file (+ its test
+        # and any new files). If an acceptance criterion names ANOTHER allowed file as needing
+        # changes (so the task really wants to edit two+ files), that file is unreachable and
+        # the task CANNOT be satisfied as one contract — fail fast with an actionable reason
+        # instead of letting QA reject the unreachable file on every attempt until the run dies
+        # (run_20260613_131603: TASK-003 required edits to both api.js and AdminAnalytics.jsx;
+        # the second file was never editable). Keyed on acceptance_criteria mentions (the task's
+        # own statement of what must change), so passive dependency artifacts in allowed_paths
+        # — e.g. a tests/__init__.py package marker — are not flagged.
+        editable_set = {path for path in (target_file_path, test_file_path) if path}
+        editable_set |= set(new_files) | set(required_test_paths)
+        criteria_blob = " ".join(str(value) for value in (item.get("acceptance_criteria") or []))
+        unreachable_edits = [
+            path
+            for path in allowed_paths
+            if path not in editable_set and (path in criteria_blob or Path(path).name in criteria_blob)
+        ]
+        if unreachable_edits:
+            errors.append(
+                f"{task_id}:task_needs_split_multiple_editable_files:" + ",".join(unreachable_edits[:5])
+            )
+
         if test_file_path and required_test_paths and test_file_path not in required_test_paths:
             errors.append(f"{task_id}:test_file_path_not_in_required_test_paths")
         if test_file_path and test_file_path not in existing_paths and test_file_path not in new_files:
