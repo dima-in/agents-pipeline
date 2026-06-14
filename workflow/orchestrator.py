@@ -9056,6 +9056,24 @@ class WorkflowOrchestrator:
         for ref_path in reference_files:
             if ref_path not in effective_known_files:
                 errors.append(f"{task_id}:{ref_path}:reference_file_missing")
+        # Auto-split guard: one task edits exactly ONE source target_file (+ its test/new files).
+        # If an acceptance criterion names another allowed file as needing changes, the planner
+        # bundled a multi-file feature into one task — reject so it re-emits one task per edited
+        # file linked with depends_on (run_20260613_131603: TASK-003 bundled api.js +
+        # AdminAnalytics.jsx and could never be satisfied as a single contract). Keyed on
+        # acceptance_criteria mentions so passive dependency artifacts are not flagged.
+        test_file = item.get("test_file") or {}
+        test_file_path = self._normalize_repo_relative_path(test_file.get("path")) if isinstance(test_file, dict) else ""
+        editable_set = {path for path in (target_file_path, test_file_path) if path}
+        editable_set |= set(new_files) | set(required_test_paths)
+        criteria_blob = " ".join(str(value) for value in (item.get("acceptance_criteria") or []))
+        unreachable_edits = [
+            path
+            for path in allowed_paths
+            if path not in editable_set and (path in criteria_blob or Path(path).name in criteria_blob)
+        ]
+        if unreachable_edits:
+            errors.append(f"{task_id}:multi_file_task_must_be_split:" + ",".join(unreachable_edits[:5]))
         return errors
 
     def _validate_backend_task_contract(self, item: dict[str, Any]) -> list[str]:

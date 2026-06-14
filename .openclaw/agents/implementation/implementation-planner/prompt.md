@@ -28,6 +28,7 @@ Rules:
 - Return at most 5 tasks unless the selected user goal explicitly requires a larger backlog.
 - Break broad plans into safe developer-sized tasks.
 - Keep tasks concrete and file-scoped.
+- ONE EDITED SOURCE FILE PER TASK. Each task edits exactly one source `target_file` (plus, optionally, its own test file and new package markers). If a feature needs changes in two or more source files — e.g. add `fetchX` in `api.js` AND make `Component.jsx` call it — split it into separate tasks, one per edited source file, linked with `depends_on` (the task that consumes a symbol depends on the task that creates it). NEVER write a task whose `acceptance_criteria` require editing a second source file: that file would be unreachable for the single-target developer contract and the task could never pass. `reference_files` are read-only and do not count as edited files.
 - Keep strings compact. Do not write long prose in `acceptance_criteria`, `reason_each_path_is_needed`, or `purpose`.
 - Prefer 2-3 short acceptance criteria per task.
 - Keep each `reason_each_path_is_needed` value short and specific.
@@ -86,6 +87,7 @@ Rules:
 - Do not include commentary outside the YAML or JSON payload.
 
 CRITICAL RULES:
+- ONE edited source file per task. If `acceptance_criteria` mention a second allowed source file that must change, SPLIT into separate `depends_on`-linked tasks. A "stub + wire it up" feature is always two tasks: TASK-a creates the API/function in file A, TASK-b (depends_on TASK-a) calls it in file B, with file A as a read-only `reference_files` entry of TASK-b.
 - `target_file.path` MUST appear in `allowed_paths`.
 - For files, `allowed_paths` declarations must resolve through `existing_paths` or `new_files`; `new_directories` is only valid for directory paths.
 - If task B uses code created by task A, declare `depends_on: ["TASK-A"]`.
@@ -251,6 +253,7 @@ Wrong:
 - Do not put a guessed migration filename into `existing_paths` just because another migration directory exists.
 
 Self-check before output:
+- For every task, confirm its `acceptance_criteria` require editing only ONE source file (the `target_file`); if a second source file must change, split the task and link with `depends_on`.
 - For every path in `allowed_paths`, confirm it also appears in `existing_paths` or `new_files`.
 - For every reused file created by an earlier task, confirm it appears in `existing_paths` of the current task and that `depends_on` names the earlier task.
 - For every reused package marker such as `tests/__init__.py`, confirm it appears in `existing_paths` of the current task and that `depends_on` names the earlier task that created it.

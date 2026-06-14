@@ -1515,6 +1515,47 @@ def test_qa_verdict_recognizes_rejection_phrasings() -> None:
     assert verdict("Вердикт QA: Принято, блокирующих замечаний нет.") == "passed"
 
 
+def test_planner_outline_flags_multi_file_task_for_split(tmp_path) -> None:
+    # Treat the cause one step earlier than the contract guard: the planner must emit one
+    # edited source file per task. A bundled outline (TASK-003: api.js + AdminAnalytics.jsx)
+    # is rejected at planner validation so the planner re-emits split, depends_on-linked tasks.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    (tmp_path / "frontend" / "src" / "lib").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "frontend" / "src" / "components").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "frontend" / "src" / "lib" / "api.js").write_text("export const api = {}\n", encoding="utf-8")
+    (tmp_path / "frontend" / "src" / "components" / "AdminAnalytics.jsx").write_text("export default function A(){}\n", encoding="utf-8")
+    repo_map = {
+        "files": [
+            {"path": "frontend/src/lib/api.js"},
+            {"path": "frontend/src/components/AdminAnalytics.jsx"},
+        ],
+        "directories": ["frontend", "frontend/src", "frontend/src/lib", "frontend/src/components"],
+    }
+    bundled = {
+        "id": "TASK-003",
+        "allowed_paths": ["frontend/src/lib/api.js", "frontend/src/components/AdminAnalytics.jsx"],
+        "existing_paths": ["frontend/src/lib/api.js", "frontend/src/components/AdminAnalytics.jsx"],
+        "new_files": [],
+        "required_test_paths": [],
+        "target_file": {"path": "frontend/src/lib/api.js", "action": "update"},
+        "test_file": {},
+        "acceptance_criteria": [
+            "api.js exports fetchCustomerAnalytics",
+            "AdminAnalytics.jsx calls the new API functions",
+        ],
+    }
+    errors = orchestrator._validate_planner_task_outline(bundled, repo_map=repo_map)
+    assert any("multi_file_task_must_be_split" in e and "AdminAnalytics.jsx" in e for e in errors)
+
+    # Split single-file task (only api.js named in its criterion) passes the guard.
+    single = dict(bundled)
+    single["allowed_paths"] = ["frontend/src/lib/api.js"]
+    single["existing_paths"] = ["frontend/src/lib/api.js"]
+    single["acceptance_criteria"] = ["api.js exports fetchCustomerAnalytics, fetchProductAnalytics"]
+    errors = orchestrator._validate_planner_task_outline(single, repo_map=repo_map)
+    assert not any("multi_file_task_must_be_split" in e for e in errors)
+
+
 def test_contract_validation_flags_multi_file_edit_task(tmp_path) -> None:
     # run_20260613_131603: TASK-003 needed edits to BOTH api.js and AdminAnalytics.jsx, but a
     # single contract edits one target file; the second file was never editable, so QA rejected
