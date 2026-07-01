@@ -1515,6 +1515,40 @@ def test_qa_verdict_recognizes_rejection_phrasings() -> None:
     assert verdict("Вердикт QA: Принято, блокирующих замечаний нет.") == "passed"
 
 
+def test_reference_symbol_ground_truth_confirms_existing_symbols(tmp_path) -> None:
+    # run_20260701_181702: task-designer refused TASK-003 claiming fetchCustomerAnalytics/etc.
+    # were missing from api.js, though they exist past the excerpt cut-off. The engine now
+    # greps the real file and injects a deterministic EXISTS/not-found confirmation.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    (tmp_path / "frontend" / "src" / "lib").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "frontend" / "src" / "components").mkdir(parents=True, exist_ok=True)
+    api = "\n".join(["export const api = {}"] + ["// filler"] * 200 + [
+        "export const fetchCustomerAnalytics = async () => {}",
+        "export const fetchProductAnalytics = async () => {}",
+        "export const fetchSummaryAnalytics = async () => {}",
+    ])
+    (tmp_path / "frontend" / "src" / "lib" / "api.js").write_text(api, encoding="utf-8")
+    (tmp_path / "frontend" / "src" / "components" / "AdminAnalytics.jsx").write_text(
+        "import { getAnalytics } from '../lib/api'\n", encoding="utf-8"
+    )
+    orchestrator._selected_implementation_item = {
+        "id": "TASK-003",
+        "target_file": {"path": "frontend/src/components/AdminAnalytics.jsx", "action": "update"},
+        "allowed_paths": ["frontend/src/components/AdminAnalytics.jsx"],
+        "existing_paths": ["frontend/src/components/AdminAnalytics.jsx"],
+        "reference_files": ["frontend/src/lib/api.js"],
+        "acceptance_criteria": [
+            "AdminAnalytics.jsx imports fetchCustomerAnalytics, fetchProductAnalytics, fetchSummaryAnalytics from ../lib/api",
+            "AdminAnalytics.jsx calls fetchCustomerAnalytics, fetchProductAnalytics and fetchSummaryAnalytics",
+        ],
+    }
+    note = orchestrator._build_reference_symbol_ground_truth()
+    assert "fetchCustomerAnalytics: EXISTS in frontend/src/lib/api.js" in note
+    assert "fetchProductAnalytics: EXISTS" in note
+    assert "fetchSummaryAnalytics: EXISTS" in note
+    assert "Do NOT declare an EXISTS symbol missing" in note
+
+
 def test_planner_outline_flags_multi_file_task_for_split(tmp_path) -> None:
     # Treat the cause one step earlier than the contract guard: the planner must emit one
     # edited source file per task. A bundled outline (TASK-003: api.js + AdminAnalytics.jsx)

@@ -5932,6 +5932,17 @@ class WorkflowOrchestrator:
                     sections.insert(insert_at, ("Selected task file excerpts", scoped_excerpts))
                 else:
                     sections.append(("Selected task file excerpts", scoped_excerpts))
+            # Deterministic proof of which identifiers named in the acceptance criteria already
+            # exist in the task's files — beats a truncated excerpt (run_20260701_181702: the
+            # task-designer refused TASK-003 claiming fetchCustomerAnalytics/etc. were missing
+            # from api.js, though they exist past the excerpt cut-off at line 147+).
+            symbol_truth = self._build_reference_symbol_ground_truth()
+            if symbol_truth:
+                insert_at = next(
+                    (idx + 1 for idx, (title, _) in enumerate(sections) if title == "Selected implementation scope"),
+                    len(sections),
+                )
+                sections.insert(insert_at, ("Reference symbol ground truth", symbol_truth))
         if agent_name == "implementation-planner":
             sections.extend(
                 [
@@ -9285,6 +9296,57 @@ class WorkflowOrchestrator:
             if len(token) >= 5
         ]
         return list(dict.fromkeys(tokens))
+
+    def _build_reference_symbol_ground_truth(self, limit: int = 1000) -> str:
+        """Deterministically confirm which identifiers named in the task's acceptance criteria
+        already exist in its reference/target/existing files, so a downstream agent does not
+        falsely declare a symbol missing from a TRUNCATED excerpt (run_20260701_181702: the
+        task-designer refused TASK-003, claiming fetchCustomerAnalytics/fetchProductAnalytics/
+        fetchSummaryAnalytics were absent from api.js, though they exist at line 147+)."""
+        item = self._selected_implementation_item or {}
+        tokens = [token for token in self._extract_task_evidence_tokens(item) if not token.startswith("/")]
+        if not tokens:
+            return ""
+        files: list[str] = []
+        for key in ("reference_files", "existing_paths", "allowed_paths"):
+            for path in item.get(key) or []:
+                normalized = self._normalize_repo_relative_path(path)
+                if normalized and normalized not in files:
+                    files.append(normalized)
+        target_file = item.get("target_file") or {}
+        if isinstance(target_file, dict):
+            normalized = self._normalize_repo_relative_path(target_file.get("path"))
+            if normalized and normalized not in files:
+                files.append(normalized)
+        contents: dict[str, str] = {}
+        for rel in files:
+            candidate = self.target_workspace / rel
+            if self._safe_is_file(candidate):
+                try:
+                    contents[rel] = candidate.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+        if not contents:
+            return ""
+        found_lines: list[str] = []
+        any_found = False
+        for token in tokens:
+            where = [rel for rel, text in contents.items() if re.search(r"\b" + re.escape(token) + r"\b", text)]
+            if where:
+                any_found = True
+                found_lines.append(f"- {token}: EXISTS in {', '.join(where[:3])}")
+            else:
+                found_lines.append(f"- {token}: not found in the task's files")
+        if not any_found:
+            return ""
+        note = [
+            "Reference symbol ground truth (verified in the actual source - trust this over any "
+            "truncated file excerpt below):",
+            *found_lines,
+            "Do NOT declare an EXISTS symbol missing, and do NOT return contract_invalid/obsolete "
+            "because you could not see it in an excerpt. Wire to it as the task requires.",
+        ]
+        return "\n".join(note)[:limit]
 
     def _check_obsolescence_claim(self, item: dict[str, Any]) -> tuple[bool, list[str]]:
         """Verify a designer's 'task is obsolete' claim against the task's own files.
