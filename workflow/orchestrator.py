@@ -169,6 +169,7 @@ class WorkflowOrchestrator:
         self.current_branch: str | None = None
         self.task_counter = 0
         self._phase_failure_status: str | None = None
+        self._attempt_blockers: list[str] = []
         self._network_unreachable = False
         self._default_branch_cache = ""
         self._agent_report_extras: dict[tuple[str, str], dict[str, Any]] = {}
@@ -321,6 +322,7 @@ class WorkflowOrchestrator:
     def _run_implementation_phase(self) -> bool:
         phase = self.config["phases"]["implementation"]
         self._phase_failure_status = None
+        self._attempt_blockers = []
         self._selected_implementation_item = None
         self._implementation_backlog_cache = None
         self._implementation_backlog_source = ""
@@ -419,16 +421,21 @@ class WorkflowOrchestrator:
                 self._skipped_completed_task_ids = []
             self.logger.info(f"Попытка реализации {attempt}/{max_retries}")
             ok = self._run_phase_agents(phase, "implementation")
+            if not ok and self._phase_failure_status:
+                self._attempt_blockers.append(self._current_blocker_reason(self._phase_failure_status))
             if not ok and self._phase_failure_status in {"scope_violation", "no_changes", "planner_invalid", "task_designer_invalid", "strict_retrieval_blocked", "task_dependencies_incomplete", "dependency_missing_from_backlog"}:
+                hard_status = self._phase_failure_status
                 if self.config["git"]["enabled"] and self.config["git"]["auto_rollback"]:
                     if not self._rollback_git(self._phase_failure_status.replace("_", " ")):
                         self._phase_failure_status = "rollback_failed"
                         self.logger.error("Rollback failed; stopping to avoid retrying on dirty worktree.")
+                        self._emit_supervisor_escalation(task_id, self._phase_failure_status, attempt, max_retries)
                         self.logger.save_phase_summary("implementation", phase["name"])
                         self.logger.phase_end(phase["name"], self._phase_failure_status)
                         return False
+                self._emit_supervisor_escalation(task_id, hard_status, attempt, max_retries)
                 self.logger.save_phase_summary("implementation", phase["name"])
-                self.logger.phase_end(phase["name"], self._phase_failure_status)
+                self.logger.phase_end(phase["name"], hard_status)
                 return False
             if ok:
                 if self._implementation_resume_stops_before_delivery():
@@ -476,6 +483,7 @@ class WorkflowOrchestrator:
                 if attempt < max_retries:
                     self._create_git_branch(task_id)
 
+        self._emit_supervisor_escalation(task_id, self._phase_failure_status or "failed", max_retries, max_retries)
         self.logger.save_phase_summary("implementation", phase["name"])
         self.logger.phase_end(phase["name"], self._phase_failure_status or "failed")
         return False
@@ -9328,23 +9336,24 @@ class WorkflowOrchestrator:
                     continue
         if not contents:
             return ""
-        found_lines: list[str] = []
-        any_found = False
-        for token in tokens:
-            where = [rel for rel, text in contents.items() if re.search(r"\b" + re.escape(token) + r"\b", text)]
-            if where:
-                any_found = True
-                found_lines.append(f"- {token}: EXISTS in {', '.join(where[:3])}")
-            else:
-                found_lines.append(f"- {token}: not found in the task's files")
-        if not any_found:
+        # Only CONFIRM what exists; never print "not found". A "not found" line for a data-
+        # response key (e.g. orders_count, total_revenue) misled the task-designer into thinking
+        # the API does not return it (run_20260701_185348). Absence here is not evidence.
+        found_lines = [
+            f"- {token}: EXISTS in {', '.join(where[:3])}"
+            for token in tokens
+            if (where := [rel for rel, text in contents.items() if re.search(r'\b' + re.escape(token) + r'\b', text)])
+        ]
+        if not found_lines:
             return ""
         note = [
             "Reference symbol ground truth (verified in the actual source - trust this over any "
             "truncated file excerpt below):",
             *found_lines,
-            "Do NOT declare an EXISTS symbol missing, and do NOT return contract_invalid/obsolete "
-            "because you could not see it in an excerpt. Wire to it as the task requires.",
+            "These identifiers DO exist. Do NOT declare them missing or return contract_invalid/"
+            "obsolete because you could not see them in an excerpt - wire to them as the task "
+            "requires. A name NOT listed here is not evidence it is missing (data-response keys "
+            "are not tracked here).",
         ]
         return "\n".join(note)[:limit]
 
@@ -10090,6 +10099,96 @@ class WorkflowOrchestrator:
         if any(marker in candidate for marker in pass_markers):
             return "passed"
         return ""
+
+    def _current_blocker_reason(self, status: str) -> str:
+        """Short human-facing reason for the current failure, pulled from the relevant report."""
+        try:
+            if status == "task_designer_invalid":
+                reason = str(getattr(self, "_task_designer_rejection_reason", "") or "").strip()
+                return (reason.splitlines()[0][:200] if reason else "task-designer не сформировал валидный контракт")
+            if status == "qa_failed":
+                rep = self._load_saved_agent_report("implementation", "qa") or {}
+                return " / ".join(self._digest_output_lines(str(rep.get("parsed_output") or ""), 2))[:200] or "QA отклонил результат"
+            if status == "template_validation_failed":
+                rep = self._load_saved_agent_report("implementation", "template-validator") or {}
+                return " / ".join(self._digest_output_lines(str(rep.get("parsed_output") or ""), 2))[:200] or "валидатор шаблонов отклонил результат"
+            if status == "developer_checks_failed":
+                rep = self._load_saved_agent_report("implementation", "developer-checks") or {}
+                text = str(rep.get("parsed_output") or rep.get("result") or "")
+                return (text.splitlines()[0][:200] if text.strip() else "детерминированные проверки не пройдены")
+            if status == "no_changes":
+                return "разработчик не внёс изменений в файлы"
+            if status == "strict_retrieval_blocked":
+                return "разработчик исчерпал бюджет чтения, не записав файл"
+            if status == "scope_violation":
+                return "выход за разрешённые пути задачи"
+        except Exception:
+            pass
+        return status
+
+    @staticmethod
+    def _supervisor_decision_options(status: str) -> list[str]:
+        options = {
+            "task_designer_invalid": [
+                "Разбить/переопределить задачу (частая причина — >1 редактируемого файла или недоспецификация).",
+                "Дать конкретное ТЗ и перезапустить.",
+                "Пропустить задачу.",
+            ],
+            "qa_failed": [
+                "Показать код: реальная регрессия или придирка QA.",
+                "Смягчить критерий/контракт и перезапустить.",
+                "Доделать вручную.",
+            ],
+            "template_validation_failed": [
+                "Показать, что валидатор считает нарушением структуры.",
+                "Смягчить требование шаблона и перезапустить.",
+                "Доделать вручную.",
+            ],
+            "developer_checks_failed": [
+                "Показать, что не проходит (pytest/символы): баг задачи или кода.",
+                "Уточнить контракт (например, формы данных) и перезапустить.",
+                "Доделать вручную.",
+            ],
+            "no_changes": [
+                "Проверить контракт/область: писать нечего или файл вне области.",
+                "Дать более конкретное ТЗ и перезапустить.",
+            ],
+            "strict_retrieval_blocked": [
+                "Ослабить область или дать точный файл в контракте.",
+                "Дать более конкретное ТЗ и перезапустить.",
+            ],
+            "scope_violation": [
+                "Расширить allowed_paths задачи или сузить саму задачу.",
+            ],
+        }
+        return options.get(status, [
+            "Показать лог прогона.",
+            "Уточнить задачу и перезапустить.",
+            "Пропустить задачу.",
+        ])
+
+    def _emit_supervisor_escalation(self, task_id: Any, status: str, attempts_made: int, max_retries: int) -> None:
+        """Supervisor layer: turn a dead phase into ONE actionable escalation card (task,
+        attempts, the recurring blocker, concrete decisions) instead of a cryptic status or a
+        silent loop. Never raises."""
+        try:
+            item = self._selected_implementation_item or {}
+            task_ref = str(item.get("id") or getattr(self, "selected_task_ref", "") or task_id or "задача")
+            title = str(item.get("title") or "").strip()
+            status_ru = self.logger._translate_status(status)
+            blockers = [b for b in (self._attempt_blockers or []) if b]
+            recurring = blockers[-1] if blockers else ""
+            looped = len(blockers) >= 2 and len(set(blockers)) == 1
+            lines = [f"Задача: {task_ref}" + (f" — {title[:80]}" if title else "")]
+            lines.append(f"Итог: {status_ru}; попыток: {attempts_made}/{max_retries}")
+            if recurring:
+                lines.append(f"Блокер: {recurring}" + (" (повторялся во всех попытках — зациклился)" if looped else ""))
+            lines.append("Возможные решения:")
+            lines.extend(f"  {i}. {opt}" for i, opt in enumerate(self._supervisor_decision_options(status), 1))
+            lines.append("Скажи номер или своё решение — доведу.")
+            self.logger.operator_box("Требуется решение (супервайзер)", lines, color="red")
+        except Exception:
+            self.logger.info(f"Требуется решение: {status}")
 
     def _capture_developer_retry_feedback(self, task_id: int) -> None:
         sections: list[str] = []

@@ -1515,6 +1515,32 @@ def test_qa_verdict_recognizes_rejection_phrasings() -> None:
     assert verdict("Вердикт QA: Принято, блокирующих замечаний нет.") == "passed"
 
 
+def test_supervisor_escalation_card_is_actionable(tmp_path, capsys) -> None:
+    # Supervisor layer: a dead phase becomes ONE actionable card (task, attempts, recurring
+    # blocker, concrete decisions) instead of a cryptic status or a silent loop.
+    from workflow.logger import WorkflowLogger
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator.logger = WorkflowLogger(log_dir=str(tmp_path / "logs"), console_verbosity="compact")
+    orchestrator._selected_implementation_item = {"id": "TASK-003", "title": "Wire AdminAnalytics to analytics"}
+    orchestrator._attempt_blockers = ["contract underspecified", "contract underspecified", "contract underspecified"]
+    orchestrator._emit_supervisor_escalation("TASK-003", "task_designer_invalid", 3, 3)
+    out = capsys.readouterr().out
+    assert "Требуется решение" in out
+    assert "TASK-003" in out
+    assert "попыток: 3/3" in out
+    assert "зациклился" in out  # same blocker across all attempts
+    assert "Разбить" in out  # a concrete decision option for this status
+
+
+def test_supervisor_decision_options_and_blocker_reason(tmp_path) -> None:
+    opt = WorkflowOrchestrator._supervisor_decision_options
+    assert opt("task_designer_invalid") and opt("qa_failed") and opt("developer_checks_failed")
+    assert opt("some_unknown_status")  # generic fallback, never empty
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    assert "не внёс изменений" in orchestrator._current_blocker_reason("no_changes")
+    assert orchestrator._current_blocker_reason("weird_status") == "weird_status"
+
+
 def test_reference_symbol_ground_truth_confirms_existing_symbols(tmp_path) -> None:
     # run_20260701_181702: task-designer refused TASK-003 claiming fetchCustomerAnalytics/etc.
     # were missing from api.js, though they exist past the excerpt cut-off. The engine now
@@ -1546,7 +1572,8 @@ def test_reference_symbol_ground_truth_confirms_existing_symbols(tmp_path) -> No
     assert "fetchCustomerAnalytics: EXISTS in frontend/src/lib/api.js" in note
     assert "fetchProductAnalytics: EXISTS" in note
     assert "fetchSummaryAnalytics: EXISTS" in note
-    assert "Do NOT declare an EXISTS symbol missing" in note
+    assert "Do NOT declare them missing" in note
+    assert "not found" not in note  # never plant doubt about data-response keys
 
 
 def test_planner_outline_flags_multi_file_task_for_split(tmp_path) -> None:
