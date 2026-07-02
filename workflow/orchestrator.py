@@ -4821,6 +4821,30 @@ class WorkflowOrchestrator:
                     and str(retrieval_request.get("tool") or "") in {"write_file", "apply_patch", "tool_batch"}
                     and ("Wrote file:" in str(retrieval_output or "") or "Patched file:" in str(retrieval_output or ""))
                 ):
+                    # A successful write used to force-break with a synthetic status=implemented.
+                    # That cut the developer off after its FIRST patch (e.g. imports only) and
+                    # bypassed the within-turn must_contain gate entirely: run_20260702_150438
+                    # shipped +2 import lines and no endpoint, pytest failed 3/3 attempts.
+                    # Only finish when every contract symbol is actually in the target file.
+                    missing_symbols = (
+                        self._within_turn_missing_must_contain()
+                        if agent_name == "code-developer" and turn < max_turns
+                        else []
+                    )
+                    if missing_symbols:
+                        self.logger.agent_progress(
+                            agent_name,
+                            f"Diagnostic write_accepted_but_must_contain_missing={len(missing_symbols)}",
+                        )
+                        messages.append({"role": "assistant", "content": output_text})
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": "Local retrieval result:\n" + (retrieval_output or "")
+                                + "\n\n" + self._build_must_contain_repair_instruction(missing_symbols),
+                            }
+                        )
+                        continue
                     response_payload = {
                         "choices": [{"message": {"content": "status=implemented"}}],
                         "model": normalized_model,
