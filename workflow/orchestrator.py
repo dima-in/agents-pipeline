@@ -6145,8 +6145,23 @@ class WorkflowOrchestrator:
 
         primary_excerpt = ""
         if editable_existing:
-            # Generous budget so editable target files are never truncated by the shared limit.
-            primary_excerpt = self._direct_api_read_files(editable_existing, limit=20000)
+            # Budget must exceed the largest realistic target file: at 20000 a ~28k-char
+            # main.py lost its TAIL (where routes end and a new endpoint belongs), so the
+            # developer anchored apply_patch blindly and patched a foreign function
+            # (run_20260702: commented out a line inside create_order). If it still gets
+            # truncated, say so explicitly instead of silently.
+            total_editable_size = sum(
+                (self.target_workspace / rel).stat().st_size
+                for rel in editable_existing
+                if self._safe_is_file(self.target_workspace / rel)
+            )
+            primary_excerpt = self._direct_api_read_files(editable_existing, limit=60000)
+            if primary_excerpt and total_editable_size > 60000:
+                primary_excerpt += (
+                    "\n\n[EDITABLE FILE(S) TRUNCATED at 60000 chars. Never rewrite the file from "
+                    "this partial view; read the missing regions with read_file first and anchor "
+                    "apply_patch only on snippets you have actually seen.]"
+                )
             if primary_excerpt:
                 sections.append(primary_excerpt)
 
