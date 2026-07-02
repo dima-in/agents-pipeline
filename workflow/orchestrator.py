@@ -488,7 +488,7 @@ class WorkflowOrchestrator:
                         self._append_supervisor_diagnosis_to_feedback(diagnosis)
                         self.logger.operator_box("Диагноз супервайзера", diagnosis.splitlines()[:6], color="yellow")
             if self.config["git"]["enabled"] and self.config["git"]["auto_rollback"]:
-                if not self._rollback_git(f"attempt {attempt} failed"):
+                if not self._rollback_git(f"изменений (попытка {attempt} не принята)"):
                     self._phase_failure_status = "rollback_failed"
                     self.logger.error("Rollback failed; stopping to avoid retrying on dirty worktree.")
                     self.logger.save_phase_summary("implementation", phase["name"])
@@ -3250,7 +3250,16 @@ class WorkflowOrchestrator:
 
     def _build_target_git_diff_excerpt(self, limit: int = 3200) -> str:
         diff_text = self._run_local_capture(["git", "diff", "--"], timeout=10, cwd=self.target_workspace)
-        return diff_text[:limit]
+        if len(diff_text) <= limit:
+            return diff_text
+        # A silently cut diff makes reviewers judge the missing tail as missing CODE:
+        # run_20260702_160127 - QA rejected a complete implementation 3/3 because the
+        # endpoint function was cut mid-body at the excerpt limit. Say so explicitly.
+        return diff_text[:limit] + (
+            "\n\n[DIFF TRUNCATED: only the beginning is shown; the real change is "
+            f"{len(diff_text)} chars. Code not visible here is NOT evidence of absence - "
+            "verify with search_text/read_file before claiming anything is missing.]"
+        )
 
     def _build_target_product_architecture_summary(self) -> str:
         lines = [
@@ -6000,7 +6009,9 @@ class WorkflowOrchestrator:
         if agent_name in {"architect", "qa", "template-validator"}:
             sections.append(("Target tests list", self._build_target_tests_file_list(limit=1500)))
         if agent_name == "qa":
-            diff_excerpt = self._build_target_git_diff_excerpt(limit=4000)
+            # 4000 chars cut a 144-line endpoint mid-body and QA judged the tail as missing
+            # code (run_20260702_160127); give the reviewer the (nearly) whole change.
+            diff_excerpt = self._build_target_git_diff_excerpt(limit=12000)
             if diff_excerpt:
                 sections.append(("Target git diff", diff_excerpt))
             sections.append(("Repo map before/after summary", self._build_repo_map_delta_summary(limit=2200)))
@@ -9329,6 +9340,7 @@ class WorkflowOrchestrator:
         blob = " ".join(
             [str(item.get("title") or "")]
             + [str(value) for value in (item.get("acceptance_criteria") or [])]
+            + [str(value) for value in (item.get("must_contain") or [])]
         )
         tokens = re.findall(r"/(?:[\w\-{}]+/)+[\w\-{}]+", blob)
         tokens += [

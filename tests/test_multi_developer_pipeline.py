@@ -1532,6 +1532,31 @@ def test_supervisor_escalation_card_is_actionable(tmp_path, capsys) -> None:
     assert "Разбить" in out  # a concrete decision option for this status
 
 
+def test_truncated_diff_excerpt_carries_explicit_warning(tmp_path, monkeypatch) -> None:
+    # run_20260702_160127: QA rejected a COMPLETE implementation 3/3 because the 4000-char
+    # diff excerpt cut the endpoint mid-body and QA judged the invisible tail as missing code.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    long_diff = "+line\n" * 1000
+    monkeypatch.setattr(orchestrator, "_run_local_capture", lambda *a, **k: long_diff)
+    excerpt = orchestrator._build_target_git_diff_excerpt(limit=500)
+    assert "[DIFF TRUNCATED" in excerpt
+    assert "NOT evidence of absence" in excerpt
+    short = orchestrator._build_target_git_diff_excerpt(limit=len(long_diff) + 10)
+    assert "[DIFF TRUNCATED" not in short  # no warning when nothing was cut
+
+
+def test_evidence_tokens_include_must_contain_symbols() -> None:
+    tokens = WorkflowOrchestrator._extract_task_evidence_tokens(
+        {
+            "title": "Add backend assistant endpoint",
+            "acceptance_criteria": ["POST /analytics/assistant endpoint accepts question"],
+            "must_contain": ['def analytics_assistant(', '@app.post("/analytics/assistant")'],
+        }
+    )
+    assert "analytics_assistant" in tokens  # QA sees 'EXISTS' for contract symbols too
+    assert "/analytics/assistant" in tokens
+
+
 def test_supervisor_diagnosis_prompt_and_failsafe(tmp_path, monkeypatch) -> None:
     # The diagnostician judges verdict-vs-diff; it is information only (never a gate) and
     # must never raise — any failure returns "".

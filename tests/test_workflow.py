@@ -4148,7 +4148,7 @@ def test_implementation_phase_stops_when_rollback_fails_after_qa_failure(tmp_pat
     assert orchestrator._phase_failure_status == "rollback_failed"
     assert run_calls == [1]
     assert create_branch_calls == [1]
-    assert rollback_reasons == ["attempt 1 failed"]
+    assert rollback_reasons == ["изменений (попытка 1 не принята)"]
 
 
 def test_implementation_phase_stops_when_rollback_fails_after_fatal_status(tmp_path: Path, monkeypatch) -> None:
