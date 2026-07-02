@@ -1532,6 +1532,50 @@ def test_supervisor_escalation_card_is_actionable(tmp_path, capsys) -> None:
     assert "Разбить" in out  # a concrete decision option for this status
 
 
+def test_supervisor_diagnosis_prompt_and_failsafe(tmp_path, monkeypatch) -> None:
+    # The diagnostician judges verdict-vs-diff; it is information only (never a gate) and
+    # must never raise — any failure returns "".
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator._selected_implementation_item = {
+        "id": "TASK-001",
+        "title": "Add backend assistant endpoint",
+        "acceptance_criteria": ["POST /analytics/assistant accepts question"],
+        "must_contain": ["def analytics_assistant("],
+    }
+    prompt = orchestrator._build_supervisor_diagnosis_prompt()
+    assert "TASK-001" in prompt
+    assert "def analytics_assistant(" in prompt
+    assert "Диагноз:" in prompt  # mandates the output format
+
+    # Failsafe: no API key -> "" (never raises).
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    assert orchestrator._run_supervisor_diagnosis() == ""
+
+    # Mocked LLM response flows through.
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    orchestrator.config = {"workflow": {}}
+    monkeypatch.setattr(
+        orchestrator,
+        "_perform_direct_api_request",
+        lambda payload, key, timeout: (200, '{"choices":[{"message":{"content":"Диагноз: QA прав — эндпоинта нет.\\nРекомендация: дописать def analytics_assistant."}}]}'),
+    )
+    diagnosis = orchestrator._run_supervisor_diagnosis()
+    assert diagnosis.startswith("Диагноз: QA прав")
+
+
+def test_supervisor_escalation_card_includes_diagnosis(tmp_path, capsys) -> None:
+    from workflow.logger import WorkflowLogger
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator.logger = WorkflowLogger(log_dir=str(tmp_path / "logs"), console_verbosity="compact")
+    orchestrator._selected_implementation_item = {"id": "TASK-001", "title": "assistant endpoint"}
+    orchestrator._attempt_blockers = ["qa rejected", "qa rejected"]
+    orchestrator._last_supervisor_diagnosis = "Диагноз: QA придирается — все критерии в диффе выполнены.\nРекомендация: принять или смягчить критерий."
+    orchestrator._emit_supervisor_escalation("TASK-001", "qa_failed", 3, 3)
+    out = capsys.readouterr().out
+    assert "Диагноз: QA придирается" in out
+    assert "Рекомендация:" in out
+
+
 def test_supervisor_decision_options_and_blocker_reason(tmp_path) -> None:
     opt = WorkflowOrchestrator._supervisor_decision_options
     assert opt("task_designer_invalid") and opt("qa_failed") and opt("developer_checks_failed")

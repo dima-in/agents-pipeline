@@ -170,6 +170,7 @@ class WorkflowOrchestrator:
         self.task_counter = 0
         self._phase_failure_status: str | None = None
         self._attempt_blockers: list[str] = []
+        self._last_supervisor_diagnosis = ""
         self._network_unreachable = False
         self._default_branch_cache = ""
         self._agent_report_extras: dict[tuple[str, str], dict[str, Any]] = {}
@@ -323,6 +324,7 @@ class WorkflowOrchestrator:
         phase = self.config["phases"]["implementation"]
         self._phase_failure_status = None
         self._attempt_blockers = []
+        self._last_supervisor_diagnosis = ""
         self._selected_implementation_item = None
         self._implementation_backlog_cache = None
         self._implementation_backlog_source = ""
@@ -473,6 +475,18 @@ class WorkflowOrchestrator:
             if self._phase_failure_status in {"qa_failed", "template_validation_failed", "developer_checks_failed", "invalid_output"}:
                 self._capture_developer_retry_feedback(task_id)
                 self._implementation_retry_from_agent = "developer"
+                # Supervisor diagnostician: when the SAME blocker repeats (a loop is already
+                # visible) or this was the final attempt, judge the verdict against the actual
+                # diff BEFORE the rollback erases it. The diagnosis is information only — it
+                # never overrules a gate: it sharpens the next attempt's feedback and lands in
+                # the "Требуется решение" card. Runs at most twice per task (~$0.03).
+                blockers = self._attempt_blockers
+                if (len(blockers) >= 2 and blockers[-1] == blockers[-2]) or attempt >= max_retries:
+                    diagnosis = self._run_supervisor_diagnosis()
+                    if diagnosis:
+                        self._last_supervisor_diagnosis = diagnosis
+                        self._append_supervisor_diagnosis_to_feedback(diagnosis)
+                        self.logger.operator_box("Диагноз супервайзера", diagnosis.splitlines()[:6], color="yellow")
             if self.config["git"]["enabled"] and self.config["git"]["auto_rollback"]:
                 if not self._rollback_git(f"attempt {attempt} failed"):
                     self._phase_failure_status = "rollback_failed"
@@ -10191,6 +10205,74 @@ class WorkflowOrchestrator:
             "Пропустить задачу.",
         ])
 
+    def _build_supervisor_diagnosis_prompt(self) -> str:
+        """Everything the diagnostician needs: contract essence, the blocker, the last QA and
+        deterministic findings, and the ACTUAL diff of the failing attempt (pre-rollback)."""
+        item = self._selected_implementation_item or {}
+        parts = [
+            "Ты — супервайзер-диагност автономного дев-пайплайна. Разработчик и QA зациклились: "
+            "QA раз за разом отклоняет попытку. Твоя задача — рассудить по фактам, НЕ переписывая код.",
+            f"Задача: {item.get('id')} — {str(item.get('title') or '')[:120]}",
+        ]
+        acceptance = [str(v).strip() for v in (item.get("acceptance_criteria") or []) if str(v).strip()]
+        if acceptance:
+            parts.append("Критерии приёмки:\n" + "\n".join(f"- {a[:160]}" for a in acceptance[:6]))
+        must_contain = [str(v).strip() for v in (item.get("must_contain") or []) if str(v).strip()]
+        if must_contain:
+            parts.append("Контракт must_contain:\n" + "\n".join(f"- {m[:120]}" for m in must_contain[:8]))
+        try:
+            qa_report = self._load_saved_agent_report("implementation", "qa") or {}
+            qa_text = str(qa_report.get("parsed_output") or "").strip()
+            if qa_text:
+                parts.append("Последний вердикт QA:\n" + qa_text[:1800])
+            checks = self._load_saved_agent_report("implementation", "developer-checks") or {}
+            checks_text = str(checks.get("parsed_output") or checks.get("result") or "").strip()
+            if checks_text:
+                parts.append("Детерминированные проверки:\n" + checks_text[:800])
+            diff_text = self._build_target_git_diff_excerpt(limit=3500)
+            if diff_text:
+                parts.append("Реальный дифф попытки:\n" + diff_text)
+        except Exception:
+            pass  # diagnosis works with whatever evidence is available; never raises
+        parts.append(
+            "Ответь по-русски, максимум 6 строк, строго в формате:\n"
+            "Диагноз: <QA прав | QA придирается | контракт/задача некорректны> — <почему, по фактам диффа>\n"
+            "Рекомендация: <одно конкретное действие для следующей попытки или для владельца>"
+        )
+        return "\n\n".join(parts)
+
+    def _run_supervisor_diagnosis(self) -> str:
+        """One cheap LLM judgement of verdict-vs-diff. Information only, never a gate; never raises."""
+        try:
+            api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+            if not api_key:
+                return ""
+            model = self._normalize_openrouter_model(
+                str((self.config.get("workflow") or {}).get("supervisor_model", "openrouter/anthropic/claude-sonnet-4.5"))
+            )
+            payload = {
+                "model": model,
+                "messages": [{"role": "user", "content": self._build_supervisor_diagnosis_prompt()}],
+                "temperature": 0.2,
+                "max_tokens": 400,
+            }
+            _status, raw_body = self._perform_direct_api_request(payload, api_key, timeout=90)
+            text = self._extract_direct_api_text(json.loads(raw_body))
+            return text.strip()[:1200]
+        except Exception:
+            return ""
+
+    def _append_supervisor_diagnosis_to_feedback(self, diagnosis: str) -> None:
+        """Attach the diagnosis to the developer's repair feedback for the next attempt."""
+        try:
+            feedback_file = str(getattr(self, "_developer_feedback_file", "") or "")
+            if not feedback_file:
+                return
+            with open(feedback_file, "a", encoding="utf-8") as handle:
+                handle.write("\n\n## Supervisor diagnosis (verdict vs actual diff)\n\n" + diagnosis + "\n")
+        except OSError:
+            pass
+
     def _emit_supervisor_escalation(self, task_id: Any, status: str, attempts_made: int, max_retries: int) -> None:
         """Supervisor layer: turn a dead phase into ONE actionable escalation card (task,
         attempts, the recurring blocker, concrete decisions) instead of a cryptic status or a
@@ -10207,6 +10289,9 @@ class WorkflowOrchestrator:
             lines.append(f"Итог: {status_ru}; попыток: {attempts_made}/{max_retries}")
             if recurring:
                 lines.append(f"Блокер: {recurring}" + (" (повторялся во всех попытках — зациклился)" if looped else ""))
+            diagnosis = str(getattr(self, "_last_supervisor_diagnosis", "") or "").strip()
+            if diagnosis:
+                lines.extend(diagnosis.splitlines()[:4])
             lines.append("Возможные решения:")
             lines.extend(f"  {i}. {opt}" for i, opt in enumerate(self._supervisor_decision_options(status), 1))
             lines.append("Скажи номер или своё решение — доведу.")
