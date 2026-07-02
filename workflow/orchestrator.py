@@ -475,18 +475,17 @@ class WorkflowOrchestrator:
             if self._phase_failure_status in {"qa_failed", "template_validation_failed", "developer_checks_failed", "invalid_output"}:
                 self._capture_developer_retry_feedback(task_id)
                 self._implementation_retry_from_agent = "developer"
-                # Supervisor diagnostician: when the SAME blocker repeats (a loop is already
-                # visible) or this was the final attempt, judge the verdict against the actual
-                # diff BEFORE the rollback erases it. The diagnosis is information only — it
-                # never overrules a gate: it sharpens the next attempt's feedback and lands in
-                # the "Требуется решение" card. Runs at most twice per task (~$0.03).
-                blockers = self._attempt_blockers
-                if (len(blockers) >= 2 and blockers[-1] == blockers[-2]) or attempt >= max_retries:
-                    diagnosis = self._run_supervisor_diagnosis()
-                    if diagnosis:
-                        self._last_supervisor_diagnosis = diagnosis
-                        self._append_supervisor_diagnosis_to_feedback(diagnosis)
-                        self.logger.operator_box("Диагноз супервайзера", diagnosis.splitlines()[:6], color="yellow")
+                # Supervisor diagnostician: judge the verdict against the actual diff after
+                # EVERY failed attempt, BEFORE the rollback erases it (run_20260702_160127:
+                # waiting for a repeated blocker let two attempts burn on a false QA verdict a
+                # first-attempt diagnosis would have flagged immediately). Information only —
+                # it never overrules a gate: it sharpens the next attempt's feedback and lands
+                # in the "Требуется решение" card. ~$0.02-0.05 per failed attempt.
+                diagnosis = self._run_supervisor_diagnosis()
+                if diagnosis:
+                    self._last_supervisor_diagnosis = diagnosis
+                    self._append_supervisor_diagnosis_to_feedback(diagnosis)
+                    self.logger.operator_box("Диагноз супервайзера", diagnosis.splitlines()[:6], color="yellow")
             if self.config["git"]["enabled"] and self.config["git"]["auto_rollback"]:
                 if not self._rollback_git(f"изменений (попытка {attempt} не принята)"):
                     self._phase_failure_status = "rollback_failed"
