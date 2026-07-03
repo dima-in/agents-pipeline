@@ -3,6 +3,13 @@ workflow:
   mode: interactive
   console_language: ru
   auto_continue_delay: 3
+  # Supervisor arbiter: what to do when a QA rejection is STYLE-level while every
+  # deterministic gate (pytest, must_contain, scope) is green and the diagnostician says
+  # "QA придирается". auto = accept the attempt (deterministic gates stay absolute; only
+  # taste-level LLM-QA is overridden). ask = never auto-accept, always escalate the card.
+  supervisor_arbiter: auto
+  # LLM used by the supervisor diagnostician (verdict-vs-diff judgement).
+  supervisor_model: openrouter/anthropic/claude-sonnet-4.5
   max_phase_cost_usd:
   default_implementation_scope: "Implement one small, safe, backend-first improvement that fits the target repository's existing architecture and conventions."
   # Scope policy is project-agnostic by default (see _default_implementation_scope_policy):

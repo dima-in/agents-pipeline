@@ -1569,6 +1569,33 @@ def test_evidence_tokens_include_must_contain_symbols() -> None:
     assert "/analytics/assistant" in tokens
 
 
+def test_arbiter_accepts_only_style_qa_rejection_with_green_gates(tmp_path) -> None:
+    # The exact case that burned three runs (2026-07-02): deterministic gates green, QA
+    # rejected over import placement, diagnostician said 'принять'. Arbiter accepts THAT and
+    # only that; deterministic gates stay absolute.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator.config = {"workflow": {"supervisor_arbiter": "auto"}}
+    orchestrator._phase_failure_status = "qa_failed"
+
+    # QA nitpick + accept diagnosis + no failing checks -> accept.
+    orchestrator._last_supervisor_diagnosis = "Диагноз: QA придирается — все критерии выполнены.\nРекомендация: принять."
+    assert orchestrator._arbiter_should_accept() is True
+
+    # Diagnosis says QA is right -> never accept.
+    orchestrator._last_supervisor_diagnosis = "Диагноз: QA прав — эндпоинта нет в диффе."
+    assert orchestrator._arbiter_should_accept() is False
+
+    # A real deterministic failure is never a qa_failed status -> not eligible.
+    orchestrator._last_supervisor_diagnosis = "Диагноз: QA придирается"
+    orchestrator._phase_failure_status = "developer_checks_failed"
+    assert orchestrator._arbiter_should_accept() is False
+
+    # 'ask' mode disables the arbiter entirely.
+    orchestrator._phase_failure_status = "qa_failed"
+    orchestrator.config = {"workflow": {"supervisor_arbiter": "ask"}}
+    assert orchestrator._arbiter_should_accept() is False
+
+
 def test_supervisor_diagnosis_prompt_and_failsafe(tmp_path, monkeypatch) -> None:
     # The diagnostician judges verdict-vs-diff; it is information only (never a gate) and
     # must never raise — any failure returns "".

@@ -423,8 +423,31 @@ class WorkflowOrchestrator:
                 self._skipped_completed_task_ids = []
             self.logger.info(f"Попытка реализации {attempt}/{max_retries}")
             ok = self._run_phase_agents(phase, "implementation")
+            diagnosis = ""
             if not ok and self._phase_failure_status:
                 self._attempt_blockers.append(self._current_blocker_reason(self._phase_failure_status))
+                # Supervisor diagnostician: judge the verdict against the ACTUAL diff after every
+                # failed attempt, BEFORE rollback erases it. Information for the developer + the
+                # escalation card; never a gate. ~$0.02-0.05 per failed attempt.
+                if self._phase_failure_status in {"qa_failed", "template_validation_failed", "developer_checks_failed", "invalid_output"}:
+                    diagnosis = self._run_supervisor_diagnosis()
+                    if diagnosis:
+                        self._last_supervisor_diagnosis = diagnosis
+                        self.logger.operator_box("Диагноз супервайзера", diagnosis.splitlines()[:6], color="yellow")
+                # Arbiter (config supervisor_arbiter=auto): accept a QA-only, STYLE-level
+                # rejection when the deterministic gates are all green and the diagnosis says so
+                # (e.g. import placement). Deterministic gates stay absolute — this overrides
+                # ONLY taste-level LLM-QA, the exact case that burned three runs on 2026-07-02.
+                if self._phase_failure_status == "qa_failed" and self._arbiter_should_accept():
+                    self.logger.operator_box(
+                        "Арбитр: попытка принята",
+                        [
+                            "Детерминированные проверки зелёные (pytest/must_contain/scope).",
+                            "Вердикт QA — стилевой; диагност: принять. Принимаю результат.",
+                        ],
+                        color="green",
+                    )
+                    ok = True
             if not ok and self._phase_failure_status in {"scope_violation", "no_changes", "planner_invalid", "task_designer_invalid", "strict_retrieval_blocked", "task_dependencies_incomplete", "dependency_missing_from_backlog"}:
                 hard_status = self._phase_failure_status
                 if self.config["git"]["enabled"] and self.config["git"]["auto_rollback"]:
@@ -475,17 +498,9 @@ class WorkflowOrchestrator:
             if self._phase_failure_status in {"qa_failed", "template_validation_failed", "developer_checks_failed", "invalid_output"}:
                 self._capture_developer_retry_feedback(task_id)
                 self._implementation_retry_from_agent = "developer"
-                # Supervisor diagnostician: judge the verdict against the actual diff after
-                # EVERY failed attempt, BEFORE the rollback erases it (run_20260702_160127:
-                # waiting for a repeated blocker let two attempts burn on a false QA verdict a
-                # first-attempt diagnosis would have flagged immediately). Information only —
-                # it never overrules a gate: it sharpens the next attempt's feedback and lands
-                # in the "Требуется решение" card. ~$0.02-0.05 per failed attempt.
-                diagnosis = self._run_supervisor_diagnosis()
+                # The diagnosis (computed above, before rollback) sharpens the next attempt.
                 if diagnosis:
-                    self._last_supervisor_diagnosis = diagnosis
                     self._append_supervisor_diagnosis_to_feedback(diagnosis)
-                    self.logger.operator_box("Диагноз супервайзера", diagnosis.splitlines()[:6], color="yellow")
             if self.config["git"]["enabled"] and self.config["git"]["auto_rollback"]:
                 if not self._rollback_git(f"изменений (попытка {attempt} не принята)"):
                     self._phase_failure_status = "rollback_failed"
@@ -10346,6 +10361,32 @@ class WorkflowOrchestrator:
                 handle.write("\n\n## Supervisor diagnosis (verdict vs actual diff)\n\n" + diagnosis + "\n")
         except OSError:
             pass
+
+    def _arbiter_should_accept(self) -> bool:
+        """Narrow arbiter (config workflow.supervisor_arbiter): accept a QA rejection ONLY when
+        every deterministic gate is green AND the diagnosis verdict is 'QA придирается' (taste-
+        level, e.g. import placement). Deterministic gates remain absolute; this never accepts a
+        real failure. 'ask' mode disables it entirely (the operator always decides)."""
+        mode = str((self.config.get("workflow") or {}).get("supervisor_arbiter", "auto")).strip().lower()
+        if mode != "auto" or self._phase_failure_status != "qa_failed":
+            return False
+        # Deterministic developer checks must not have failed (a non-success report = real fail).
+        try:
+            checks = self._load_saved_agent_report("implementation", "developer-checks") or {}
+        except Exception:
+            checks = {}
+        if checks and str(checks.get("status") or "").strip().lower() not in {"success", "passed", ""}:
+            return False
+        diagnosis = str(getattr(self, "_last_supervisor_diagnosis", "") or "")
+        if not diagnosis:
+            return False
+        # Decide ONLY on the verdict head ("Диагноз: QA придирается | QA прав | ..."), not on
+        # stray words in the explanation.
+        match = re.search(r"Диагноз\s*:\s*(.{0,40})", diagnosis, re.IGNORECASE)
+        head = (match.group(1) if match else diagnosis[:40]).lower()
+        if "прав" in head:  # "QA прав" — QA is right, never auto-accept
+            return False
+        return "придира" in head  # "QA придирается"
 
     def _emit_supervisor_escalation(self, task_id: Any, status: str, attempts_made: int, max_retries: int) -> None:
         """Supervisor layer: turn a dead phase into ONE actionable escalation card (task,
