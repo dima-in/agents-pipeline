@@ -1532,6 +1532,18 @@ def test_supervisor_escalation_card_is_actionable(tmp_path, capsys) -> None:
     assert "Разбить" in out  # a concrete decision option for this status
 
 
+def test_direct_api_usage_accumulates_across_all_requests(tmp_path) -> None:
+    # OpenRouter dashboard showed $5.81/day vs $1.41 metered: only the FINAL response's usage
+    # was recorded, dropping every retrieval-loop turn; gate-synthesized finals recorded none.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator._reset_direct_api_usage_accumulator()
+    orchestrator._accumulate_direct_api_usage('{"usage":{"prompt_tokens":1000,"completion_tokens":50,"total_tokens":1050}}')
+    orchestrator._accumulate_direct_api_usage('{"usage":{"prompt_tokens":2000,"completion_tokens":100,"total_tokens":2100}}')
+    orchestrator._accumulate_direct_api_usage('not json at all')  # never raises
+    acc = orchestrator._direct_api_usage_accumulator
+    assert acc == {"prompt_tokens": 3000, "completion_tokens": 150, "total_tokens": 3150, "requests": 2}
+
+
 def test_truncated_diff_excerpt_carries_explicit_warning(tmp_path, monkeypatch) -> None:
     # run_20260702_160127: QA rejected a COMPLETE implementation 3/3 because the 4000-char
     # diff excerpt cut the endpoint mid-body and QA judged the invisible tail as missing code.

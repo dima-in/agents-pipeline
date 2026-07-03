@@ -3572,6 +3572,28 @@ class WorkflowOrchestrator:
             return base + "When you have enough information, return the final answer normally instead of JSON."
         return base + "When you have enough information, return the final answer normally instead of JSON."
 
+    def _reset_direct_api_usage_accumulator(self) -> None:
+        self._direct_api_usage_accumulator = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "requests": 0}
+
+    def _accumulate_direct_api_usage(self, raw_body: str) -> None:
+        """Count EVERY paid request. The old accounting read usage only from an agent's FINAL
+        response: all retrieval-loop turns were dropped, and gate-synthesized finals carried
+        no usage at all ('Стоимость: агент н/д') — the engine under-reported real spend ~4x
+        (OpenRouter dashboard: $5.81/day vs $1.41 metered, 2026-07-02)."""
+        try:
+            usage = (json.loads(raw_body) or {}).get("usage")
+            if not isinstance(usage, dict):
+                return
+            accumulator = getattr(self, "_direct_api_usage_accumulator", None)
+            if accumulator is None:
+                self._reset_direct_api_usage_accumulator()
+                accumulator = self._direct_api_usage_accumulator
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                accumulator[key] += int(usage.get(key) or 0)
+            accumulator["requests"] += 1
+        except Exception:
+            pass
+
     def _perform_direct_api_request(
         self,
         request_payload: dict[str, Any],
@@ -3597,8 +3619,11 @@ class WorkflowOrchestrator:
                 response = urllib_request.urlopen(request, timeout=timeout)
                 if hasattr(response, "__enter__") and hasattr(response, "__exit__"):
                     with response:
-                        return 200, response.read().decode("utf-8", errors="replace")
-                return 200, response.read().decode("utf-8", errors="replace")
+                        raw_body = response.read().decode("utf-8", errors="replace")
+                else:
+                    raw_body = response.read().decode("utf-8", errors="replace")
+                self._accumulate_direct_api_usage(raw_body)
+                return 200, raw_body
             except urllib_error.HTTPError as exc:
                 # Client errors (4xx) are not transient — surface immediately. Server
                 # errors (5xx) are retried with backoff.
@@ -4595,16 +4620,28 @@ class WorkflowOrchestrator:
             save_agent_report("failed", error_message, 0.0, "", error_message, "", "direct_api", 1)
             self.logger.agent_end(agent_name, "failed", error_message)
             return False
+        # Per-agent spend accounting: sum EVERY request of this agent's run (all retrieval
+        # turns, repairs, forced finals), not just the last response.
+        self._reset_direct_api_usage_accumulator()
 
         normalized_model = self._normalize_openrouter_model(str(agent_runtime.get("model") or ""))
         command = (
             "direct_api POST https://openrouter.ai/api/v1/chat/completions "
             f"--model {normalized_model}"
         )
-        messages: list[dict[str, str]] = [
+        messages: list[dict[str, Any]] = [
             {"role": "system", "content": str(message_bundle["system_message"])},
             {"role": "user", "content": str(message_bundle["user_message"])},
         ]
+        # Anthropic prompt caching: the big static prefix (system + repository context) is
+        # identical on every turn of a retrieval loop, yet was re-billed at FULL input price
+        # each turn (dashboard cache hit rate: 2%). Mark it as a cache breakpoint — cached
+        # reads cost ~10%; the loop's turns land well inside the 5-minute TTL.
+        if "claude" in normalized_model or "anthropic" in normalized_model:
+            for prefix_message in messages:
+                prefix_message["content"] = [
+                    {"type": "text", "text": str(prefix_message["content"]), "cache_control": {"type": "ephemeral"}}
+                ]
         max_turns = 1
         if message_bundle.get("retrieval_enabled"):
             if phase == "implementation" and (agent_name == "developer" or self._is_multi_developer_edit_agent(agent_name)):
@@ -5071,13 +5108,24 @@ class WorkflowOrchestrator:
             "model": str(response_payload.get("model") or normalized_model),
             "provider": "openrouter",
         }
-        usage = response_payload.get("usage")
-        if isinstance(usage, dict):
+        # Accumulated across ALL of this agent's requests (every retrieval turn, repair and
+        # forced final) — the final response alone under-reported real spend ~4x.
+        accumulated = getattr(self, "_direct_api_usage_accumulator", None) or {}
+        if int(accumulated.get("requests") or 0) > 0:
             stdout_payload["usage"] = {
-                "prompt_tokens": usage.get("prompt_tokens"),
-                "completion_tokens": usage.get("completion_tokens"),
-                "total_tokens": usage.get("total_tokens"),
+                "prompt_tokens": accumulated.get("prompt_tokens"),
+                "completion_tokens": accumulated.get("completion_tokens"),
+                "total_tokens": accumulated.get("total_tokens"),
+                "requests": accumulated.get("requests"),
             }
+        else:
+            usage = response_payload.get("usage")
+            if isinstance(usage, dict):
+                stdout_payload["usage"] = {
+                    "prompt_tokens": usage.get("prompt_tokens"),
+                    "completion_tokens": usage.get("completion_tokens"),
+                    "total_tokens": usage.get("total_tokens"),
+                }
         stdout = json.dumps(stdout_payload, ensure_ascii=False)
         parsed_output = self._extract_agent_output(stdout)
         if parsed_output:
