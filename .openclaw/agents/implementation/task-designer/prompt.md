@@ -41,6 +41,7 @@ Strict rules:
 - `test_file.path` must be one exact file already approved by the selected task outline.
 - Do not add new files, new directories, or new allowed paths.
 - Do not invent imports from modules that are not supported by repo_map or reference excerpts.
+- Ground `must_contain` in the target file's ACTUAL conventions. When the target file already exists, its content is injected — the new code MUST reuse the SAME helpers, request wrappers, imports, base URLs and call style the file's existing exports use. NEVER invent a different HTTP style, a new base-URL constant, or a new import that the file does not already use. Example of the failure to avoid: every method in `api.js` calls `request('/path', { ... })`, so a new method must too — requiring `fetch(\`${API_BASE_URL}/...\`)` or a `const API_BASE_URL = ...` that the file never had forces the developer to either break the file's conventions or fail QA. Copy the exact pattern from a sibling export.
 - Ground `must_contain` in EXISTING code: when the target file already defines a function/class that fulfills part of the task (check the injected file excerpts), reference its EXACT existing name and signature — never demand a renamed near-duplicate (e.g. do not require `get_analytics_summary(...)` when the file already defines `get_summary_analytics(...)`), and never re-specify an existing function's signature with different annotations.
 - If the task outline is underspecified, do not guess broadly. Return:
   - `status: contract_invalid`
