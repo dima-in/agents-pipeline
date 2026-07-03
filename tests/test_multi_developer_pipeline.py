@@ -1537,11 +1537,11 @@ def test_direct_api_usage_accumulates_across_all_requests(tmp_path) -> None:
     # was recorded, dropping every retrieval-loop turn; gate-synthesized finals recorded none.
     orchestrator = make_orchestrator_with_workspace(tmp_path)
     orchestrator._reset_direct_api_usage_accumulator()
-    orchestrator._accumulate_direct_api_usage('{"usage":{"prompt_tokens":1000,"completion_tokens":50,"total_tokens":1050}}')
+    orchestrator._accumulate_direct_api_usage('{"usage":{"prompt_tokens":1000,"completion_tokens":50,"total_tokens":1050,"prompt_tokens_details":{"cached_tokens":900}}}')
     orchestrator._accumulate_direct_api_usage('{"usage":{"prompt_tokens":2000,"completion_tokens":100,"total_tokens":2100}}')
     orchestrator._accumulate_direct_api_usage('not json at all')  # never raises
     acc = orchestrator._direct_api_usage_accumulator
-    assert acc == {"prompt_tokens": 3000, "completion_tokens": 150, "total_tokens": 3150, "requests": 2}
+    assert acc == {"prompt_tokens": 3000, "completion_tokens": 150, "total_tokens": 3150, "cached_tokens": 900, "requests": 2}
 
 
 def test_truncated_diff_excerpt_carries_explicit_warning(tmp_path, monkeypatch) -> None:

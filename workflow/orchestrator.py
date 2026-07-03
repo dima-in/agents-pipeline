@@ -3588,7 +3588,7 @@ class WorkflowOrchestrator:
         return base + "When you have enough information, return the final answer normally instead of JSON."
 
     def _reset_direct_api_usage_accumulator(self) -> None:
-        self._direct_api_usage_accumulator = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "requests": 0}
+        self._direct_api_usage_accumulator = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cached_tokens": 0, "requests": 0}
 
     def _accumulate_direct_api_usage(self, raw_body: str) -> None:
         """Count EVERY paid request. The old accounting read usage only from an agent's FINAL
@@ -3605,6 +3605,8 @@ class WorkflowOrchestrator:
                 accumulator = self._direct_api_usage_accumulator
             for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
                 accumulator[key] += int(usage.get(key) or 0)
+            details = usage.get("prompt_tokens_details") or {}
+            accumulator["cached_tokens"] += int((details.get("cached_tokens") if isinstance(details, dict) else 0) or 0)
             accumulator["requests"] += 1
         except Exception:
             pass
@@ -5131,6 +5133,7 @@ class WorkflowOrchestrator:
                 "prompt_tokens": accumulated.get("prompt_tokens"),
                 "completion_tokens": accumulated.get("completion_tokens"),
                 "total_tokens": accumulated.get("total_tokens"),
+                "cached_tokens": accumulated.get("cached_tokens"),
                 "requests": accumulated.get("requests"),
             }
         else:
@@ -7178,8 +7181,46 @@ class WorkflowOrchestrator:
             "target_architecture": existing_target,  # the architect's intended end-state (Target Profile)
             "open_questions": open_questions,
         }
+        # Reuse the profiler agent's inferred persistence facts across tasks of the same
+        # project: the deterministic detectors leave the same fields 'unknown' on every run
+        # (e.g. Oil's raw-MySQL layer), so without this the profiler re-runs and re-pays on
+        # every task. When a persisted profile for the SAME repo digest already filled them,
+        # merge those inferred facts back so _architecture_profile_has_gaps() is satisfied and
+        # the profiler skips. Never overrides a fresh 'verified' detector fact.
+        persisted = self._load_persisted_architecture_profile()
+        if isinstance(persisted, dict) and persisted.get("repo_map_digest") == digest:
+            persisted_persistence = persisted.get("persistence") or {}
+            for key in ("concurrency", "access", "session_dependency"):
+                fresh = profile["persistence"].get(key) or {}
+                saved = persisted_persistence.get(key) or {}
+                if (
+                    fresh.get("confidence") == "unknown"
+                    and isinstance(saved, dict)
+                    and saved.get("confidence") in {"inferred", "verified"}
+                    and saved.get("value") is not None
+                ):
+                    profile["persistence"][key] = saved
+            open_questions = self._recompute_profile_open_questions(profile)
+            profile["open_questions"] = open_questions
         self._architecture_profile_cache = profile
         return profile
+
+    @staticmethod
+    def _recompute_profile_open_questions(profile: dict[str, Any]) -> list[str]:
+        """Open questions after persisted facts were merged in (so a filled profile has none)."""
+        questions: list[str] = []
+        persistence = profile.get("persistence") or {}
+        if (persistence.get("concurrency") or {}).get("confidence") == "unknown" or (
+            persistence.get("access") or {}
+        ).get("confidence") == "unknown":
+            questions.append(
+                "DB concurrency/access not auto-detected; a profiler agent must read the data layer."
+            )
+        if not (profile.get("layout") or {}).get("tests_root", {}).get("value"):
+            questions.append(
+                "No tests directory detected; a backend task may need to scaffold the test harness."
+            )
+        return questions
 
     def _render_architecture_profile_note(self) -> str:
         """Human-readable Project Architecture Profile for injection into agent context."""
@@ -7235,7 +7276,13 @@ class WorkflowOrchestrator:
         agent is skipped entirely to save tokens."""
         profile = profile or self._build_architecture_profile()
         persistence = profile.get("persistence") or {}
-        for key in ("concurrency", "access", "session_dependency"):
+        # session_dependency is only meaningful for injected-session stacks (ORM/Depends).
+        # A raw-DBAPI app (e.g. Oil's UseDatabase) legitimately has NONE, so an 'unknown' there
+        # is not a gap worth re-running the profiler for — otherwise the profiler re-ran on
+        # every task forever. Once concurrency+access are known, the profile is sufficient.
+        access_value = str((persistence.get("access") or {}).get("value") or "")
+        keys = ("concurrency", "access") if access_value == "raw_dbapi" else ("concurrency", "access", "session_dependency")
+        for key in keys:
             if (persistence.get(key) or {}).get("confidence") == "unknown":
                 return True
         return False
@@ -9634,7 +9681,17 @@ class WorkflowOrchestrator:
             return True
         if self.from_agent_name == "implementation-planner":
             return True
-        return self.from_agent_name in {"task-designer", "developer", "qa", "template-validator"} or self.retry_agent_name in {"task-designer", "developer", "qa", "template-validator"}
+        if self.from_agent_name in {"task-designer", "developer", "qa", "template-validator"} or self.retry_agent_name in {"task-designer", "developer", "qa", "template-validator"}:
+            return True
+        # Auto-reuse across tasks of the SAME unchanged project: once a canonical backlog exists
+        # and the architect's Target architecture is persisted (and injected into task-designer
+        # via the profile note), re-running the architect for the next task re-pays for an
+        # identical plan. Only on a plain task run (no explicit --from-agent / retry).
+        if not self.from_agent_name and not self.retry_agent_name and self._load_canonical_implementation_backlog():
+            target = (self._load_persisted_architecture_profile() or {}).get("target_architecture")
+            if isinstance(target, dict) and str(target.get("summary") or "").strip():
+                return True
+        return False
 
     def _should_reuse_planner_for_implementation(self) -> bool:
         if self.from_agent_name in {"task-designer", "developer", "qa", "template-validator"}:
@@ -12278,10 +12335,17 @@ class WorkflowOrchestrator:
         run_totals = self.logger.get_run_totals()
         # Cost is a first-class operator signal (owner request) — one Russian console line,
         # never hidden by compact mode (logger.info is shown unless noise-prefixed).
+        cache_note = ""
+        accumulated = getattr(self, "_direct_api_usage_accumulator", None) or {}
+        prompt_tokens = int(accumulated.get("prompt_tokens") or usage.get("input_tokens") or 0)
+        cached_tokens = int(accumulated.get("cached_tokens") or 0)
+        if prompt_tokens > 0 and cached_tokens > 0:
+            cache_note = f" | кэш входа {round(100 * cached_tokens / prompt_tokens)}%"
         self.logger.info(
             f"Стоимость: агент {self._format_cost(agent_cost)}"
             f" | фаза {self._format_cost(phase_totals['estimated_cost_usd'])}"
             f" | прогон {self._format_cost(run_totals['estimated_cost_usd'])}"
+            + cache_note
         )
         if self.max_phase_cost_usd is not None:
             self.logger.info(f"Лимит стоимости фазы: {self._format_cost(self.max_phase_cost_usd)}")
