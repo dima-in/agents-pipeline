@@ -23,7 +23,13 @@ class WorkflowLogger:
     )
     # Operator boxes shown on the console in compact mode (everything else is file-only):
     # the handoff card, the result card, and the human-readable failure summary.
-    COMPACT_BOX_TITLE_PREFIXES = ("Передача", "Готово", "Human summary", "План multi-developer", "Требуется решение", "Диагноз")
+    COMPACT_BOX_TITLE_PREFIXES = (
+        "Передача", "Готово", "Human summary", "План multi-developer", "Требуется решение", "Диагноз",
+        # Roadmap / slice-driver cards and the arbiter decision are operator-facing outcomes, not
+        # service dumps — they must reach the console in compact mode too (and --list-slices, whose
+        # entire job is to print the roadmap, is one of these).
+        "Роадмап", "Слайс", "Запуск слайса", "Арбитр",
+    )
 
     def __init__(self, log_dir: str = ".openclaw/logs", console_verbosity: str = "compact") -> None:
         self.log_dir = Path(log_dir)

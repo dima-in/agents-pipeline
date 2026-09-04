@@ -2,6 +2,8 @@
 
 `agents-pipeline` is a local-first, multi-phase agent workflow that autonomously implements backlog tasks INTO a target repository. It is **universal**: the engine names zero projects; every fact about the target (language, persistence model, schema, join paths, layout, conventions) is detected from the target repo itself or filled in by a profiler agent. The same engine onboards a SQLAlchemy/Alembic service and a hand-written raw-MySQL FastAPI app without code changes.
 
+It scales from a single task to a big ambition: a **product-strategist** agent decomposes a vision into a prioritized, dependency-linked **roadmap of slices** (each slice = one shippable feature), and a slice driver feeds the next slice's goal to the planner → backlog → implementation loop. A **supervisor layer** (diagnostician + arbiter + escalation card) keeps a stuck run from looping expensively or dying cryptically, and application endpoints are covered by **real behavioral tests** (FastAPI `TestClient` + mocked boundaries) run in the target's own virtualenv.
+
 ## Quick start
 
 ```powershell
@@ -13,6 +15,14 @@ Copy-Item .env.example .env   # put OPENROUTER_API_KEY here (start.py loads .env
 # research once per project (builds the backlog), then implement task by task:
 venv\Scripts\python.exe start.py --phase research --workspace D:\SomeProject --goal "..."
 venv\Scripts\python.exe start.py --phase implementation --workspace D:\SomeProject --mode auto --task-id TASK-001
+```
+
+Or drive a big vision as a roadmap of slices:
+
+```powershell
+venv\Scripts\python.exe start.py --build-roadmap --mode auto --workspace D:\SomeProject --goal "<the vision>"
+venv\Scripts\python.exe start.py --list-slices  --workspace D:\SomeProject          # inspect the roadmap
+venv\Scripts\python.exe start.py --next-slice   --mode auto --workspace D:\SomeProject   # plan + implement the next slice
 ```
 
 A green implementation run costs around $0.10–0.35 (OpenRouter, mixed sonnet/gpt models).
@@ -29,12 +39,13 @@ The engine never edits itself while targeting another repo; the target repo neve
 - `context/repo_map.json` — repo map snapshot
 - `codex.md` / `resume.md` — durable project notes + resume checkpoint (synced via git)
 - `state/implementation_backlog.json` — the canonical task backlog
+- `state/roadmap.json` — the slice roadmap (product-strategist output)
 
 `project_id` derives from the target's git remote (e.g. `github.com-user-repo`).
 
 ## Phases and agents
 
-**Research** (once per goal): project-analyst, competitor/market/tech-analyst, innovation-scout, product-manager. Produces requirements and a backlog. Each role gets a tailored context profile and a deterministic ≤2000-char handoff summary for the next agent.
+**Research** (once per goal): project-analyst, competitor/market/tech-analyst, innovation-scout, product-manager, **product-strategist**. Produces requirements, a backlog, and a slice roadmap. Each role gets a tailored context profile and a deterministic ≤2000-char handoff summary for the next agent. `product-strategist` reads the vision + codebase and emits `roadmap.json` (see *Roadmap / slice decomposition*).
 
 **Implementation** (per task, up to 3 attempts with git rollback between):
 
@@ -49,10 +60,23 @@ The engine never edits itself while targeting another repo; the target repo neve
 
 **Deployment readiness** (optional): production-readiness-checker, launch-strategist.
 
+## Roadmap / slice decomposition
+
+One level above the planner. The `product-strategist` agent turns a big VISION into an ordered list of **slices** — each slice a coherent, shippable feature (e.g. "natural-language order entry", "weekly digest"), with `id`, `goal`, `rationale`, `depends_on`, `status`, `value`, `effort`. It recognizes what already exists in the codebase and marks those slices `done` instead of re-proposing them. The roadmap persists to `state/roadmap.json`.
+
+The slice driver then runs the pipeline slice by slice:
+
+- `--build-roadmap` — run only the strategist (~$0.02) to (re)generate `roadmap.json` from the vision, without paying for the full research phase.
+- `--list-slices` — print the roadmap (vision, per-slice goal/value/effort/deps/status).
+- `--next-slice` — pick the next `pending` slice whose dependencies are `done` (or resume the `in_progress` one), set it as the active goal, regenerate the backlog for it, and run implementation. When the slice's backlog is fully completed it is marked `done`; run again for the next slice.
+
+Slices reuse generic task ids (`TASK-001`...), so starting a new slice archives the previous slice's backlog and completed-task registry (state file **and** the settings list) — otherwise a prior slice's completed ids would make the new slice's first tasks look already-done and selection would skip ahead.
+
 ## Grounding (why agents don't hallucinate the stack)
 
 - **Architecture Profile** — confidence-tagged facts `{verified|inferred|unknown}` about the CURRENT codebase: language, persistence (engine, access style, sync/async, session pattern), migrations, layout, tests root. Deterministic detectors fill what they can (`verified`); the profiler agent fills gaps (`inferred`); verified facts are never overridden. The architect's intended END-STATE is captured and carried across tasks as the Target architecture.
 - **DB schema ground truth** — for raw-SQL repos, `CREATE TABLE` statements are parsed into exact table/column lists **and FOREIGN KEY join paths**. Planners see which tables are linked and which are NOT ("the ONLY declared join paths"), so a metric that needs an impossible join gets narrowed by the architect itself instead of shipping invented columns.
+- **DB cursor row shape** — the engine detects whether raw cursors yield tuples (plain `conn.cursor()`) or dicts (`dictionary=True` / `DictCursor`) and states it as shared ground truth. Both the code-developer (which reads rows) and the test-developer (which mocks them) then agree — a plain cursor returns tuples read by index (`row[0]`), so `row['col']` (which raises `tuple indices must be integers`) is caught before it ships.
 - **Sync/async guardrail** — AST detection of the real DB concurrency + injected-session pattern; contracts demanding async DB on a sync stack are rejected at design time.
 - **Evidence-checked obsolescence** — when the task-designer claims a task is "already implemented", the engine extracts checkable tokens (URLs, camelCase/snake_case identifiers) from the acceptance criteria and greps the task's files; a false claim gets an explicit disproof in the retry feedback.
 
@@ -63,6 +87,18 @@ The engine never edits itself while targeting another repo; the target repo neve
 - Truncated-write repair: a tool-request-looking final answer that failed to parse (e.g. a whole-file `write_file` cut by max_tokens) is never accepted; the loop demands small `apply_patch` hunks instead.
 - QA/validator verdicts are **fail-closed**: an unrecognized verdict phrasing is a rejection by default; a validator report full of `**FAILED**` sections fails even without a status line. Import placement (module-level vs function-local) is non-blocking style, not a violation.
 - Scope policy: per-project `forbidden_paths` (checked first, always win) + per-task `allowed_paths` (the only editable files). Sensitive files (billing/auth/payment...) are auto-derived from the repo map by keyword. Test-less tasks (frontend/docs/config) don't demand a test contract.
+
+## Supervisor layer (don't loop, don't die cryptically)
+
+After every failed attempt, before the git rollback erases the diff:
+
+- **Diagnostician** — one cheap LLM judgement (default sonnet) of the verdict vs the ACTUAL diff + the full pytest traceback. It outputs `Диагноз: <QA прав | QA придирается | контракт некорректны> — <why>` plus one concrete recommendation, which is auto-appended to the developer's repair feedback for the next attempt. Information only — never a gate.
+- **Arbiter** (`workflow.supervisor_arbiter: auto|ask`) — overrules a taste-level LLM rejection **only** when every objective signal already says done. It accepts a `qa_failed` when the deterministic gates are green and the diagnosis is "QA придирается" (style, e.g. import placement); and a `template_validation_failed` when the deterministic gates are green, QA already **passed**, and the diagnosis flags no real defect (the tertiary template reviewer is the lone objector). Deterministic gates (pytest / must_contain / scope) stay absolute — a real failure is never accepted.
+- **Escalation card** — when retries are exhausted or a hard status blocks, one actionable card ("Требуется решение") states the task, attempts, the recurring blocker, the diagnosis, and concrete decisions — instead of a silent expensive loop.
+
+## Behavioral tests for the target
+
+For application/API code the test-developer writes **real behavioral tests**: it adds the repo root to `sys.path`, imports the app, drives it with FastAPI `TestClient`, and asserts actual HTTP status codes and JSON — mocking only the external boundaries (`mock.patch("main.requests.post")`, `mock.patch("main.UseDatabase")`). Migration files stay on the static-AST path (parse, never execute). These tests run in the **target's own virtualenv**: `resolve_python_executable` prefers `target_workspace/.venv` (which has the app's dependencies) over the engine venv, so `import main` and the app's stack resolve. For the mocks to bind, the code-developer imports external boundaries at module level (so `main.<name>` exists).
 
 ## Console observability (Russian, compact by default)
 
@@ -100,7 +136,7 @@ workflow:
   max_phase_cost_usd: 2.50
 ```
 
-Per-agent/phase/run cost is printed after every agent and accumulated from saved reports; the phase stops before scheduling more agents once the limit is exceeded.
+Per-agent/phase/run cost is printed after every agent and accumulated from saved reports; the phase stops before scheduling more agents once the limit is exceeded. Accounting is honest — **every** OpenRouter request (retrieval turns, retries, repairs) is counted, not just the final response. For Claude models the engine sends Anthropic **prompt caching** (`cache_control: ephemeral`) on message content, and the cost line shows the input cache-hit rate (`| кэш входа N%`); reusing the profiler/architect/planner across tasks of an unchanged project cuts per-task cost further.
 
 ## CLI reference (most used)
 
@@ -113,6 +149,9 @@ Per-agent/phase/run cost is printed after every agent and accumulated from saved
 --rerun-completed          allow re-running a task recorded as completed
 --list-tasks               print the persisted backlog and exit
 --mark-selected-complete   mark the selected task complete without running agents
+--build-roadmap            run only product-strategist; (re)generate roadmap.json and exit
+--list-slices              print the slice roadmap and exit
+--next-slice               drive the next roadmap slice (set goal, plan backlog, implement)
 --from-agent X / --retry-agent X / --reuse-architect   partial reruns
 --skip-git                 disable branch/merge/rollback
 ```
@@ -132,4 +171,4 @@ Each run writes JSON+Markdown per agent, a phase summary, `run_summary.json` (to
 venv\Scripts\python.exe -m pytest
 ```
 
-370+ tests; live-run regressions get a test named after the run id that exposed them.
+410+ tests; live-run regressions get a test named after the run id that exposed them.

@@ -44,7 +44,17 @@ PROJECT_RESUME_AUTO_START = "<!-- AUTO-GENERATED:RESUME-CONTEXT START -->"
 PROJECT_RESUME_AUTO_END = "<!-- AUTO-GENERATED:RESUME-CONTEXT END -->"
 DEFAULT_ALEMBIC_DOWN_REVISION = "0005"
 TEST_DEVELOPER_FORBIDDEN_IMPORTS = ("sqlalchemy", "alembic", "pytest")
-TEST_DEVELOPER_ALLOWED_IMPORTS = ("ast", "re", "pathlib", "importlib.util")
+TEST_DEVELOPER_ALLOWED_IMPORTS = (
+    # Static AST inspection (migrations and any static structural checks).
+    "ast", "re", "pathlib", "importlib.util",
+    # Behavioral tests for application code: FastAPI TestClient + mocking the app's
+    # external boundaries (HTTP calls, DB context managers). Importing the app module
+    # itself is allowed separately (see _target_local_module_roots) because its name is
+    # project-specific (e.g. `main`, `app`).
+    "sys", "os", "json", "types", "datetime", "decimal",
+    "unittest", "unittest.mock", "contextlib",
+    "fastapi", "fastapi.testclient", "starlette", "httpx",
+)
 
 # Human-readable Russian labels for the per-agent handoff card (who -> whom, must do, did).
 AGENT_DISPLAY_RU = {
@@ -128,6 +138,7 @@ class WorkflowOrchestrator:
         self.project_implementation_state_dir = self.project_state_dir / "state"
         self.canonical_backlog_path = self.project_implementation_state_dir / "implementation_backlog.json"
         self.completed_tasks_path = self.project_implementation_state_dir / "completed_implementation_tasks.json"
+        self.roadmap_path = self.project_implementation_state_dir / "roadmap.json"
         self.project_settings = self._load_project_settings()
         self.project_local_settings = self._load_project_local_settings()
         self.project_codex_context = self._load_project_codex_context()
@@ -271,8 +282,48 @@ class WorkflowOrchestrator:
         if not self._preflight_runtime("research"):
             return False
         ok = self.run_phase("research")
+        if ok:
+            try:
+                self._capture_roadmap_from_strategist()
+            except Exception:
+                pass
         self._persist_project_codex_context()
         self._persist_project_resume_context()
+        return ok
+
+    def build_roadmap(self) -> bool:
+        """Run only the product-strategist agent to (re)generate the slice roadmap.
+
+        Cheaper than a full research phase: reuses the vision + codebase (and any
+        existing research handoff) to decompose the goal into a roadmap of slices
+        without paying for the six market/competitor/tech analysts.
+        """
+        if not self._ensure_user_goal("research"):
+            return False
+        if not self._preflight_runtime("research"):
+            return False
+        agent = next(
+            (a for a in self.config["phases"]["research"]["agents"] if a.get("name") == "product-strategist"),
+            None,
+        )
+        if not agent:
+            self.logger.error("Агент product-strategist не зарегистрирован в research-фазе.")
+            return False
+        if not self._refresh_repo_map():
+            return False
+        self.logger.phase_start("Roadmap")
+        ok = self._run_agent(agent, "research", index=1, total=1)
+        if ok:
+            roadmap = self._capture_roadmap_from_strategist()
+            if not roadmap.get("slices"):
+                self.logger.warning(
+                    "Стратег не вернул слайсы в ожидаемом формате — роадмап не обновлён."
+                )
+                ok = False
+            else:
+                self._persist_project_codex_context()
+                self._persist_project_resume_context()
+        self.logger.phase_end("Roadmap", "success" if ok else "failed")
         return ok
 
     def run_implementation_phase(self) -> bool:
@@ -438,12 +489,17 @@ class WorkflowOrchestrator:
                 # rejection when the deterministic gates are all green and the diagnosis says so
                 # (e.g. import placement). Deterministic gates stay absolute — this overrides
                 # ONLY taste-level LLM-QA, the exact case that burned three runs on 2026-07-02.
-                if self._phase_failure_status == "qa_failed" and self._arbiter_should_accept():
+                if self._phase_failure_status in {"qa_failed", "template_validation_failed"} and self._arbiter_should_accept():
+                    reason = (
+                        "Вердикт QA — стилевой; диагност: принять. Принимаю результат."
+                        if self._phase_failure_status == "qa_failed"
+                        else "QA принял, отказал лишь валидатор шаблонов; диагност подтвердил. Принимаю результат."
+                    )
                     self.logger.operator_box(
                         "Арбитр: попытка принята",
                         [
                             "Детерминированные проверки зелёные (pytest/must_contain/scope).",
-                            "Вердикт QA — стилевой; диагност: принять. Принимаю результат.",
+                            reason,
                         ],
                         color="green",
                     )
@@ -462,6 +518,12 @@ class WorkflowOrchestrator:
                 self.logger.save_phase_summary("implementation", phase["name"])
                 self.logger.phase_end(phase["name"], hard_status)
                 return False
+            # Verify gate: after tests + QA pass, actually RUN the changed app and confirm it
+            # boots. Catches the "tests green but the real app crashes on start" class (e.g. a
+            # missing runtime dependency) that isolated/mocked tests never see. A failure flips ok
+            # back to False and feeds the boot error into the developer's retry, like a failed check.
+            if ok and not self._run_app_boot_verification(task_id):
+                ok = False
             if ok:
                 if self._implementation_resume_stops_before_delivery():
                     self.logger.save_phase_summary("implementation", phase["name"])
@@ -495,7 +557,7 @@ class WorkflowOrchestrator:
                 return True
 
             self._save_feedback(task_id, "qa", f"Попытка {attempt} завершилась ошибкой. Проверь логи и исправь регрессии.")
-            if self._phase_failure_status in {"qa_failed", "template_validation_failed", "developer_checks_failed", "invalid_output"}:
+            if self._phase_failure_status in {"qa_failed", "template_validation_failed", "developer_checks_failed", "invalid_output", "verification_failed"}:
                 self._capture_developer_retry_feedback(task_id)
                 self._implementation_retry_from_agent = "developer"
                 # The diagnosis (computed above, before rollback) sharpens the next attempt.
@@ -3003,9 +3065,14 @@ class WorkflowOrchestrator:
         return process.returncode, (process.stdout or "").strip(), (process.stderr or "").strip()
 
     def resolve_python_executable(self) -> tuple[str, str, bool]:
+        # The target's OWN virtualenv is the correct environment to run the target's tests:
+        # behavioral tests import the application under test, which needs the target's dependency
+        # set (fastapi, requests, the DB driver, ...), not the engine's. Prefer target_venv over
+        # engine_venv so a provisioned target .venv is actually used. For engine self-analysis the
+        # target has no `.venv`, so it falls through to the engine venv.
         candidates: list[tuple[Path, str]] = [
-            (self.engine_root / "venv" / "Scripts" / "python.exe", "engine_venv"),
             (self.target_workspace / ".venv" / "Scripts" / "python.exe", "target_venv"),
+            (self.engine_root / "venv" / "Scripts" / "python.exe", "engine_venv"),
             (Path(sys.executable), "sys_executable"),
         ]
 
@@ -6711,6 +6778,48 @@ class WorkflowOrchestrator:
             cached = getattr(self, "_raw_sql_relations_cache", None) or []
         return cached
 
+    def _detect_db_cursor_row_shape(self) -> str:
+        """How raw DB cursors yield rows in the target: 'dict', 'tuple', or '' (unknown/none).
+
+        A plain ``conn.cursor()`` (mysql.connector / sqlite3 / psycopg2 default) yields TUPLES read
+        by index (``row[0]``); a cursor built with ``dictionary=True`` / ``DictCursor`` /
+        ``RealDictCursor`` / ``cursor_factory=`` yields dict rows read by column name. The
+        code-developer and test-developer independently pick a shape and oscillate when it is left
+        implicit (run_20260703_163752: code used ``row["surname"]`` while a plain cursor returns
+        tuples -> TypeError -> 500). Surfacing the real convention as shared ground truth makes both
+        agents agree on the same one.
+        """
+        cached = getattr(self, "_db_cursor_row_shape_cache", None)
+        if cached is not None:
+            return cached
+        dict_markers = ("dictionary=true", "dictcursor", "realdictcursor", "cursor_factory")
+        skip_dirs = {".venv", "venv", "node_modules", ".git", "__pycache__", ".agents-pipeline", ".openclaw", "db_data"}
+        shape = ""
+        plain_cursor = False
+        scanned = 0
+        try:
+            for candidate in self.target_workspace.rglob("*.py"):
+                if any(part in skip_dirs for part in candidate.parts):
+                    continue
+                try:
+                    text = candidate.read_text(encoding="utf-8", errors="ignore").lower()
+                except OSError:
+                    continue
+                scanned += 1
+                if ".cursor(" in text or "conn.cursor" in text:
+                    plain_cursor = True
+                    if any(marker in text for marker in dict_markers):
+                        shape = "dict"
+                        break
+                if scanned >= 800:
+                    break
+        except Exception:
+            pass
+        if not shape and plain_cursor:
+            shape = "tuple"
+        self._db_cursor_row_shape_cache = shape
+        return shape
+
     def _build_raw_sql_schema_note(self) -> str:
         schema = self._extract_raw_sql_schema()
         if not schema:
@@ -6748,6 +6857,22 @@ class WorkflowOrchestrator:
             "Any SQL (e.g. cursor.execute) MUST reference only the tables and columns above. "
             "Do NOT use a table or column name that is not in this list."
         )
+        row_shape = self._detect_db_cursor_row_shape()
+        if row_shape == "tuple":
+            lines.append(
+                "DB CURSOR ROW SHAPE (ground truth): this project uses PLAIN cursors, so "
+                "cursor.fetchone()/fetchall() return TUPLES. Read columns by POSITION — row[0], "
+                "row[1], ... in the SELECT order — NEVER by name (row['col'] raises "
+                "'tuple indices must be integers'). Code that reads rows and any test that mocks "
+                "them MUST both use tuple/index access."
+            )
+        elif row_shape == "dict":
+            lines.append(
+                "DB CURSOR ROW SHAPE (ground truth): this project uses DICTIONARY cursors "
+                "(dictionary=True/DictCursor), so cursor.fetchone()/fetchall() return DICTS. Read "
+                "columns by NAME — row['column'] — matching the schema above. Code that reads rows "
+                "and any test that mocks them MUST both use dict/key access."
+            )
         return "\n".join(lines)
 
     def _extract_db_architecture(self) -> dict[str, Any]:
@@ -7478,8 +7603,29 @@ class WorkflowOrchestrator:
         value = str(implementation.get("default_alembic_down_revision") or DEFAULT_ALEMBIC_DOWN_REVISION).strip()
         return value or DEFAULT_ALEMBIC_DOWN_REVISION
 
+    def _target_local_module_roots(self) -> set[str]:
+        """Top-level importable module names of the target repo.
+
+        A behavioral test legitimately imports the application under test (e.g. `import main`)
+        and its sibling modules (`import UseDatabase`). Their names are project-specific, so the
+        must_use_only allow-list cannot hard-code them; instead we treat any top-level `.py` file
+        or package directory in the target root as an allowed import root for test code.
+        """
+        roots: set[str] = set()
+        try:
+            for entry in self.target_workspace.iterdir():
+                name = entry.name
+                if entry.is_file() and name.endswith(".py"):
+                    roots.add(name[:-3])
+                elif entry.is_dir() and not name.startswith((".", "_")):
+                    roots.add(name)
+        except OSError:
+            pass
+        return roots
+
     def _validate_test_developer_static_constraints(self, relative_paths: list[str]) -> list[str]:
         findings: list[str] = []
+        local_module_roots = self._target_local_module_roots()
         for relative_path in relative_paths:
             if not relative_path.endswith(".py"):
                 continue
@@ -7506,7 +7652,11 @@ class WorkflowOrchestrator:
                 root = module.split(".", 1)[0]
                 if module in TEST_DEVELOPER_FORBIDDEN_IMPORTS or root in TEST_DEVELOPER_FORBIDDEN_IMPORTS:
                     findings.append(f"{relative_path}: forbidden import: {module}")
-                elif module not in TEST_DEVELOPER_ALLOWED_IMPORTS and root not in TEST_DEVELOPER_ALLOWED_IMPORTS:
+                elif (
+                    module not in TEST_DEVELOPER_ALLOWED_IMPORTS
+                    and root not in TEST_DEVELOPER_ALLOWED_IMPORTS
+                    and root not in local_module_roots
+                ):
                     findings.append(f"{relative_path}: import outside must_use_only: {module}")
             for marker in ("pytest.main(", "alembic.command.", "command.upgrade(", "command.downgrade(", "create_engine("):
                 if marker in text:
@@ -9188,9 +9338,18 @@ class WorkflowOrchestrator:
         # require "from app.models import ProviderMetrics" to appear in the target file).
         if normalized.startswith("import ") or (normalized.startswith("from ") and " import " in normalized):
             return False
+        # Frontend anchors are concrete verifiable substrings too. A React/JSX contract legitimately
+        # requires JSX element tags ("<textarea", "<button", "<NLPOrderInput") and JS module exports
+        # ("export default NLPOrderInput", "export const askAssistant"). The Python-centric signal
+        # markers below miss these, so a valid frontend contract was wrongly rejected as vague
+        # (run_20260703_154526: TASK-004 could not emit any accepted must_contain for a .jsx file).
+        if normalized.startswith(("export default", "export const", "export function", "export {", "export(")):
+            return False
+        if re.match(r"</?[a-z][a-z0-9]*", normalized):
+            return False
         if re.fullmatch(r"[a-z_][a-z0-9_\.]*", normalized):
             return False
-        signal_markers = ("class ", "def ", "async def ", "mapped[", " = ", "assert ", "test_", "(", ":", "->")
+        signal_markers = ("class ", "def ", "async def ", "mapped[", " = ", "assert ", "test_", "(", ":", "->", "=>", "</")
         return not any(marker in normalized for marker in signal_markers)
 
     def _task_requires_tests(self, item: dict[str, Any]) -> bool:
@@ -9329,12 +9488,17 @@ class WorkflowOrchestrator:
                 f"{task_id}:task_needs_split_multiple_editable_files:" + ",".join(unreachable_edits[:5])
             )
 
-        if test_file_path and required_test_paths and test_file_path not in required_test_paths:
-            errors.append(f"{task_id}:test_file_path_not_in_required_test_paths")
-        if test_file_path and test_file_path not in existing_paths and test_file_path not in new_files:
-            errors.append(f"{task_id}:test_file_path_not_declared")
-        if (test_file_path or requires_tests) and test_file_action not in {"create", "update", "modify"}:
-            errors.append(f"{task_id}:invalid_test_file_action")
+        # Test-file validation only applies to tasks that require tests. A frontend/docs/config
+        # task carries no pytest requirement, so a stray test_file the designer emitted must NOT
+        # be validated (or demanded) — otherwise a valid test-less contract is rejected forever
+        # (run_20260703_154526: TASK-004 frontend-only kept failing test_file_path_not_declared).
+        if requires_tests:
+            if test_file_path and required_test_paths and test_file_path not in required_test_paths:
+                errors.append(f"{task_id}:test_file_path_not_in_required_test_paths")
+            if test_file_path and test_file_path not in existing_paths and test_file_path not in new_files:
+                errors.append(f"{task_id}:test_file_path_not_declared")
+            if test_file_action not in {"create", "update", "modify"}:
+                errors.append(f"{task_id}:invalid_test_file_action")
 
         if len(must_contain) < 2:
             errors.append(f"{task_id}:must_contain_too_short")
@@ -10296,10 +10460,11 @@ class WorkflowOrchestrator:
             if status == "template_validation_failed":
                 rep = self._load_saved_agent_report("implementation", "template-validator") or {}
                 return " / ".join(self._digest_output_lines(str(rep.get("parsed_output") or ""), 2))[:200] or "валидатор шаблонов отклонил результат"
-            if status == "developer_checks_failed":
+            if status in {"developer_checks_failed", "verification_failed"}:
                 rep = self._load_saved_agent_report("implementation", "developer-checks") or {}
                 text = str(rep.get("parsed_output") or rep.get("result") or "")
-                return (text.splitlines()[0][:200] if text.strip() else "детерминированные проверки не пройдены")
+                default = "приложение не поднялось (verify)" if status == "verification_failed" else "детерминированные проверки не пройдены"
+                return (text.splitlines()[0][:200] if text.strip() else default)
             if status == "no_changes":
                 return "разработчик не внёс изменений в файлы"
             if status == "strict_retrieval_blocked":
@@ -10374,7 +10539,11 @@ class WorkflowOrchestrator:
             checks = self._load_saved_agent_report("implementation", "developer-checks") or {}
             checks_text = str(checks.get("parsed_output") or checks.get("result") or "").strip()
             if checks_text:
-                parts.append("Детерминированные проверки:\n" + checks_text[:800])
+                # The pytest traceback lives here (e.g. "TypeError: tuple indices ... main.py:555").
+                # It is the single most actionable piece of evidence, so give the diagnostician the
+                # full failing-test output instead of a first-line-only snippet — otherwise it can
+                # only reply "I need the full test log" and produce no usable instruction.
+                parts.append("Детерминированные проверки (полный вывод pytest/символов):\n" + checks_text[:4000])
             diff_text = self._build_target_git_diff_excerpt(limit=3500)
             if diff_text:
                 parts.append("Реальный дифф попытки:\n" + diff_text)
@@ -10419,13 +10588,37 @@ class WorkflowOrchestrator:
         except OSError:
             pass
 
+    def _qa_report_passed(self) -> bool:
+        """True when the QA agent accepted the attempt (verdict ПРИНЯТО / status success)."""
+        try:
+            qa = self._load_saved_agent_report("implementation", "qa") or {}
+        except Exception:
+            return False
+        text = str(qa.get("parsed_output") or "").upper()
+        if "ОТКЛОНЕНО" in text:
+            return False
+        if "ПРИНЯТО" in text:
+            return True
+        return str(qa.get("status") or "").strip().lower() in {"success", "passed"}
+
     def _arbiter_should_accept(self) -> bool:
-        """Narrow arbiter (config workflow.supervisor_arbiter): accept a QA rejection ONLY when
-        every deterministic gate is green AND the diagnosis verdict is 'QA придирается' (taste-
-        level, e.g. import placement). Deterministic gates remain absolute; this never accepts a
-        real failure. 'ask' mode disables it entirely (the operator always decides)."""
+        """Narrow arbiter (config workflow.supervisor_arbiter=auto): overrule a taste-level LLM
+        rejection ONLY when every OBJECTIVE signal already says the task is done. Deterministic
+        gates (pytest / must_contain / scope) stay absolute — this never accepts a real failure.
+        'ask' mode disables it entirely (the operator always decides).
+
+        - qa_failed: accept when the deterministic gates are green AND the diagnosis verdict is
+          'QA придирается' (QA wrongly rejected on style, e.g. import placement).
+        - template_validation_failed: accept when the deterministic gates are green, the PRIMARY
+          reviewer (QA) already PASSED, and the diagnosis does not flag a real defect — i.e. only
+          the tertiary template/structure reviewer objects (run_20260705_161257: pytest green + QA
+          ПРИНЯТО + must_contain present, yet template-validator falsely claimed the DB access was
+          missing when the diff clearly contained it)."""
         mode = str((self.config.get("workflow") or {}).get("supervisor_arbiter", "auto")).strip().lower()
-        if mode != "auto" or self._phase_failure_status != "qa_failed":
+        if mode != "auto":
+            return False
+        status = self._phase_failure_status
+        if status not in {"qa_failed", "template_validation_failed"}:
             return False
         # Deterministic developer checks must not have failed (a non-success report = real fail).
         try:
@@ -10437,13 +10630,20 @@ class WorkflowOrchestrator:
         diagnosis = str(getattr(self, "_last_supervisor_diagnosis", "") or "")
         if not diagnosis:
             return False
-        # Decide ONLY on the verdict head ("Диагноз: QA придирается | QA прав | ..."), not on
-        # stray words in the explanation.
+        # Decide ONLY on the verdict head ("Диагноз: QA придирается | QA прав | ...некорректны"),
+        # not on stray words in the explanation.
         match = re.search(r"Диагноз\s*:\s*(.{0,40})", diagnosis, re.IGNORECASE)
         head = (match.group(1) if match else diagnosis[:40]).lower()
-        if "прав" in head:  # "QA прав" — QA is right, never auto-accept
+        if status == "qa_failed":
+            if "прав" in head:  # "QA прав" — QA correctly rejected, never auto-accept
+                return False
+            return "придира" in head  # "QA придирается"
+        # template_validation_failed: the tertiary reviewer is the lone objector.
+        if not self._qa_report_passed():
             return False
-        return "придира" in head  # "QA придирается"
+        if "некорректн" in head:  # "контракт/задача некорректны" — a real gap, do not override
+            return False
+        return True
 
     def _emit_supervisor_escalation(self, task_id: Any, status: str, attempts_made: int, max_retries: int) -> None:
         """Supervisor layer: turn a dead phase into ONE actionable escalation card (task,
@@ -10470,6 +10670,122 @@ class WorkflowOrchestrator:
             self.logger.operator_box("Требуется решение (супервайзер)", lines, color="red")
         except Exception:
             self.logger.info(f"Требуется решение: {status}")
+
+    def _detect_app_entrypoint(self) -> str:
+        """Best-effort ASGI/WSGI app entrypoint module of the target (e.g. 'main' for a top-level
+        main.py that builds `app = FastAPI()`). Returns '' when none is found. Cached."""
+        cached = getattr(self, "_app_entrypoint_cache", None)
+        if cached is not None:
+            return cached
+        entry = ""
+        try:
+            for name in ("Dockerfile", "Procfile", "docker-compose.yml", "docker-compose.prod.yml"):
+                p = self.target_workspace / name
+                if not p.exists():
+                    continue
+                text = p.read_text(encoding="utf-8", errors="ignore")
+                # Match both shell form (`uvicorn main:app`) and JSON exec form (`["uvicorn", "main:app"]`).
+                match = re.search(r"(?:uvicorn|gunicorn|hypercorn|daphne)[\"'\s,]+([A-Za-z_][A-Za-z0-9_]*)[:\.]", text)
+                if match:
+                    entry = match.group(1)
+                    break
+            if not entry:
+                for candidate in sorted(self.target_workspace.glob("*.py")):
+                    try:
+                        src = candidate.read_text(encoding="utf-8", errors="ignore")
+                    except OSError:
+                        continue
+                    if re.search(r"=\s*(?:FastAPI|Flask)\s*\(", src):
+                        entry = candidate.stem
+                        break
+        except Exception:
+            entry = ""
+        self._app_entrypoint_cache = entry
+        return entry
+
+    def _run_app_boot_verification(self, task_id: Any) -> bool:
+        """Verify gate (v1): after tests + QA pass, RUN the changed app in the target's own venv and
+        confirm it imports/boots. Catches the 'tests green but the real app crashes at start' class
+        (import-time errors, circular imports, module-level exceptions, undefined names) that mocked/
+        isolated tests never see. Returns True to proceed, False to send the boot error back to the
+        developer. Never raises; skips cleanly when it does not apply.
+
+        Scope + honesty: this imports the app in the target's LOCAL venv, so it catches code-level
+        import failures against that env. It does NOT yet catch a dependency present locally but
+        missing from the deployment image's install list (that needs a build-the-image layer) — that
+        is the next verify increment."""
+        workflow_cfg = self.config.get("workflow") or {}
+        if not bool(workflow_cfg.get("verify_run", True)):
+            return True
+        # Only run when this attempt actually changed application Python (not tests/migrations/docs).
+        try:
+            changed = [self._normalize_target_relative_path(p) for p in (self._implementation_completion_changed_files() or [])]
+        except Exception:
+            changed = []
+        changed = [p for p in changed if p]
+        app_py_changed = any(
+            p.endswith(".py") and not p.startswith("tests/") and "/tests/" not in p and "alembic/" not in p
+            for p in changed
+        )
+        if changed and not app_py_changed:
+            return True
+        entry = self._detect_app_entrypoint()
+        if not entry:
+            return True  # no detectable app entrypoint (library/CLI) -> nothing to boot
+        python, source, _pytest = self.resolve_python_executable()
+        if source != "target_venv":
+            # Without the target's own venv we cannot trust its dependency set, so importing the app
+            # would false-fail on the app's first real dependency. Skip rather than cry wolf.
+            self.logger.operator_box(
+                "Verify: пропущен (нет venv цели)",
+                ["Заведи .venv в целевом репо с зависимостями приложения, чтобы включить boot-проверку."],
+                color="yellow",
+            )
+            return True
+        # Import the app; then, best-effort, construct a TestClient and hit a trivial route so we
+        # confirm the app not only imports but actually CONSTRUCTS and SERVES (catches middleware /
+        # static-mount / routing / startup crashes that a bare import misses). The serve part is
+        # skipped cleanly when the target venv has no TestClient dependency.
+        code = (
+            "import sys; sys.path.insert(0, '.')\n"
+            f"import {entry} as _appmod\n"
+            "print('IMPORT-OK')\n"
+            "try:\n"
+            "    from fastapi.testclient import TestClient as _TC\n"
+            "    _app = getattr(_appmod, 'app', None)\n"
+            "    if _app is not None:\n"
+            "        _r = _TC(_app).get('/openapi.json')\n"
+            "        assert _r.status_code < 500, 'openapi status ' + str(_r.status_code)\n"
+            "    print('SERVE-OK')\n"
+            "except ImportError:\n"
+            "    print('SERVE-SKIP')\n"
+        )
+        rc, out, err = self._run_local_command([python, "-c", code], timeout=90, cwd=self.target_workspace)
+        combined = ((err or "") + "\n" + (out or "")).strip()
+        if rc == 0:
+            self.logger.operator_box("Verify: приложение поднялось", [f"import {entry}: ok"], color="green")
+            return True
+        # A code-level import failure is the developer's to fix; an environment error (no DB/network
+        # at import time) is not a code bug in this scoped task -> do not fail the gate on it.
+        code_error_markers = (
+            "ModuleNotFoundError", "ImportError", "SyntaxError", "IndentationError",
+            "NameError", "AttributeError", "TypeError", "ValueError", "AssertionError",
+        )
+        env_error_markers = (
+            "OperationalError", "Can't connect", "Connection refused", "getaddrinfo",
+            "Access denied", "InterfaceError", "timed out", "Timeout",
+        )
+        is_code_error = any(m in combined for m in code_error_markers) and not any(m in combined for m in env_error_markers)
+        if not is_code_error:
+            last = combined.splitlines()[-1][:160] if combined else "no output"
+            self.logger.operator_box("Verify: пропущен (окружение, не код)", [last], color="yellow")
+            return True
+        detail = "\n".join([f"App boot verification failed: `import {entry}` crashed.", combined[:4000]])
+        self._phase_failure_status = "verification_failed"
+        self._save_developer_checks_report("failed", f"app boot verification failed for import {entry}", detail)
+        self._attempt_blockers.append("приложение не поднялось (verify)")
+        self.logger.operator_box("Verify: приложение НЕ поднялось", (combined.splitlines() or ["no output"])[-4:], color="red")
+        return False
 
     def _capture_developer_retry_feedback(self, task_id: int) -> None:
         sections: list[str] = []
@@ -11758,6 +12074,311 @@ class WorkflowOrchestrator:
             self.saved_user_goal = ""
             self.project_settings.pop("user_goal", None)
         self._save_project_settings()
+
+    # ------------------------------------------------------------------
+    # Roadmap / slice-decomposition layer
+    #
+    # One level above the implementation planner: the product-strategist agent
+    # turns a big VISION into an ordered list of SLICES (each slice = a shippable
+    # feature goal). The roadmap is persisted here; the slice driver then feeds
+    # the next slice's goal to the normal planner -> backlog -> implementation
+    # pipeline, so the engine handles big ambitions instead of only tiny tasks.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _extract_first_json_object(text: str) -> dict[str, Any] | None:
+        raw = str(text or "")
+        start = raw.find("{")
+        while start != -1:
+            depth = 0
+            in_string = False
+            escape = False
+            for index in range(start, len(raw)):
+                char = raw[index]
+                if in_string:
+                    if escape:
+                        escape = False
+                    elif char == "\\":
+                        escape = True
+                    elif char == '"':
+                        in_string = False
+                    continue
+                if char == '"':
+                    in_string = True
+                elif char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = raw[start : index + 1]
+                        try:
+                            parsed = json.loads(candidate)
+                        except Exception:
+                            break
+                        if isinstance(parsed, dict):
+                            return parsed
+                        break
+            start = raw.find("{", start + 1)
+        return None
+
+    def _normalize_roadmap(self, payload: dict[str, Any], *, previous: dict[str, Any] | None = None) -> dict[str, Any]:
+        previous_by_id: dict[str, dict[str, Any]] = {}
+        for slice_item in (previous or {}).get("slices", []) or []:
+            slice_id = str(slice_item.get("id") or "").strip()
+            if slice_id:
+                previous_by_id[slice_id] = slice_item
+        allowed_status = {"pending", "in_progress", "done", "blocked"}
+        slices: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for index, raw_slice in enumerate(payload.get("slices", []) or [], start=1):
+            if not isinstance(raw_slice, dict):
+                continue
+            slice_id = str(raw_slice.get("id") or "").strip() or f"SLICE-{index:03d}"
+            if slice_id in seen_ids:
+                continue
+            seen_ids.add(slice_id)
+            depends_on = [
+                str(dep).strip()
+                for dep in (raw_slice.get("depends_on") or [])
+                if str(dep).strip()
+            ]
+            status = str(raw_slice.get("status") or "pending").strip().lower()
+            if status not in allowed_status:
+                status = "pending"
+            # Never let a re-plan regress real progress: a slice already in_progress
+            # or done stays that way regardless of what the strategist re-emits.
+            prior = previous_by_id.get(slice_id)
+            if prior:
+                prior_status = str(prior.get("status") or "").strip().lower()
+                if prior_status in {"in_progress", "done"}:
+                    status = prior_status
+            slices.append(
+                {
+                    "id": slice_id,
+                    "title": str(raw_slice.get("title") or slice_id).strip(),
+                    "goal": str(raw_slice.get("goal") or "").strip(),
+                    "rationale": str(raw_slice.get("rationale") or "").strip(),
+                    "depends_on": depends_on,
+                    "status": status,
+                    "value": str(raw_slice.get("value") or "medium").strip().lower(),
+                    "effort": str(raw_slice.get("effort") or "M").strip().upper(),
+                }
+            )
+        return {
+            "vision": str(payload.get("vision") or (previous or {}).get("vision") or self.user_goal or "").strip(),
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "slices": slices,
+        }
+
+    def _load_roadmap(self) -> dict[str, Any]:
+        try:
+            if self.roadmap_path.exists():
+                data = json.loads(self.roadmap_path.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and isinstance(data.get("slices"), list):
+                    return data
+        except Exception:
+            pass
+        return {}
+
+    def _persist_roadmap(self, roadmap: dict[str, Any]) -> None:
+        try:
+            self.project_implementation_state_dir.mkdir(parents=True, exist_ok=True)
+            self.roadmap_path.write_text(
+                json.dumps(roadmap, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    def _capture_roadmap_from_strategist(self) -> dict[str, Any]:
+        report = self._load_saved_agent_report("research", "product-strategist")
+        if not report:
+            return {}
+        text = str(report.get("parsed_output") or "").strip()
+        if not text:
+            stdout = str(report.get("stdout") or "")
+            inner = self._extract_first_json_object(stdout) or {}
+            text = str(inner.get("output_text") or stdout)
+        payload = self._extract_first_json_object(text)
+        if not payload or not isinstance(payload.get("slices"), list) or not payload.get("slices"):
+            return {}
+        roadmap = self._normalize_roadmap(payload, previous=self._load_roadmap())
+        if not roadmap.get("slices"):
+            return {}
+        self._persist_roadmap(roadmap)
+        done = sum(1 for item in roadmap["slices"] if item.get("status") == "done")
+        pending = len(roadmap["slices"]) - done
+        self.logger.operator_box(
+            "Роадмап слайсов готов",
+            [
+                f"Видение: {roadmap.get('vision', '')[:90]}",
+                f"Слайсов: {len(roadmap['slices'])} (готово {done}, в очереди {pending})",
+            ]
+            + [
+                f"  [{item.get('status', 'pending')}] {item.get('id')}: {item.get('title')}"
+                for item in roadmap["slices"][:8]
+            ],
+            color="cyan",
+        )
+        return roadmap
+
+    def _select_next_slice(self, roadmap: dict[str, Any]) -> dict[str, Any] | None:
+        slices = roadmap.get("slices") or []
+        done_ids = {str(item.get("id") or "").strip() for item in slices if item.get("status") == "done"}
+        # Resume an in-progress slice before picking a fresh one.
+        for item in slices:
+            if item.get("status") == "in_progress":
+                return item
+        for item in slices:
+            if item.get("status") != "pending":
+                continue
+            deps = [dep for dep in (item.get("depends_on") or []) if dep]
+            if all(dep in done_ids for dep in deps):
+                return item
+        return None
+
+    def _set_slice_status(self, slice_id: str, status: str) -> dict[str, Any]:
+        roadmap = self._load_roadmap()
+        changed = False
+        for item in roadmap.get("slices") or []:
+            if str(item.get("id") or "").strip() == slice_id:
+                item["status"] = status
+                changed = True
+                break
+        if changed:
+            self._persist_roadmap(roadmap)
+        return roadmap
+
+    def _active_backlog_is_complete(self) -> bool:
+        backlog = self._load_canonical_implementation_backlog()
+        backlog_ids = [str(item.get("id") or "").strip() for item in backlog if str(item.get("id") or "").strip()]
+        if not backlog_ids:
+            return False
+        completed = set(self._completed_implementation_task_ids())
+        return all(task_id in completed for task_id in backlog_ids)
+
+    def _archive_backlog_for_new_slice(self, slice_id: str) -> None:
+        # Give the incoming slice a clean planner backlog: park the current canonical
+        # backlog + completed registry under the previous slice's id so the planner
+        # regenerates tasks against the new slice goal instead of resuming the old one.
+        stamp = re.sub(r"[^A-Za-z0-9._-]+", "-", slice_id).strip("-") or "slice"
+        for path in (self.canonical_backlog_path, self.completed_tasks_path):
+            try:
+                if path.exists():
+                    archived = path.with_name(f"{path.stem}.{stamp}{path.suffix}")
+                    if archived.exists():
+                        archived.unlink()
+                    path.rename(archived)
+            except Exception:
+                pass
+        # The completed-task registry ALSO lives as a list in settings.yaml. Backlogs reuse
+        # generic ids (TASK-001, TASK-002, ...), so a previous slice's completed ids collide
+        # with the new slice's fresh backlog and would make its first tasks look already-done
+        # (the selector then skips ahead to a mid-chain task with unmet dependencies). Park the
+        # settings list under the slice too and clear it so the new slice starts from TASK-001.
+        prior_completed = self.project_settings.get("completed_implementation_tasks")
+        if prior_completed:
+            archive_key = f"completed_implementation_tasks.{stamp}"
+            self.project_settings[archive_key] = prior_completed
+        self.project_settings["completed_implementation_tasks"] = []
+        self._save_project_settings()
+        self._reset_selected_implementation_item()
+        self._canonical_backlog_loaded = False
+        self._canonical_backlog_payload = {}
+
+    def print_roadmap(self) -> int:
+        roadmap = self._load_roadmap()
+        slices = roadmap.get("slices") or []
+        if not slices:
+            self.logger.warning(
+                "Роадмап пуст. Сначала запусти research-фазу (агент product-strategist построит слайсы)."
+            )
+            return 1
+        lines = [f"Видение: {roadmap.get('vision', '')}", ""]
+        active_id = str(self.project_settings.get("active_slice_id") or "").strip()
+        for item in slices:
+            marker = ">" if str(item.get("id") or "").strip() == active_id else " "
+            deps = ", ".join(item.get("depends_on") or []) or "-"
+            lines.append(
+                f"{marker} [{item.get('status', 'pending'):<11}] {item.get('id')}: {item.get('title')}"
+            )
+            lines.append(f"      цель: {item.get('goal', '')}")
+            lines.append(f"      ценность={item.get('value', '')} усилие={item.get('effort', '')} зависит={deps}")
+        self.logger.operator_box("Роадмап слайсов", lines, color="cyan")
+        return 0
+
+    def run_next_slice(self) -> bool:
+        roadmap = self._load_roadmap()
+        if not roadmap.get("slices"):
+            self.logger.warning(
+                "Роадмапа нет. Сначала запусти research-фазу: product-strategist построит слайсы из видения."
+            )
+            return False
+        active_id = str(self.project_settings.get("active_slice_id") or "").strip()
+        # If the active slice finished its backlog, close it before advancing.
+        if active_id:
+            active_slice = next(
+                (item for item in roadmap["slices"] if str(item.get("id") or "").strip() == active_id),
+                None,
+            )
+            if active_slice and active_slice.get("status") == "in_progress" and self._active_backlog_is_complete():
+                roadmap = self._set_slice_status(active_id, "done")
+                self.project_settings["active_slice_id"] = ""
+                self._save_project_settings()
+                self.logger.operator_box(
+                    "Слайс завершён",
+                    [f"{active_id}: {active_slice.get('title')}", "Все задачи бэклога слайса выполнены."],
+                    color="green",
+                )
+                active_id = ""
+        target = self._select_next_slice(roadmap)
+        if target is None:
+            pending = [item for item in roadmap["slices"] if item.get("status") == "pending"]
+            if pending:
+                self.logger.operator_box(
+                    "Слайсы заблокированы зависимостями",
+                    [f"{item.get('id')}: ждёт {', '.join(item.get('depends_on') or [])}" for item in pending[:6]],
+                    color="yellow",
+                )
+            else:
+                self.logger.operator_box(
+                    "Роадмап пройден",
+                    ["Все слайсы завершены. Перезапусти research, чтобы наметить следующие."],
+                    color="green",
+                )
+            return True
+        target_id = str(target.get("id") or "").strip()
+        goal = str(target.get("goal") or "").strip()
+        starting_new = target_id != active_id
+        if starting_new:
+            if goal:
+                self._set_user_goal(goal)
+            self._archive_backlog_for_new_slice(target_id)
+            self._set_slice_status(target_id, "in_progress")
+            self.project_settings["active_slice_id"] = target_id
+            self._save_project_settings()
+        self.logger.operator_box(
+            "Слайс в работе" if not starting_new else "Запуск слайса",
+            [
+                f"{target_id}: {target.get('title')}",
+                f"Цель: {goal[:120]}",
+                "Планировщик построит бэклог этого слайса и начнётся реализация.",
+            ],
+            color="cyan",
+        )
+        # Auto-select the next uncompleted backlog task for this slice.
+        self.next_task_requested = True
+        ok = self.run_implementation_phase()
+        # Close the slice immediately if this cycle exhausted its backlog.
+        if ok and self._active_backlog_is_complete():
+            self._set_slice_status(target_id, "done")
+            self.project_settings["active_slice_id"] = ""
+            self._save_project_settings()
+            self.logger.operator_box(
+                "Слайс завершён",
+                [f"{target_id}: {target.get('title')}", "Запусти --next-slice для следующего слайса."],
+                color="green",
+            )
+        return ok
 
     def _should_prompt_for_user_goal(self, phase_key: str) -> bool:
         if self.config["workflow"]["mode"] == "auto":

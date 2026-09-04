@@ -10,6 +10,8 @@ Scope:
 
 Hard rules:
 - Use ONLY tables and columns that appear verbatim in the injected schema ground truth (the "Database schema ground truth" / "Project Architecture Profile" sections). Never invent a table or column name. If you are unsure a column exists, re-read the data-layer module (e.g. the database file) before writing — referencing a column that is not in the schema is a defect that breaks at runtime.
+- Read DB rows in the shape the "DB CURSOR ROW SHAPE" ground truth declares: a PLAIN-cursor project returns TUPLES — access columns by position (`row[0]`, `row[1]` in SELECT order), NEVER by name (`row['col']` raises "tuple indices must be integers" and returns a 500). Only a dictionary/DictCursor project uses `row['col']`. When unsure, match exactly how the existing data-layer code reads rows.
+- Import the external boundaries an endpoint uses — the DB context manager (e.g. `UseDatabase`), the HTTP client (`requests`) — at MODULE level (top of the file), so they exist as module attributes (`main.UseDatabase`, `main.requests`) that behavioral tests can mock via `mock.patch("main.<name>")`. NEVER import them locally inside the endpoint function: a function-local `from X import Y` makes `main.Y` non-existent, so the test's `mock.patch("main.Y")` fails with AttributeError and the endpoint then hits the real network/DB. Reuse a module-level import that is already present rather than adding a duplicate local one.
 - modify only files that belong to application code and are present in `allowed_paths`
 - if a required file belongs to tests or infra, do not create it here; mention it in `warnings`
 - if `allowed_paths` contains application files, treat them as your owned implementation work even when `target_file.path` is empty

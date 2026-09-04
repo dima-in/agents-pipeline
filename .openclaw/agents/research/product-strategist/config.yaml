@@ -1,0 +1,6 @@
+name: product-strategist
+phase: research
+description: "Decompose the vision into a sequenced roadmap of shippable slices"
+timeout: 600
+commands:
+  - echo "product-strategist"

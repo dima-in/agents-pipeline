@@ -46,6 +46,23 @@ def test_compact_console_keeps_cards_status_and_reason(tmp_path, capsys) -> None
     assert "Попытка реализации 2/3" in out
 
 
+def test_compact_console_shows_roadmap_and_slice_cards(tmp_path, capsys) -> None:
+    # --list-slices / the slice driver / the arbiter are operator-facing outcomes: they MUST
+    # reach the console in compact mode (regression: they were suppressed and --list-slices
+    # printed nothing).
+    logger = _make(tmp_path, "compact")
+    logger.operator_box("Роадмап слайсов", ["[done] SLICE-001: Q&A", "[pending] SLICE-002: NL order"])
+    logger.operator_box("Запуск слайса", ["SLICE-002: NL order"])
+    logger.operator_box("Слайс завершён", ["SLICE-001 done"])
+    logger.operator_box("Арбитр: попытка принята", ["QA принял; валидатор придирается"])
+    out = capsys.readouterr().out
+    assert "Роадмап слайсов" in out
+    assert "SLICE-002: NL order" in out
+    assert "Запуск слайса" in out
+    assert "Слайс завершён" in out
+    assert "Арбитр: попытка принята" in out
+
+
 def test_verbose_console_prints_everything(tmp_path, capsys) -> None:
     logger = _make(tmp_path, "verbose")
     logger.agent_progress("qa", "Executor command:")

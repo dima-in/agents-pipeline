@@ -1596,6 +1596,39 @@ def test_arbiter_accepts_only_style_qa_rejection_with_green_gates(tmp_path) -> N
     assert orchestrator._arbiter_should_accept() is False
 
 
+def test_arbiter_overrules_template_validator_when_qa_passed(tmp_path) -> None:
+    # run_20260705_161257: pytest green + QA ПРИНЯТО + must_contain present, yet the tertiary
+    # template-validator falsely claimed the DB access was missing. The arbiter overrules that lone
+    # veto when QA passed and the diagnosis does not flag a real defect.
+    import json
+
+    from workflow.logger import WorkflowLogger
+
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator.logger = WorkflowLogger(log_dir=str(tmp_path / "logs"), console_verbosity="compact")
+    orchestrator.config = {"workflow": {"supervisor_arbiter": "auto"}}
+    orchestrator._phase_failure_status = "template_validation_failed"
+
+    qa_path = orchestrator.logger.run_dir / "agents" / "implementation" / "qa.json"
+    qa_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _write_qa(status: str, verdict: str) -> None:
+        qa_path.write_text(json.dumps({"status": status, "parsed_output": verdict}), encoding="utf-8")
+
+    _write_qa("success", "Вердикт QA: ПРИНЯТО")
+    orchestrator._last_supervisor_diagnosis = "Диагноз: QA прав — задача выполнена корректно."
+    assert orchestrator._arbiter_should_accept() is True
+
+    # QA itself rejected -> template failure is not a lone veto -> do not override.
+    _write_qa("failed", "Вердикт QA: ОТКЛОНЕНО")
+    assert orchestrator._arbiter_should_accept() is False
+
+    # QA passed but the diagnosis flags a real contract gap -> do not override.
+    _write_qa("success", "Вердикт QA: ПРИНЯТО")
+    orchestrator._last_supervisor_diagnosis = "Диагноз: контракт/задача некорректны — эндпоинт не читает БД."
+    assert orchestrator._arbiter_should_accept() is False
+
+
 def test_supervisor_diagnosis_prompt_and_failsafe(tmp_path, monkeypatch) -> None:
     # The diagnostician judges verdict-vs-diff; it is information only (never a gate) and
     # must never raise — any failure returns "".

@@ -82,6 +82,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Select the next uncompleted implementation backlog item",
     )
     parser.add_argument(
+        "--build-roadmap",
+        action="store_true",
+        help="Run only the product-strategist agent to (re)generate the slice roadmap and exit",
+    )
+    parser.add_argument(
+        "--list-slices",
+        action="store_true",
+        help="Print the roadmap of slices (product-strategist output) and exit",
+    )
+    parser.add_argument(
+        "--next-slice",
+        action="store_true",
+        help="Drive the next roadmap slice: set its goal, regenerate the backlog, and run implementation",
+    )
+    parser.add_argument(
         "--rerun-completed",
         action="store_true",
         help="Allow --task-id to select an implementation task already recorded as completed",
@@ -178,6 +193,15 @@ def main(argv: list[str] | None = None) -> int:
     orchestrator.config["workflow"]["mode"] = args.mode
     orchestrator.config["git"]["enabled"] = not args.skip_git
     orchestrator.config["logging"]["level"] = args.log_level
+
+    if args.build_roadmap:
+        return 0 if orchestrator.build_roadmap() else 1
+
+    if args.list_slices:
+        return orchestrator.print_roadmap()
+
+    if args.next_slice:
+        return 0 if orchestrator.run_next_slice() else 1
 
     if args.list_tasks:
         return orchestrator.print_implementation_backlog()
