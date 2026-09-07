@@ -9,7 +9,33 @@ workflow:
   # taste-level LLM-QA is overridden). ask = never auto-accept, always escalate the card.
   supervisor_arbiter: auto
   # LLM used by the supervisor diagnostician (verdict-vs-diff judgement).
-  supervisor_model: openrouter/anthropic/claude-sonnet-4.5
+  supervisor_model: openrouter/anthropic/claude-sonnet-5
+  # Surgical patch retry: when the supervisor diagnosis is a concrete, localized fix (e.g. "add this
+  # one FK to orders.foreign_keys") and the target file already exists, the retry hands the developer
+  # a MINIMAL-EDIT directive on the existing file instead of re-issuing the whole task ("recreate all
+  # 9 tables"). Keeps the retry context tiny and focused, avoids full-file regeneration regressions
+  # and the "nothing to change" loop, and makes even the cheap first-tier model land the fix.
+  surgical_patch_retry: true
+  # Model escalation on retry: when the cheap/default edit models keep failing an implementation
+  # task, escalate the EDIT agents to a stronger model on the LATER attempts (cheap -> better ->
+  # best). The strong model is paid for ONLY when the cheaper tiers could not converge, i.e. rarely.
+  # Rationale (run_20260907_153318): the developer was handed the EXACT one-line fix in the retry
+  # feedback and still failed to apply it 3/3 — a model-capability ceiling, not an information gap.
+  # Only the edit agents are escalated; upstream agents (profiler/architect/qa/...) keep their model.
+  # NOTE: test-developer is deliberately EXCLUDED. Escalating the test author lets a stronger model
+  # "solve" a failing test by WEAKENING it to match wrong code (observed run_20260907_15xxxx: opus
+  # test-developer removed the real orders.status->order_statuses.id FK assertion so a schema missing
+  # that FK went green). The grounded test must stay fixed; only the CODE producers are escalated.
+  developer_model_escalation:
+    enabled: true
+    agents: [developer, code-developer, infra-developer]
+    tiers:
+      - min_attempt: 2
+        provider: openrouter
+        model: openrouter/anthropic/claude-sonnet-5
+      - min_attempt: 3
+        provider: openrouter
+        model: openrouter/anthropic/claude-opus-5
   # Verify gate: after tests + QA pass, actually boot the changed app in the target's own venv and
   # confirm it imports/starts (catches "tests green but the real app crashes on start"). A code-level
   # boot failure is fed back to the developer as another attempt. Requires the target to have its own
@@ -41,7 +67,7 @@ project:
 
 runtime:
   provider: openrouter
-  model: openrouter/anthropic/claude-sonnet-4.6
+  model: openrouter/anthropic/claude-sonnet-5
   thinking: low
 
 paths:
@@ -59,43 +85,43 @@ phases:
         description: "Analyze the current repository, constraints, gaps, and immediate opportunities"
         timeout: 900
         provider: openrouter
-        model: openrouter/anthropic/claude-sonnet-4.5
+        model: openrouter/anthropic/claude-sonnet-5
         thinking: low
       - name: competitor-analyst
         description: "Analyze competitors"
         timeout: 600
         provider: openrouter
-        model: openrouter/anthropic/claude-sonnet-4.5
+        model: openrouter/anthropic/claude-sonnet-5
         thinking: low
       - name: market-analyst
         description: "Analyze market and trends"
         timeout: 600
         provider: openrouter
-        model: openrouter/anthropic/claude-sonnet-4.5
+        model: openrouter/anthropic/claude-sonnet-5
         thinking: low
       - name: tech-analyst
         description: "Review technical options"
         timeout: 600
         provider: openrouter
-        model: openrouter/anthropic/claude-sonnet-4.5
+        model: openrouter/anthropic/claude-sonnet-5
         thinking: low
       - name: innovation-scout
         description: "Find adjacent product and workflow innovations"
         timeout: 600
         provider: openrouter
-        model: openrouter/anthropic/claude-sonnet-4.5
+        model: openrouter/anthropic/claude-sonnet-5
         thinking: low
       - name: product-manager
         description: "Summarize and prepare requirements"
         timeout: 900
         provider: openrouter
-        model: openrouter/anthropic/claude-sonnet-4.5
+        model: openrouter/anthropic/claude-sonnet-5
         thinking: low
       - name: product-strategist
         description: "Decompose the vision into a sequenced roadmap of shippable slices"
         timeout: 600
         provider: openrouter
-        model: openrouter/anthropic/claude-sonnet-4.5
+        model: openrouter/anthropic/claude-sonnet-5
         thinking: low
 
   implementation:
@@ -103,67 +129,75 @@ phases:
     execution_mode: multi_developer_json
     default_alembic_down_revision: "0005"
     multi_developer_agents:
+      # Attempt 1 uses a cheap-but-capable model ("не жалко переделать"); the retry loop escalates
+      # code producers to sonnet-5 then opus-5 only when the cheap tier cannot converge.
       - name: code-developer
         description: "Write application code only"
         timeout: 1800
         provider: openrouter
-        model: openrouter/anthropic/claude-sonnet-4.5
+        model: openrouter/openai/gpt-5.6-luna
         thinking: low
       - name: infra-developer
         description: "Write migrations and config only"
         timeout: 1800
         provider: openrouter
-        model: gpt-5.4
+        model: openrouter/openai/gpt-5.6-luna
         thinking: medium
+      # test-developer is NOT escalated and stays on a strong, fixed model: the grounded test is the
+      # ground truth the code must meet, so it must never be weakened to match wrong code.
       - name: test-developer
         description: "Write pytest tests only"
         timeout: 1200
         provider: openrouter
-        model: gpt-5.4
+        model: openrouter/anthropic/claude-sonnet-5
         thinking: medium
     agents:
       - name: codebase-profiler
         description: "Profile the target's current architecture; fill gaps the detectors could not"
         timeout: 600
         provider: openrouter
-        model: openrouter/anthropic/claude-sonnet-4.5
+        model: openrouter/anthropic/claude-sonnet-5
         thinking: low
       - name: architect
         description: "Prepare technical plan"
         timeout: 900
         provider: openrouter
-        model: openrouter/anthropic/claude-sonnet-4.5
+        model: openrouter/anthropic/claude-sonnet-5
         thinking: low
       - name: implementation-planner
         description: "Convert the architect plan into a prioritized implementation backlog"
         timeout: 900
         provider: openrouter
-        model: openrouter/anthropic/claude-sonnet-4.5
+        model: openrouter/anthropic/claude-sonnet-5
         thinking: low
       - name: task-designer
         description: "Convert the selected backlog item into a machine-executable developer contract"
         timeout: 900
         provider: openrouter
-        model: openrouter/anthropic/claude-sonnet-4.5
+        model: openrouter/anthropic/claude-sonnet-5
         thinking: low
       - name: developer
         description: "Implement the task"
         timeout: 2400
         max_retries: 3
         provider: openrouter
-        model: gpt-5.4
+        model: openrouter/openai/gpt-5.6-luna
         thinking: low
+      # QA stays a GPT (a different model family from the Claude producers/reviewers) on purpose —
+      # an independent viewpoint is less likely to share their blind spots — but on the newest GPT gen.
       - name: qa
         description: "Run checks and report regressions"
         timeout: 900
         provider: openrouter
-        model: gpt-5.4
+        model: openrouter/openai/gpt-5.6-sol
         thinking: low
+      # Tertiary structural reviewer only — its lone vetoes are overridable by the arbiter, so a cheap
+      # model is safe here (a false veto is caught, and QA + deterministic checks are the real gates).
       - name: template-validator
         description: "Validate output against template"
         timeout: 600
         provider: openrouter
-        model: openrouter/anthropic/claude-sonnet-4.5
+        model: openrouter/openai/gpt-5.6-luna
         thinking: low
 
   deployment:

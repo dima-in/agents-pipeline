@@ -1532,6 +1532,258 @@ def test_supervisor_escalation_card_is_actionable(tmp_path, capsys) -> None:
     assert "Разбить" in out  # a concrete decision option for this status
 
 
+def test_scope_watchdog_excludes_prior_completed_task_files(tmp_path) -> None:
+    # Regression: with --skip-git, files from an already-COMPLETED task keep sitting uncommitted
+    # in the worktree, so `git status` reports them on the NEXT task's run. The scope watchdog
+    # wrongly attributed TASK-001's tests/test_sql_validator.py to TASK-002 -> false scope_violation.
+    import json as _json
+
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator.completed_tasks_path = tmp_path / "completed_implementation_tasks.json"
+    orchestrator.completed_tasks_path.write_text(
+        _json.dumps(
+            {
+                "completed_tasks": [
+                    {"task_id": "TASK-001", "changed_files": ["main.py", "tests/test_sql_validator.py"]}
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    # The current task (TASK-002) legitimately edits main.py + its own new test, but NOT the
+    # prior task's test file.
+    orchestrator._selected_implementation_item = {
+        "id": "TASK-002",
+        "allowed_paths": ["main.py", "tests/__init__.py", "tests/test_schema_description.py"],
+        "new_files": ["tests/test_schema_description.py"],
+        "existing_paths": ["main.py", "tests/__init__.py"],
+    }
+    candidate = ["main.py", "tests/test_schema_description.py", "tests/test_sql_validator.py"]
+    excluded = orchestrator._prior_completed_task_baseline_paths(candidate)
+    # Prior task's file is dropped; a file the current task itself owns (main.py) stays in scope.
+    assert excluded == {"tests/test_sql_validator.py"}
+    assert "main.py" not in excluded
+    assert "tests/test_schema_description.py" not in excluded
+
+
+def test_supervisor_escalation_auto_mode_states_autonomous_verdict(tmp_path, capsys) -> None:
+    # The escalation card must NOT ask "Скажи номер — доведу" in auto mode (no operator listens);
+    # it must state the supervisor's autonomous final decision so the run does not appear to hang.
+    from workflow.logger import WorkflowLogger
+
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator.logger = WorkflowLogger(log_dir=str(tmp_path / "logs"), console_verbosity="compact")
+    orchestrator.config = {"workflow": {"mode": "auto"}}
+    orchestrator._selected_implementation_item = {"id": "TASK-002", "title": "schema description"}
+    orchestrator._attempt_blockers = ["выход за разрешённые пути задачи"]
+    orchestrator._emit_supervisor_escalation("TASK-002", "scope_violation", 3, 3)
+    out = capsys.readouterr().out
+    assert "Автономное решение супервайзера" in out
+    assert "Скажи номер" not in out  # no interactive prompt in auto mode
+    assert "TASK-002" in out
+
+
+def test_supervisor_escalation_interactive_mode_keeps_operator_prompt(tmp_path, capsys) -> None:
+    from workflow.logger import WorkflowLogger
+
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator.logger = WorkflowLogger(log_dir=str(tmp_path / "logs"), console_verbosity="compact")
+    orchestrator.config = {"workflow": {"mode": "interactive"}}
+    orchestrator._selected_implementation_item = {"id": "TASK-002", "title": "schema description"}
+    orchestrator._attempt_blockers = ["выход за разрешённые пути задачи"]
+    orchestrator._emit_supervisor_escalation("TASK-002", "scope_violation", 3, 3)
+    out = capsys.readouterr().out
+    assert "Скажи номер" in out  # operator stays in the loop
+    assert "Автономное решение супервайзера" not in out
+
+
+def _escalation_orchestrator(tmp_path):
+    import types
+
+    from workflow.logger import WorkflowLogger
+
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator.logger = WorkflowLogger(log_dir=str(tmp_path / "logs"), console_verbosity="compact")
+    orchestrator.runtime = types.SimpleNamespace(provider="openrouter", model="gpt-5.4", profile="", thinking="low")
+    orchestrator._global_registry_models = {}
+    orchestrator.config = {
+        "workflow": {
+            "developer_model_escalation": {
+                "enabled": True,
+                "agents": ["developer", "code-developer", "test-developer"],
+                "tiers": [
+                    {"min_attempt": 2, "provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-5"},
+                    {"min_attempt": 3, "provider": "openrouter", "model": "openrouter/anthropic/claude-opus-5"},
+                ],
+            }
+        }
+    }
+    return orchestrator
+
+
+def test_developer_model_escalation_by_level(tmp_path) -> None:
+    # Escalation is driven by the escalation LEVEL (set only when the diagnostician decides the cheap
+    # model cannot progress), NOT by attempt number. Level indexes the tiers weakest->strongest.
+    orchestrator = _escalation_orchestrator(tmp_path)
+    code_dev = {"name": "code-developer", "provider": "openrouter", "model": "openrouter/openai/gpt-5.6-luna"}
+    gpt_dev = {"name": "test-developer", "provider": "openrouter", "model": "gpt-5.4"}
+    qa = {"name": "qa", "provider": "openrouter", "model": "openrouter/openai/gpt-5.6-sol"}
+
+    # Level 0: cheap base model everywhere (even after many attempts — attempts alone never escalate).
+    orchestrator._escalation_level = 0
+    orchestrator._implementation_attempt = 3
+    assert orchestrator._resolve_agent_runtime(code_dev)["model"] == "openrouter/openai/gpt-5.6-luna"
+    assert orchestrator._resolve_agent_runtime(gpt_dev)["model"] == "gpt-5.4"
+
+    # Level 1: first tier (sonnet-5).
+    orchestrator._escalation_level = 1
+    r1 = orchestrator._resolve_agent_runtime(code_dev)
+    assert r1["model"] == "openrouter/anthropic/claude-sonnet-5"
+    assert r1["model_source"].startswith("escalation")
+
+    # Level 2: break-glass tier (opus-5).
+    orchestrator._escalation_level = 2
+    assert orchestrator._resolve_agent_runtime(code_dev)["model"] == "openrouter/anthropic/claude-opus-5"
+    # Level above the last tier is capped at the strongest.
+    orchestrator._escalation_level = 9
+    assert orchestrator._resolve_agent_runtime(code_dev)["model"] == "openrouter/anthropic/claude-opus-5"
+
+    # A non-edit agent (qa) is never escalated, at any level.
+    orchestrator._escalation_level = 2
+    assert orchestrator._resolve_agent_runtime(qa)["model"] == "openrouter/openai/gpt-5.6-sol"
+
+
+def test_escalation_gated_by_diagnostician_decision(tmp_path) -> None:
+    # The checker decides: 'Эскалация: НЕТ' keeps the cheap model patching; 'Эскалация: ДА' bumps it.
+    orchestrator = _escalation_orchestrator(tmp_path)
+    orchestrator._escalation_level = 0
+    orchestrator._last_escalation_signal = ""
+
+    # Diagnostician says the cheap model is moving toward the goal -> no escalation.
+    orchestrator._update_escalation_decision(
+        "Диагноз: QA прав — не хватает FK.\nРекомендация: добавить FK status.\nЭскалация: НЕТ"
+    )
+    assert orchestrator._escalation_level == 0
+
+    # A different concrete recommendation (progress) with НЕТ -> still no escalation.
+    orchestrator._update_escalation_decision(
+        "Диагноз: QA прав — теперь не хватает индекса.\nРекомендация: добавить блок INTO OUTFILE запрет.\nЭскалация: НЕТ"
+    )
+    assert orchestrator._escalation_level == 0
+
+    # Diagnostician asks to escalate -> level goes up by one.
+    orchestrator._update_escalation_decision(
+        "Диагноз: модель повторяет ошибку.\nРекомендация: переписать на allow-list.\nЭскалация: ДА"
+    )
+    assert orchestrator._escalation_level == 1
+
+
+def test_escalation_backstop_on_repeated_recommendation(tmp_path) -> None:
+    # Even without an explicit 'ДА', two near-identical recommendations mean the cheap model cannot
+    # move that point -> escalate (deterministic backstop).
+    orchestrator = _escalation_orchestrator(tmp_path)
+    orchestrator._escalation_level = 0
+    orchestrator._last_escalation_signal = ""
+    rec = "Рекомендация: добавить в validate_sql_query явный запрет INTO OUTFILE и FOR UPDATE.\nЭскалация: НЕТ"
+    orchestrator._update_escalation_decision("Диагноз: QA прав.\n" + rec)
+    assert orchestrator._escalation_level == 0
+    orchestrator._update_escalation_decision("Диагноз: QA прав снова.\n" + rec)
+    assert orchestrator._escalation_level == 1  # same point twice -> backstop escalation
+
+
+def test_deterministic_failure_escalates_only_on_repeated_traceback(tmp_path) -> None:
+    # Deterministic failures spend NO LLM diagnosis: escalation is driven purely by the raw traceback
+    # repeating. A changing traceback (progress) keeps the cheap model; the same one twice escalates.
+    orchestrator = _escalation_orchestrator(tmp_path)
+    orchestrator._escalation_level = 0
+    orchestrator._last_escalation_signal = ""
+    tb1 = "pytest failed for selected test file: tests/t.py\nImportError: cannot import name 'dbconfig'"
+    tb2 = "pytest failed for selected test file: tests/t.py\nAssertionError: expected 3 got 4"
+
+    # First failure — nothing to compare against yet.
+    orchestrator._update_escalation_decision(tb1, explicit_escalate=False)
+    assert orchestrator._escalation_level == 0
+    # A DIFFERENT traceback = progress -> stay on the cheap model.
+    orchestrator._update_escalation_decision(tb2, explicit_escalate=False)
+    assert orchestrator._escalation_level == 0
+    # The SAME traceback repeats -> the cheap model cannot move it -> escalate.
+    orchestrator._update_escalation_decision(tb2, explicit_escalate=False)
+    assert orchestrator._escalation_level == 1
+
+
+def test_deterministic_failure_signal_reads_developer_checks(tmp_path, monkeypatch) -> None:
+    orchestrator = _escalation_orchestrator(tmp_path)
+    monkeypatch.setattr(
+        orchestrator,
+        "_load_saved_agent_report",
+        lambda *a, **k: {"parsed_output": "app import failed (boot): import main\nImportError: x"},
+    )
+    signal = orchestrator._deterministic_failure_signal()
+    assert "app import failed (boot)" in signal
+
+
+def test_surgical_patch_mode_enables_on_localized_diagnosis(tmp_path) -> None:
+    # Instead of re-running the whole task ("recreate all 9 tables") to fix one FK line, a concrete
+    # localized diagnosis on an existing file switches the retry into a minimal-edit patch directive.
+    from workflow.logger import WorkflowLogger
+
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator.logger = WorkflowLogger(log_dir=str(tmp_path / "logs"), console_verbosity="compact")
+    orchestrator.config = {"workflow": {"surgical_patch_retry": True}}
+    (tmp_path / "main.py").write_text("x = 1\n", encoding="utf-8")
+    orchestrator._selected_implementation_item = {
+        "id": "TASK-002",
+        "target_file": {"path": "main.py", "action": "update"},
+    }
+    diagnosis = (
+        "Диагноз: QA прав — в orders нет FK для status.\n"
+        "Рекомендация: Добавить в orders.foreign_keys {'column': 'status', 'references': 'order_statuses.id'}."
+    )
+    assert "orders.foreign_keys" in orchestrator._extract_diagnosis_recommendation(diagnosis)
+
+    orchestrator._maybe_enable_surgical_patch_mode(diagnosis)
+    assert orchestrator._developer_patch_mode is True
+    assert "order_statuses.id" in orchestrator._developer_patch_instruction
+
+    directive = orchestrator._build_patch_mode_directive("code-developer")
+    assert "PATCH MODE" in directive
+    assert "МИНИМАЛЬНОЕ" in directive
+    assert "order_statuses.id" in directive
+    # A non-edit agent never receives the patch directive.
+    assert orchestrator._build_patch_mode_directive("qa") == ""
+
+
+def test_surgical_patch_mode_off_without_recommendation(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator.config = {"workflow": {"surgical_patch_retry": True}}
+    (tmp_path / "main.py").write_text("x=1", encoding="utf-8")
+    orchestrator._selected_implementation_item = {"target_file": {"path": "main.py", "action": "update"}}
+    orchestrator._maybe_enable_surgical_patch_mode("Диагноз: контракт/задача некорректны — без конкретной рекомендации.")
+    assert orchestrator._developer_patch_mode is False
+    assert orchestrator._build_patch_mode_directive("code-developer") == ""
+
+
+def test_surgical_patch_mode_respects_config_flag(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator.config = {"workflow": {"surgical_patch_retry": False}}
+    (tmp_path / "main.py").write_text("x=1", encoding="utf-8")
+    orchestrator._selected_implementation_item = {"target_file": {"path": "main.py", "action": "update"}}
+    orchestrator._maybe_enable_surgical_patch_mode("Рекомендация: сделай точечную правку X.")
+    assert orchestrator._developer_patch_mode is False
+
+
+def test_developer_model_escalation_disabled_is_noop(tmp_path) -> None:
+    import types
+
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator.runtime = types.SimpleNamespace(provider="openrouter", model="gpt-5.4", profile="", thinking="low")
+    orchestrator._global_registry_models = {}
+    orchestrator.config = {"workflow": {"developer_model_escalation": {"enabled": False}}}
+    orchestrator._escalation_level = 2  # even a high level is a no-op when escalation is disabled
+    code_dev = {"name": "code-developer", "provider": "openrouter", "model": "openrouter/openai/gpt-5.6-luna"}
+    assert orchestrator._resolve_agent_runtime(code_dev)["model"] == "openrouter/openai/gpt-5.6-luna"
+
+
 def test_direct_api_usage_accumulates_across_all_requests(tmp_path) -> None:
     # OpenRouter dashboard showed $5.81/day vs $1.41 metered: only the FINAL response's usage
     # was recorded, dropping every retrieval-loop turn; gate-synthesized finals recorded none.

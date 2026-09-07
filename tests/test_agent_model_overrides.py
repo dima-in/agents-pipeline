@@ -23,7 +23,7 @@ def test_manager_reads_agent_registration_override() -> None:
     manager = AgentManager()
     overrides = manager._get_agent_registration_overrides("competitor-analyst", "research")
     assert overrides["provider"] == "openrouter"
-    assert overrides["model"] == "openrouter/anthropic/claude-sonnet-4.5"
+    assert overrides["model"] == "openrouter/anthropic/claude-sonnet-5"
 
 
 def test_research_agent_routing_overrides_are_configured() -> None:
@@ -55,12 +55,12 @@ def test_research_agents_use_expected_models() -> None:
         for agent in orchestrator.config["phases"]["research"]["agents"]
     }
 
-    assert research_agents["project-analyst"] == "openrouter/anthropic/claude-sonnet-4.5"
-    assert research_agents["competitor-analyst"] == "openrouter/anthropic/claude-sonnet-4.5"
-    assert research_agents["market-analyst"] == "openrouter/anthropic/claude-sonnet-4.5"
-    assert research_agents["tech-analyst"] == "openrouter/anthropic/claude-sonnet-4.5"
-    assert research_agents["innovation-scout"] == "openrouter/anthropic/claude-sonnet-4.5"
-    assert research_agents["product-manager"] == "openrouter/anthropic/claude-sonnet-4.5"
+    assert research_agents["project-analyst"] == "openrouter/anthropic/claude-sonnet-5"
+    assert research_agents["competitor-analyst"] == "openrouter/anthropic/claude-sonnet-5"
+    assert research_agents["market-analyst"] == "openrouter/anthropic/claude-sonnet-5"
+    assert research_agents["tech-analyst"] == "openrouter/anthropic/claude-sonnet-5"
+    assert research_agents["innovation-scout"] == "openrouter/anthropic/claude-sonnet-5"
+    assert research_agents["product-manager"] == "openrouter/anthropic/claude-sonnet-5"
 
 
 def test_implementation_and_deployment_agents_use_expected_models() -> None:
@@ -74,14 +74,33 @@ def test_implementation_and_deployment_agents_use_expected_models() -> None:
         for agent in orchestrator.config["phases"]["deployment"]["agents"]
     }
 
-    assert implementation_agents["architect"] == "openrouter/anthropic/claude-sonnet-4.5"
-    assert implementation_agents["implementation-planner"] == "openrouter/anthropic/claude-sonnet-4.5"
-    assert implementation_agents["task-designer"] == "openrouter/anthropic/claude-sonnet-4.5"
-    assert implementation_agents["developer"] == "gpt-5.4"
-    assert implementation_agents["qa"] == "gpt-5.4"
-    assert implementation_agents["template-validator"] == "openrouter/anthropic/claude-sonnet-4.5"
+    assert implementation_agents["architect"] == "openrouter/anthropic/claude-sonnet-5"
+    assert implementation_agents["implementation-planner"] == "openrouter/anthropic/claude-sonnet-5"
+    assert implementation_agents["task-designer"] == "openrouter/anthropic/claude-sonnet-5"
+    # Attempt-1 code producer runs on the cheap-but-capable tier; the retry loop escalates it.
+    assert implementation_agents["developer"] == "openrouter/openai/gpt-5.6-luna"
+    assert implementation_agents["qa"] == "openrouter/openai/gpt-5.6-sol"
+    # Tertiary structural reviewer runs on the cheap tier (its vetoes are arbiter-overridable).
+    assert implementation_agents["template-validator"] == "openrouter/openai/gpt-5.6-luna"
     assert deployment_agents["production-readiness-checker"] == "openrouter/deepseek/deepseek-v4-pro"
     assert deployment_agents["launch-strategist"] == "openrouter/deepseek/deepseek-v4-pro"
+
+    # Multi-developer edit agents: cheap code/infra producers, strong FIXED test author.
+    multi = {
+        agent["name"]: agent["model"]
+        for agent in orchestrator.config["phases"]["implementation"]["multi_developer_agents"]
+    }
+    assert multi["code-developer"] == "openrouter/openai/gpt-5.6-luna"
+    assert multi["infra-developer"] == "openrouter/openai/gpt-5.6-luna"
+    assert multi["test-developer"] == "openrouter/anthropic/claude-sonnet-5"
+
+    # Escalation ladder: cheap -> sonnet-5 -> opus-5, and test-developer is NOT escalated (anti-gaming).
+    esc = orchestrator.config["workflow"]["developer_model_escalation"]
+    assert esc["enabled"] is True
+    assert "test-developer" not in esc["agents"]
+    tiers = {t["min_attempt"]: t["model"] for t in esc["tiers"]}
+    assert tiers[2] == "openrouter/anthropic/claude-sonnet-5"
+    assert tiers[3] == "openrouter/anthropic/claude-opus-5"
 
 
 def test_config_uses_deepseek_v4_pro_for_selected_agents() -> None:

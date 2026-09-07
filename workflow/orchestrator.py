@@ -419,6 +419,12 @@ class WorkflowOrchestrator:
         self._developer_feedback_chars = 0
         self._implementation_retry_from_agent = ""
         self._implementation_attempt = 0
+        self._developer_patch_mode = False
+        self._developer_patch_instruction = ""
+        # Analysis-gated escalation: the model tier is bumped ONLY when the diagnostician decides the
+        # cheap model cannot make progress (never by attempt number). Level 0 = cheapest base model.
+        self._escalation_level = 0
+        self._last_escalation_signal = ""
         self.logger.phase_start(phase["name"])
         research_reports, _run_dir = self._load_latest_project_research_reports()
         if not research_reports:
@@ -477,14 +483,23 @@ class WorkflowOrchestrator:
             diagnosis = ""
             if not ok and self._phase_failure_status:
                 self._attempt_blockers.append(self._current_blocker_reason(self._phase_failure_status))
-                # Supervisor diagnostician: judge the verdict against the ACTUAL diff after every
-                # failed attempt, BEFORE rollback erases it. Information for the developer + the
-                # escalation card; never a gate. ~$0.02-0.05 per failed attempt.
-                if self._phase_failure_status in {"qa_failed", "template_validation_failed", "developer_checks_failed", "invalid_output"}:
+                # Deterministic-first economy: pay the LLM diagnostician ONLY for a SEMANTIC dispute
+                # (QA/template rejection where judgement adds value). A deterministic failure
+                # (py_compile/import/pytest red) already carries an exact, free traceback — feed that
+                # straight to the cheap model; spending an LLM call to restate it is pure waste.
+                if self._phase_failure_status in {"qa_failed", "template_validation_failed"}:
                     diagnosis = self._run_supervisor_diagnosis()
                     if diagnosis:
                         self._last_supervisor_diagnosis = diagnosis
                         self.logger.operator_box("Диагноз супервайзера", diagnosis.splitlines()[:6], color="yellow")
+                elif self._phase_failure_status in {"developer_checks_failed", "invalid_output", "verification_failed"}:
+                    finding = self._deterministic_failure_signal()
+                    if finding:
+                        self.logger.operator_box(
+                            "Детерминированный провал",
+                            ["Ошибка поймана бесплатно (compile/import/pytest) — сырой трейсбек уходит модели:", finding[:200]],
+                            color="yellow",
+                        )
                 # Arbiter (config supervisor_arbiter=auto): accept a QA-only, STYLE-level
                 # rejection when the deterministic gates are all green and the diagnosis says so
                 # (e.g. import placement). Deterministic gates stay absolute — this overrides
@@ -504,6 +519,39 @@ class WorkflowOrchestrator:
                         color="green",
                     )
                     ok = True
+            # Supervisor autonomous corrective action (auto mode only): a scope_violation usually
+            # means the developer strayed one file outside allowed_paths — recoverable. Instead of
+            # dead-ending, the supervisor DRIVES one corrective developer retry with an explicit
+            # "restrict strictly to allowed_paths" instruction, then escalates only if it recurs or
+            # attempts are exhausted. This is the "довести до конца" behaviour the escalation card
+            # promises. Interactive mode keeps the operator in the loop (falls through below).
+            if (
+                not ok
+                and self._phase_failure_status == "scope_violation"
+                and attempt < max_retries
+                and str(self.config["workflow"].get("mode", "")).strip().lower() == "auto"
+            ):
+                self._save_scope_violation_retry_feedback(task_id)
+                self._implementation_retry_from_agent = "developer"
+                self.logger.operator_box(
+                    "Арбитр: корректирующий повтор",
+                    [
+                        "Блокер: выход за allowed_paths задачи (scope_violation).",
+                        "Автономное решение: повторить developer со строгим ограничением путей.",
+                    ],
+                    color="yellow",
+                )
+                if self.config["git"]["enabled"] and self.config["git"]["auto_rollback"]:
+                    if not self._rollback_git(f"scope violation (попытка {attempt})"):
+                        self._phase_failure_status = "rollback_failed"
+                        self.logger.error("Rollback failed; stopping to avoid retrying on dirty worktree.")
+                        self._emit_supervisor_escalation(task_id, self._phase_failure_status, attempt, max_retries)
+                        self.logger.save_phase_summary("implementation", phase["name"])
+                        self.logger.phase_end(phase["name"], self._phase_failure_status)
+                        return False
+                    if attempt < max_retries:
+                        self._create_git_branch(task_id)
+                continue
             if not ok and self._phase_failure_status in {"scope_violation", "no_changes", "planner_invalid", "task_designer_invalid", "strict_retrieval_blocked", "task_dependencies_incomplete", "dependency_missing_from_backlog"}:
                 hard_status = self._phase_failure_status
                 if self.config["git"]["enabled"] and self.config["git"]["auto_rollback"]:
@@ -563,6 +611,16 @@ class WorkflowOrchestrator:
                 # The diagnosis (computed above, before rollback) sharpens the next attempt.
                 if diagnosis:
                     self._append_supervisor_diagnosis_to_feedback(diagnosis)
+                # When the diagnosis is a concrete localized fix on an existing file, switch the next
+                # attempt into surgical patch mode (minimal edit) instead of a full task re-run.
+                self._maybe_enable_surgical_patch_mode(diagnosis)
+                # Analysis-gated escalation. Semantic failure: the diagnostician's explicit verdict
+                # decides. Deterministic failure (no paid diagnosis): escalate only when the SAME raw
+                # traceback repeats — the cheap model demonstrably cannot move it — else keep it cheap.
+                if diagnosis:
+                    self._update_escalation_decision(diagnosis)
+                else:
+                    self._update_escalation_decision(self._deterministic_failure_signal(), explicit_escalate=False)
             if self.config["git"]["enabled"] and self.config["git"]["auto_rollback"]:
                 if not self._rollback_git(f"изменений (попытка {attempt} не принята)"):
                     self._phase_failure_status = "rollback_failed"
@@ -2144,13 +2202,69 @@ class WorkflowOrchestrator:
             model = str(self.runtime.model)
             model_source = "workflow config"
 
-        return {
+        runtime = {
             "provider": provider,
             "model": model,
             "profile": str(profile_override or self.runtime.profile),
             "thinking": str(thinking_override or self.runtime.thinking),
             "model_source": model_source,
         }
+        return self._maybe_escalate_agent_runtime(agent_name, runtime)
+
+    def _escalation_tiers(self) -> list[dict[str, Any]]:
+        """Escalation tiers ordered weakest->strongest (sorted by min_attempt, used purely as an
+        ordering key). Escalation LEVEL indexes this list: level 1 = first tier, and so on."""
+        cfg = (self.config.get("workflow") or {}).get("developer_model_escalation") or {}
+        tiers = [t for t in (cfg.get("tiers") or []) if str(t.get("model") or "").strip()]
+
+        def _order(t: dict[str, Any]) -> int:
+            try:
+                return int(t.get("min_attempt", 0))
+            except (TypeError, ValueError):
+                return 0
+
+        return sorted(tiers, key=_order)
+
+    def _maybe_escalate_agent_runtime(self, agent_name: str, runtime: dict[str, str]) -> dict[str, str]:
+        """Model escalation driven by the escalation LEVEL (set only when the diagnostician decides
+        the cheap model cannot progress — see _update_escalation_decision), NOT by attempt number.
+        A no-op at level 0 and for non-edit agents, so startup diagnostics stay unchanged."""
+        cfg = (self.config.get("workflow") or {}).get("developer_model_escalation") or {}
+        if not cfg.get("enabled"):
+            return runtime
+        if agent_name not in set(cfg.get("agents") or []):
+            return runtime
+        level = int(getattr(self, "_escalation_level", 0) or 0)
+        if level <= 0:
+            return runtime
+        tiers = self._escalation_tiers()
+        if not tiers:
+            return runtime
+        chosen = tiers[min(level, len(tiers)) - 1]  # level 1 -> weakest tier; capped at the strongest
+        new_model = str(chosen.get("model") or "").strip()
+        if not new_model or new_model == runtime["model"]:
+            return runtime
+        escalated = dict(runtime)
+        escalated["provider"] = str(chosen.get("provider") or runtime["provider"])
+        escalated["model"] = new_model
+        escalated["model_source"] = f"escalation(уровень {level})"
+        # Announce the swap once per (agent, level, model) so the operator sees WHY cost rose.
+        seen = getattr(self, "_escalation_announced", None)
+        if seen is None:
+            seen = set()
+            self._escalation_announced = seen
+        key = (agent_name, level, new_model)
+        if key not in seen:
+            seen.add(key)
+            self.logger.operator_box(
+                "Эскалация модели",
+                [
+                    f"Агент {agent_name}: {runtime['model']} -> {new_model}",
+                    f"Уровень {level}: диагност решил, что дешёвая модель не тянет.",
+                ],
+                color="yellow",
+            )
+        return escalated
 
     def _build_agent_message_bundle(
         self,
@@ -2331,6 +2445,9 @@ class WorkflowOrchestrator:
         if developer_feedback_text:
             combined_parts.append(f"Previous validation feedback to repair:\n{developer_feedback_text}")
         if phase == "implementation":
+            patch_directive = self._build_patch_mode_directive(agent_name)
+            if patch_directive:
+                combined_parts.append(patch_directive)
             combined_parts.append(self._build_implementation_scope_instruction(selected_task_scope, agent_name=agent_name))
         combined_parts.append(translation_instruction)
         combined_message = "\n\n".join(combined_parts)
@@ -2347,6 +2464,9 @@ class WorkflowOrchestrator:
         if developer_feedback_text:
             system_parts.append(f"Previous validation feedback to repair:\n{developer_feedback_text}")
         if phase == "implementation":
+            patch_directive = self._build_patch_mode_directive(agent_name)
+            if patch_directive:
+                system_parts.append(patch_directive)
             system_parts.append(self._build_implementation_scope_instruction(selected_task_scope, agent_name=agent_name))
         system_parts.append(translation_instruction)
         system_message = "\n\n".join(part for part in system_parts if part)
@@ -5730,6 +5850,16 @@ class WorkflowOrchestrator:
             if normalized:
                 changed_files.append(normalized)
         changed_files = sorted(set(changed_files))
+        # Prior COMPLETED tasks whose output is still sitting uncommitted in the worktree (the
+        # --skip-git accumulation pattern used to batch a feature's tasks into one final commit)
+        # keep showing up in `git status`. Those files are baseline, not THIS task's work — the
+        # scope watchdog must never attribute a previous task's file to the current task. A path
+        # the current task itself declares editable stays in the check (it may legitimately share
+        # a file such as main.py). This makes the watchdog correct regardless of git mode: when
+        # git is enabled the prior files are committed and never appear here anyway.
+        baseline_excluded = self._prior_completed_task_baseline_paths(changed_files)
+        if baseline_excluded:
+            changed_files = [path for path in changed_files if path not in baseline_excluded]
 
         path_check = self._evaluate_scope_paths(changed_files)
         numstat_output = self._run_local_capture(["git", "diff", "--numstat"], timeout=10, cwd=self.target_workspace)
@@ -5788,8 +5918,27 @@ class WorkflowOrchestrator:
                 if self._normalize_repo_relative_path(path)
             ],
             "planned_edit_paths": self._build_selected_task_planned_edit_paths(),
+            "baseline_excluded_paths": sorted(baseline_excluded),
             "forbidden_hits_source": "diff" if forbidden_hits else "",
         }
+
+    def _prior_completed_task_baseline_paths(self, candidate_paths: list[str]) -> set[str]:
+        """Files produced by ALREADY-COMPLETED implementation tasks that are still uncommitted in
+        the worktree (the --skip-git batch pattern) are baseline, not the current task's changes.
+        Return the subset of ``candidate_paths`` that belongs to a prior completed task AND is not
+        declared editable by the current task, so the scope watchdog can drop them before judging
+        this task's scope."""
+        prior: set[str] = set()
+        for record in self._load_completed_implementation_task_records():
+            for path in (record.get("changed_files") or []):
+                normalized = self._normalize_repo_relative_path(path)
+                if normalized:
+                    prior.add(normalized)
+        if not prior:
+            return set()
+        own = set(self._build_selected_task_planned_edit_paths())
+        candidates = set(candidate_paths)
+        return {path for path in prior if path in candidates and path not in own}
 
     def _mark_developer_no_changes(self, reason: str) -> bool:
         diagnostics = self._collect_scope_watchdog_diff_diagnostics()
@@ -10552,7 +10701,10 @@ class WorkflowOrchestrator:
         parts.append(
             "Ответь по-русски, максимум 6 строк, строго в формате:\n"
             "Диагноз: <QA прав | QA придирается | контракт/задача некорректны> — <почему, по фактам диффа>\n"
-            "Рекомендация: <одно конкретное действие для следующей попытки или для владельца>"
+            "Рекомендация: <одно конкретное действие для следующей попытки или для владельца>\n"
+            "Эскалация: <НЕТ | ДА> — НЕТ, если правка точечная и разработчик движется к цели "
+            "(достаточно повторить на текущей модели); ДА, если модель повторяет одну и ту же ошибку "
+            "или задача требует более сильной модели"
         )
         return "\n\n".join(parts)
 
@@ -10664,10 +10816,20 @@ class WorkflowOrchestrator:
             diagnosis = str(getattr(self, "_last_supervisor_diagnosis", "") or "").strip()
             if diagnosis:
                 lines.extend(diagnosis.splitlines()[:4])
-            lines.append("Возможные решения:")
+            auto_mode = str(((getattr(self, "config", None) or {}).get("workflow") or {}).get("mode", "")).strip().lower() == "auto"
+            if auto_mode:
+                # No operator is listening in auto mode — state the supervisor's autonomous final
+                # decision instead of a prompt that would hang. The task stops with this verdict;
+                # the options are the owner's follow-ups, not a question the run is waiting on.
+                lines.append("Автономное решение супервайзера: задача остановлена с этим вердиктом (оператора нет).")
+                lines.append("Варианты для владельца дальше:")
+            else:
+                lines.append("Возможные решения:")
             lines.extend(f"  {i}. {opt}" for i, opt in enumerate(self._supervisor_decision_options(status), 1))
-            lines.append("Скажи номер или своё решение — доведу.")
-            self.logger.operator_box("Требуется решение (супервайзер)", lines, color="red")
+            if not auto_mode:
+                lines.append("Скажи номер или своё решение — доведу.")
+            title = "Итог супервайзера (авто): задача остановлена" if auto_mode else "Требуется решение (супервайзер)"
+            self.logger.operator_box(title, lines, color="red")
         except Exception:
             self.logger.info(f"Требуется решение: {status}")
 
@@ -10853,6 +11015,163 @@ class WorkflowOrchestrator:
         self._developer_feedback_file = str(feedback_file)
         self._developer_feedback_source = str(feedback_file)
         self._developer_feedback_chars = len(feedback)
+
+    def _save_scope_violation_retry_feedback(self, task_id: int) -> None:
+        """Write the developer a precise, actionable repair note for a scope_violation retry:
+        which paths were out of scope and the exact allowed_paths to stay within."""
+        developer_report = self._load_saved_agent_report("implementation", "developer") or {}
+        offending = [
+            str(hit).split(":", 1)[1] if ":" in str(hit) else str(hit)
+            for hit in (developer_report.get("forbidden_hits") or [])
+            if str(hit).startswith("out_of_scope:") or str(hit).startswith("path:")
+        ]
+        item = self._selected_implementation_item or {}
+        allowed = [self._normalize_repo_relative_path(p) for p in (item.get("allowed_paths") or [])]
+        allowed = [p for p in allowed if p]
+        lines = [
+            "Implementation repair feedback",
+            "Your previous attempt changed files OUTSIDE the task's allowed_paths (scope_violation).",
+            "Fix: edit ONLY the allowed paths below. Do not create, modify, or delete any other file.",
+        ]
+        if offending:
+            lines.append("Out-of-scope paths you touched (revert these to their original state):")
+            lines.extend(f"- {path}" for path in sorted(dict.fromkeys(offending)))
+        if allowed:
+            lines.append("The ONLY paths you may edit for this task:")
+            lines.extend(f"- {path}" for path in allowed)
+        feedback = "\n".join(lines)
+        feedback_file = self._save_feedback(task_id, "developer", feedback)
+        self._developer_feedback_file = str(feedback_file)
+        self._developer_feedback_source = str(feedback_file)
+        self._developer_feedback_chars = len(feedback)
+
+    @staticmethod
+    def _extract_diagnosis_recommendation(diagnosis: str) -> str:
+        """Pull the concrete 'Рекомендация: <one action>' line out of a supervisor diagnosis.
+        Empty when the diagnosis has no actionable recommendation (then no patch mode)."""
+        text = str(diagnosis or "")
+        match = re.search(r"Рекомендаци[яи]\s*:\s*(.+)", text, re.IGNORECASE | re.DOTALL)
+        if not match:
+            return ""
+        recommendation = match.group(1).strip().split("\n\n", 1)[0].strip()
+        return recommendation[:600]
+
+    def _maybe_enable_surgical_patch_mode(self, diagnosis: str) -> None:
+        """Enable surgical patch mode for the NEXT developer attempt when the diagnosis is a concrete,
+        localized fix and the target file already exists. Keeps the retry a minimal edit rather than a
+        full task re-run (which regenerates the whole file and keeps dropping the same detail)."""
+        self._developer_patch_mode = False
+        self._developer_patch_instruction = ""
+        if not (self.config.get("workflow") or {}).get("surgical_patch_retry"):
+            return
+        recommendation = self._extract_diagnosis_recommendation(diagnosis)
+        if not recommendation:
+            return
+        item = self._selected_implementation_item or {}
+        target = item.get("target_file") or {}
+        action = str(target.get("action") or "").strip().lower()
+        target_path = str(target.get("path") or "").strip()
+        exists = False
+        if target_path:
+            try:
+                exists = (self.target_workspace / target_path).exists()
+            except OSError:
+                exists = False
+        if action != "update" and not exists:
+            return
+        self._developer_patch_mode = True
+        self._developer_patch_instruction = recommendation
+        self.logger.operator_box(
+            "Точечная правка",
+            [
+                "Ретрай в режиме минимальной правки существующего файла (не пересоздаём весь файл).",
+                recommendation[:180],
+            ],
+            color="yellow",
+        )
+
+    def _build_patch_mode_directive(self, agent_name: str) -> str:
+        """A high-priority minimal-edit directive injected into an EDIT agent's prompt when the retry
+        is a surgical patch. Returns '' when patch mode is off or the agent is not a code editor."""
+        if not getattr(self, "_developer_patch_mode", False):
+            return ""
+        if not (agent_name == "developer" or self._is_multi_developer_edit_agent(agent_name)):
+            return ""
+        instruction = str(getattr(self, "_developer_patch_instruction", "") or "").strip()
+        item = self._selected_implementation_item or {}
+        target_path = str((item.get("target_file") or {}).get("path") or "").strip()
+        lines = [
+            "=== PATCH MODE — минимальная точечная правка ===",
+            f"Целевой файл {target_path or 'из контракта'} УЖЕ существует и почти корректен.",
+            "НЕ переписывай файл целиком и НЕ пересоздавай существующий код.",
+            "Внеси МИНИМАЛЬНОЕ изменение, чтобы пройти проверки, затем остановись. Остальной код сохрани без изменений.",
+        ]
+        if instruction:
+            lines.append("Конкретная требуемая правка:")
+            lines.append(instruction)
+        lines.append("Меняй только необходимые строки; не реструктурируй, не переименовывай, не трогай несмежный код.")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _extract_diagnosis_escalation(diagnosis: str) -> bool:
+        """Read the diagnostician's explicit escalation verdict ('Эскалация: ДА|НЕТ'). The checker
+        decides whether the cheap model must be escalated. Absent or НЕТ -> keep the cheap model."""
+        match = re.search(r"Эскалаци[яю]\s*:\s*(ДА|НЕТ|да|нет|YES|NO|yes|no)", str(diagnosis or ""))
+        if not match:
+            return False
+        return match.group(1).strip().lower() in {"да", "yes"}
+
+    @staticmethod
+    def _recommendations_similar(a: str, b: str) -> bool:
+        """True when two diagnosis recommendations target essentially the SAME point — the signal the
+        cheap model failed to move it (deterministic backstop for escalation). Token Jaccard >= 0.6."""
+        def toks(s: str) -> set[str]:
+            return {t for t in re.findall(r"[A-Za-zА-Яа-я_]{3,}", str(s or "").lower())}
+
+        ta, tb = toks(a), toks(b)
+        if not ta or not tb:
+            return False
+        union = len(ta | tb)
+        return union > 0 and (len(ta & tb) / union) >= 0.6
+
+    def _deterministic_failure_signal(self) -> str:
+        """The free, exact failure signature for a deterministic failure (py_compile/import/pytest),
+        pulled from the developer-checks report — used both as retry feedback and as the escalation
+        repeat-key. No LLM call."""
+        report = self._load_saved_agent_report("implementation", "developer-checks") or {}
+        text = str(report.get("parsed_output") or report.get("result") or "").strip()
+        return text
+
+    def _update_escalation_decision(self, signal_text: str, explicit_escalate: bool | None = None) -> None:
+        """Analysis-gated escalation (the checker decides): bump the escalation LEVEL only when the
+        checker asks for a stronger model, OR when the SAME failure signal repeats (cheap model cannot
+        move that point). Otherwise keep the cheap model patching. Never a per-attempt bump.
+
+        signal_text is the diagnosis (semantic dispute) or the raw deterministic traceback. When
+        explicit_escalate is None it is derived from the signal's 'Эскалация:' line (diagnosis only)."""
+        cfg = (self.config.get("workflow") or {}).get("developer_model_escalation") or {}
+        if not cfg.get("enabled"):
+            return
+        if explicit_escalate is None:
+            explicit_escalate = self._extract_diagnosis_escalation(signal_text)
+        # Repeat-key: the concrete recommendation if the signal carries one, else the raw signal text.
+        key = self._extract_diagnosis_recommendation(signal_text) or " ".join(str(signal_text or "").split())[:400]
+        repeated = bool(key) and self._recommendations_similar(key, str(getattr(self, "_last_escalation_signal", "") or ""))
+        self._last_escalation_signal = key
+        if not (explicit_escalate or repeated):
+            return  # cheap model is moving toward the goal — keep patching, no escalation
+        if self._escalation_level >= len(self._escalation_tiers()):
+            return
+        self._escalation_level += 1
+        why = "диагност: нужен более сильный ум" if explicit_escalate else "одна и та же ошибка повторяется — дешёвая модель не тянет"
+        self.logger.operator_box(
+            "Эскалация: решение",
+            [
+                f"Уровень эскалации -> {self._escalation_level} ({why}).",
+                "Следующая попытка — на более сильной модели.",
+            ],
+            color="yellow",
+        )
 
     def _save_developer_checks_report(self, status: str, result: str, parsed_output: str = "") -> None:
         self.logger.save_agent_report(
@@ -11058,6 +11377,23 @@ class WorkflowOrchestrator:
             if returncode != 0:
                 findings.append("py_compile failed for changed Python files:")
                 findings.append(stderr or stdout or "unknown py_compile failure")
+
+        # Free boot gate: the app entrypoint must IMPORT in the target venv. Catches "app does not
+        # load" (e.g. a hallucinated import name that py_compile cannot see) for free, EVERY attempt,
+        # BEFORE the paid QA — exactly the class isolated/mocked tests miss. Skipped when the target
+        # venv is unavailable (an env problem, not a code defect).
+        entrypoint = self._detect_app_entrypoint()
+        if entrypoint and changed_python_files:
+            boot_python, boot_python_source, _boot_pytest = self.resolve_python_executable()
+            if boot_python_source == "target_venv":
+                rc_boot, out_boot, err_boot = self._run_local_command(
+                    [boot_python, "-c", f"import {entrypoint}"],
+                    timeout=60,
+                    cwd=self.target_workspace,
+                )
+                if rc_boot != 0:
+                    findings.append(f"app import failed (boot): import {entrypoint}")
+                    findings.append((err_boot or out_boot or "unknown import failure").strip()[:800])
 
         if test_file_path:
             candidate = self.target_workspace / test_file_path
