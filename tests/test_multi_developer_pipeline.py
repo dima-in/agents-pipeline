@@ -391,6 +391,45 @@ def test_multi_developer_no_changes_rejects_code_scope_without_target_contract(t
     assert "no scoped target_file contract" in detail
 
 
+def test_multi_developer_no_changes_accepts_green_scope_without_token(tmp_path) -> None:
+    # Recurring false failure (TASK-002/005/004 re-runs): a sub-agent writes nothing because its
+    # scoped file already exists and is correct, but did not emit the 'status=no_changes' token.
+    # Deterministic-green must be the decider, so this is ACCEPTED, not a constraint failure.
+    test_path = tmp_path / "tests" / "test_thing.py"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+
+    ok, detail = orchestrator._validate_multi_developer_no_changes(
+        "test-developer",
+        {
+            "allowed_paths": ["tests/test_thing.py"],
+            "target_file": {},
+            "test_file": {"path": "tests/test_thing.py"},
+            "must_contain": [],
+        },
+        ["tests/test_thing.py"],
+        "the test already covers this; nothing to change",  # NO status=no_changes token
+    )
+
+    assert ok is True
+    assert "green" in detail
+
+
+def test_multi_developer_no_changes_still_rejects_missing_file(tmp_path) -> None:
+    # But "no changes" is NOT accepted when the scoped file is missing (real gap), token or not.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    ok, detail = orchestrator._validate_multi_developer_no_changes(
+        "test-developer",
+        {"allowed_paths": ["tests/missing.py"], "target_file": {}, "test_file": {}, "must_contain": []},
+        ["tests/missing.py"],
+        "nothing to do",
+    )
+    assert ok is False
+    assert "missing" in detail
+
+
 def test_test_developer_static_constraints_reject_format_sensitive_migration_assertions(tmp_path) -> None:
     test_path = tmp_path / "gateway-v4" / "tests" / "test_provider_metrics_migration.py"
     test_path.parent.mkdir(parents=True)
@@ -1566,6 +1605,44 @@ def test_scope_watchdog_excludes_prior_completed_task_files(tmp_path) -> None:
     assert "tests/test_schema_description.py" not in excluded
 
 
+def test_scope_watchdog_excludes_untracked_leftovers_from_unrecorded_tasks(tmp_path, monkeypatch) -> None:
+    # TASK-003 regression: TASK-004/005 finished functionally but the pipeline did NOT record them
+    # complete, so their UNTRACKED test files were not in completed_tasks -> the old baseline filter
+    # missed them -> they were attributed to TASK-003 -> false scope_violation on every attempt.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator.completed_tasks_path = tmp_path / "completed.json"  # no records
+    # Pre-task snapshot: prior untracked leftovers + a tracked file the task will legitimately edit.
+    orchestrator._repo_map_before = {
+        "files": [
+            {"path": "main.py", "is_tracked": True},
+            {"path": "tests/test_llm_sql_generation.py", "is_tracked": False},
+            {"path": "tests/test_safe_sql_execution.py", "is_tracked": False},
+        ]
+    }
+    orchestrator._selected_implementation_item = {
+        "id": "TASK-003",
+        "allowed_paths": ["main.py", "tests/test_analytics_assistant_endpoint.py"],
+        "new_files": ["tests/test_analytics_assistant_endpoint.py"],
+        "existing_paths": ["main.py"],
+    }
+    # This task's developer actually wrote only main.py + its own new test.
+    monkeypatch.setattr(
+        orchestrator,
+        "_load_saved_agent_report",
+        lambda *a, **k: {"developer_changed_files": ["main.py", "tests/test_analytics_assistant_endpoint.py"]},
+    )
+    candidate = [
+        "main.py",
+        "tests/test_analytics_assistant_endpoint.py",
+        "tests/test_llm_sql_generation.py",
+        "tests/test_safe_sql_execution.py",
+    ]
+    excluded = orchestrator._prior_completed_task_baseline_paths(candidate)
+    assert excluded == {"tests/test_llm_sql_generation.py", "tests/test_safe_sql_execution.py"}
+    assert "main.py" not in excluded  # developer wrote it + it is declared editable
+    assert "tests/test_analytics_assistant_endpoint.py" not in excluded  # this task's own new file
+
+
 def test_supervisor_escalation_auto_mode_states_autonomous_verdict(tmp_path, capsys) -> None:
     # The escalation card must NOT ask "Скажи номер — доведу" in auto mode (no operator listens);
     # it must state the supervisor's autonomous final decision so the run does not appear to hang.
@@ -1720,6 +1797,20 @@ def test_deterministic_failure_signal_reads_developer_checks(tmp_path, monkeypat
     )
     signal = orchestrator._deterministic_failure_signal()
     assert "app import failed (boot)" in signal
+
+
+def test_humanize_task_designer_error_is_actionable() -> None:
+    # A terse validation code becomes an actionable instruction so the task-designer can self-correct
+    # instead of re-emitting the same too-thin contract (TASK-004: must_contain_too_short 3x -> dead).
+    h = WorkflowOrchestrator._humanize_task_designer_error
+    msg = h("TASK-004:must_contain_too_short:1")
+    assert "at least 2" in msg.lower()
+    assert "def" in msg.lower()
+    assert h("TASK-004:must_contain_too_short:1") != "TASK-004:must_contain_too_short:1"  # not passthrough
+    # Unknown codes pass through unchanged.
+    assert h("TASK-004:some_unknown_code") == "TASK-004:some_unknown_code"
+    # Vague item echoes the offending value.
+    assert "SELECT" in h("TASK-004:vague_must_contain:runs a SELECT")
 
 
 def test_surgical_patch_mode_enables_on_localized_diagnosis(tmp_path) -> None:

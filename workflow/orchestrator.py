@@ -967,8 +967,12 @@ class WorkflowOrchestrator:
         allowed_paths: list[str],
         parsed_output: str,
     ) -> tuple[bool, str]:
-        if "status=no_changes" not in str(parsed_output or "").lower():
-            return False, "agent did not write and did not return status=no_changes"
+        # "No changes" is acceptable when the scoped work is ALREADY done. The DETERMINISTIC checks
+        # below (scoped files exist + compile + must_contain present + no forbidden) are the decider —
+        # NOT whether the agent emitted a magic 'status=no_changes' token. This kills the recurring
+        # false failure where a re-run sub-agent correctly writes nothing because the file already
+        # exists and is right; the downstream pytest gate still judges behavioural correctness.
+        _declared_no_changes = "status=no_changes" in str(parsed_output or "").lower()
 
         findings: list[str] = []
         existing_paths: list[str] = []
@@ -1024,7 +1028,8 @@ class WorkflowOrchestrator:
 
         if findings:
             return False, "; ".join(findings)
-        return True, "status=no_changes accepted after scoped deterministic validation"
+        suffix = " (agent declared status=no_changes)" if _declared_no_changes else " (scoped work already complete)"
+        return True, "no-changes accepted: scoped deterministic validation is green" + suffix
 
     def _validate_multi_developer_changed_scope(
         self,
@@ -5923,22 +5928,47 @@ class WorkflowOrchestrator:
         }
 
     def _prior_completed_task_baseline_paths(self, candidate_paths: list[str]) -> set[str]:
-        """Files produced by ALREADY-COMPLETED implementation tasks that are still uncommitted in
-        the worktree (the --skip-git batch pattern) are baseline, not the current task's changes.
-        Return the subset of ``candidate_paths`` that belongs to a prior completed task AND is not
-        declared editable by the current task, so the scope watchdog can drop them before judging
-        this task's scope."""
+        """Files that were already present before THIS task's developer ran and that the developer did
+        NOT actually write are baseline noise in `git status` (the --skip-git accumulation), not this
+        task's changes — the scope watchdog must drop them. Two sources: (1) prior COMPLETED tasks'
+        recorded outputs, and (2) UNTRACKED files that existed in the pre-task repo-map snapshot (a
+        prior task whose run failed/was not recorded still leaves its test/code files untracked in the
+        worktree). NEVER dropped: paths this task declares editable, and files the developer actually
+        wrote this attempt — so a genuine out-of-scope write to a pre-existing file stays flagged."""
         prior: set[str] = set()
         for record in self._load_completed_implementation_task_records():
             for path in (record.get("changed_files") or []):
                 normalized = self._normalize_repo_relative_path(path)
                 if normalized:
                     prior.add(normalized)
+        # Untracked files that existed BEFORE this task (leftovers from earlier, possibly unrecorded,
+        # runs). A tracked pre-existing file is excluded here on purpose: a real edit to it IS this
+        # task's change and must still be judged.
+        before = getattr(self, "_repo_map_before", None) or {}
+        for entry in (before.get("files") or []):
+            if not isinstance(entry, dict) or entry.get("is_tracked", True):
+                continue
+            normalized = self._normalize_repo_relative_path(entry.get("path"))
+            if normalized:
+                prior.add(normalized)
         if not prior:
             return set()
         own = set(self._build_selected_task_planned_edit_paths())
+        developer_written: set[str] = set()
+        try:
+            developer_report = self._load_saved_agent_report("implementation", "developer") or {}
+        except Exception:
+            developer_report = {}
+        for path in (developer_report.get("developer_changed_files") or []):
+            normalized = self._normalize_repo_relative_path(path)
+            if normalized:
+                developer_written.add(normalized)
         candidates = set(candidate_paths)
-        return {path for path in prior if path in candidates and path not in own}
+        return {
+            path
+            for path in prior
+            if path in candidates and path not in own and path not in developer_written
+        }
 
     def _mark_developer_no_changes(self, reason: str) -> bool:
         diagnostics = self._collect_scope_watchdog_diff_diagnostics()
@@ -9465,6 +9495,49 @@ class WorkflowOrchestrator:
         return normalized.startswith("tests/") or "/tests/" in normalized or name.startswith("test_")
 
     @staticmethod
+    def _humanize_task_designer_error(error: str) -> str:
+        """Turn a terse validation code (e.g. 'TASK-004:must_contain_too_short:1') into an actionable
+        instruction the task-designer can act on — the same precise-feedback principle as the developer
+        loop. Unknown codes pass through unchanged."""
+        parts = str(error or "").split(":")
+        code = parts[1] if len(parts) > 1 else (parts[0] if parts else "")
+        detail = parts[2] if len(parts) > 2 else ""
+        table = {
+            "must_contain_too_short": (
+                f"must_contain has too few items ({detail or '<2'}). List AT LEAST 2 exact, greppable "
+                "code tokens the target file must contain after this task — e.g. the `def <function>(` "
+                "signature PLUS a concrete symbol it must call or reference (a helper function named in "
+                "the acceptance criteria, an import, or a decorator). No vague phrases."
+            ),
+            "vague_must_contain": (
+                f"must_contain item is too vague to grep for: '{detail}'. Replace it with an exact code "
+                "token (a def signature, a specific function call, an import, or a decorator)."
+            ),
+            "vague_must_test": (
+                f"must_test item is too vague: '{detail}'. Name the concrete test function and the exact "
+                "assertion it makes."
+            ),
+            "must_test_empty": (
+                "must_test is empty but this task requires tests. List at least one concrete test name "
+                "and the assertion it must make."
+            ),
+            "task_needs_split_multiple_editable_files": (
+                f"The contract needs edits across multiple files ({detail}) but a task must have exactly "
+                "ONE editable target file. Narrow the task to a single file, or split it into separate tasks."
+            ),
+            "test_file_path_not_declared": (
+                "The declared test_file path is not in existing_paths or new_files. Add it to new_files."
+            ),
+            "test_file_path_not_in_required_test_paths": (
+                "The declared test_file path is not among the task's required_test_paths. Use one of those paths."
+            ),
+            "invalid_test_file_action": (
+                "test_file.action must be one of create/update/modify."
+            ),
+        }
+        return table.get(code, error)
+
+    @staticmethod
     def _is_vague_contract_item(text: str) -> bool:
         normalized = str(text or "").strip().lower()
         if not normalized:
@@ -9650,7 +9723,7 @@ class WorkflowOrchestrator:
                 errors.append(f"{task_id}:invalid_test_file_action")
 
         if len(must_contain) < 2:
-            errors.append(f"{task_id}:must_contain_too_short")
+            errors.append(f"{task_id}:must_contain_too_short:{len(must_contain)}")
         for value in must_contain:
             if self._is_vague_contract_item(value):
                 errors.append(f"{task_id}:vague_must_contain:{value[:80]}")
@@ -9911,11 +9984,12 @@ class WorkflowOrchestrator:
                 )
         self._task_designer_validation_errors = errors
         if not contract_item or errors:
-            feedback = "Task designer validation errors\n\n```text\n" + ("\n".join(errors) or "unknown_error") + "\n```"
+            humanized = "\n".join(f"- {self._humanize_task_designer_error(e)}" for e in errors) or "unknown_error"
+            feedback = "Task designer validation errors — fix ALL of these, then re-emit the contract:\n\n" + humanized
             feedback_file = self._save_feedback(self.task_counter or 0, "task-designer", feedback)
             self._task_designer_feedback_file = str(feedback_file)
             self._task_designer_feedback_source = str(feedback_file)
-            self._task_designer_rejection_reason = "\n".join(errors)
+            self._task_designer_rejection_reason = humanized
             self.logger.error("Task designer output is invalid", self._task_designer_rejection_reason or "unknown_error")
             self._phase_failure_status = "task_designer_invalid"
             return False
