@@ -11431,6 +11431,35 @@ class WorkflowOrchestrator:
         )
         return "\n".join(lines)
 
+    def _duplicate_definition_findings(self, changed_python_files: list[str]) -> list[str]:
+        """Free AST check: a changed file that defines the SAME top-level function/class name more
+        than once almost always means the developer ADDED a duplicate instead of modifying the
+        existing one (observed: TASK-003 added a second `analytics_assistant`, and prior runs left
+        duplicate analytics functions). Flag it so the cheap model merges them. No LLM call."""
+        import ast as _ast
+        from collections import Counter as _Counter
+
+        findings: list[str] = []
+        for rel in changed_python_files:
+            candidate = self.target_workspace / rel
+            try:
+                tree = _ast.parse(candidate.read_text(encoding="utf-8", errors="replace"))
+            except (OSError, SyntaxError):
+                continue  # syntax errors are already reported by py_compile
+            names = [
+                node.name
+                for node in tree.body
+                if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef))
+            ]
+            for name, count in _Counter(names).items():
+                if count > 1:
+                    findings.append(
+                        f"{rel}: duplicate top-level definition of '{name}' ({count}x) — MODIFY the "
+                        "existing definition instead of adding a new one (a duplicate silently shadows "
+                        "the first and breaks its contract)."
+                    )
+        return findings
+
     def _run_developer_deterministic_checks(self) -> bool:
         developer_report = self._load_saved_agent_report("implementation", "developer") or {}
         changed_files = [
@@ -11492,6 +11521,7 @@ class WorkflowOrchestrator:
                         findings.append(f"pytest failed for selected test file: {test_file_path}")
                         findings.append(stderr or stdout or "unknown pytest failure")
 
+        findings.extend(self._duplicate_definition_findings(changed_python_files))
         findings.extend(self._missing_must_contain_findings(item, changed_files))
         findings.extend(self._validate_changed_migration_files(changed_python_files))
 

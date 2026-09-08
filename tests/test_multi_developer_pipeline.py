@@ -430,6 +430,24 @@ def test_multi_developer_no_changes_still_rejects_missing_file(tmp_path) -> None
     assert "missing" in detail
 
 
+def test_duplicate_definition_findings_flags_duplicate_defs(tmp_path) -> None:
+    # Free AST check catches "added a duplicate instead of modifying" (TASK-003 added a second
+    # analytics_assistant; prior runs duplicated analytics functions). This is the real defect —
+    # not a planner/task-designer bug.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    (tmp_path / "main.py").write_text(
+        "def analytics_assistant(request):\n    return 1\n\n"
+        "def other():\n    return 2\n\n"
+        "def analytics_assistant(question, username):\n    return 3\n",
+        encoding="utf-8",
+    )
+    findings = orchestrator._duplicate_definition_findings(["main.py"])
+    assert any("analytics_assistant" in f and "duplicate" in f.lower() for f in findings)
+
+    (tmp_path / "clean.py").write_text("def a():\n    return 1\n\ndef b():\n    return 2\n", encoding="utf-8")
+    assert orchestrator._duplicate_definition_findings(["clean.py"]) == []
+
+
 def test_test_developer_static_constraints_reject_format_sensitive_migration_assertions(tmp_path) -> None:
     test_path = tmp_path / "gateway-v4" / "tests" / "test_provider_metrics_migration.py"
     test_path.parent.mkdir(parents=True)
