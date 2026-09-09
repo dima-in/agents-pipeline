@@ -25,7 +25,7 @@ venv\Scripts\python.exe start.py --list-slices  --workspace D:\SomeProject      
 venv\Scripts\python.exe start.py --next-slice   --mode auto --workspace D:\SomeProject   # plan + implement the next slice
 ```
 
-A green implementation run costs around $0.10–0.35 (OpenRouter, mixed sonnet/gpt models).
+A green implementation run costs around $0.10–0.35: the edit agents start on a cheap model (`gpt-5.6-luna`) and only climb to `sonnet-5` / `opus-5` when the diagnostician proves the cheaper tier plateaued (see *Supervisor layer*), and mechanical breakage is caught by free deterministic checks before any paid reviewer is asked to judge semantics.
 
 ## Architecture: two roots
 
@@ -54,9 +54,10 @@ The engine never edits itself while targeting another repo; the target repo neve
 3. `implementation-planner` — backlog (skipped when the canonical backlog exists)
 4. `task-designer` — turns one backlog item into a machine-executable contract (`must_contain`, `must_import`, `must_test`, `forbidden`, ...), validated deterministically; on validation failure it regenerates with the validation feedback (2 retries)
 5. `developer` — in `multi_developer_json` mode the work is routed to `code-developer` / `infra-developer` / `test-developer` by file type; edit agents use a JSON tool protocol (`read_file(s)`, `search_text`, `list_files`, `write_file`, `apply_patch`, `tool_batch`)
-6. deterministic developer checks — `py_compile`, pytest on the contract's test file, `must_contain` symbol gate
+6. **deterministic developer checks (FREE, fail-closed)** — `py_compile`, an `import <entrypoint>` boot smoke-test (when the target is the app's own venv), pytest on the contract's test file, the `must_contain` symbol gate, and an AST duplicate-definition scan. Green here means the *paid* reviewers below are asked only to judge semantics, not to re-catch mechanical breakage.
 7. `qa` — verdict against the contract (mandatory first line `Вердикт QA: ПРИНЯТО|ОТКЛОНЕНО`)
 8. `template-validator` — structure check (explicit `Статус: PASSED|FAILED` line)
+9. **verify gate** (`workflow.verify_run`) — after tests + QA pass, actually boot the changed app in the target's own venv; a real start-up crash that green tests missed is fed back to the developer as another attempt.
 
 **Deployment readiness** (optional): production-readiness-checker, launch-strategist.
 
@@ -83,6 +84,7 @@ Slices reuse generic task ids (`TASK-001`...), so starting a new slice archives 
 ## Deterministic gates (fail-closed)
 
 - `must_contain` gate: def/class symbols matched by AST name, decorators (e.g. `@app.get("/api/...")`) by quote/whitespace-normalized substring against the FULL file — immune to truncated read excerpts. Runs both post-hoc and **within-turn** (a developer cannot finalize while required symbols are missing).
+- Free AST **duplicate-definition** gate: a second top-level `def`/`class` re-declaring a name already defined in the file is flagged — catches a developer that ADDed a new function where it should have MODIFIED the existing one, before the shadowed dead code ships.
 - Write-reserved turns: reads can spend the retrieval budget, but edit agents always keep extra turns where read requests are bounced with a force-write instruction — reads can no longer starve the write.
 - Truncated-write repair: a tool-request-looking final answer that failed to parse (e.g. a whole-file `write_file` cut by max_tokens) is never accepted; the loop demands small `apply_patch` hunks instead.
 - QA/validator verdicts are **fail-closed**: an unrecognized verdict phrasing is a rejection by default; a validator report full of `**FAILED**` sections fails even without a status line. Import placement (module-level vs function-local) is non-blocking style, not a violation.
@@ -92,7 +94,9 @@ Slices reuse generic task ids (`TASK-001`...), so starting a new slice archives 
 
 After every failed attempt, before the git rollback erases the diff:
 
-- **Diagnostician** — one cheap LLM judgement (default sonnet) of the verdict vs the ACTUAL diff + the full pytest traceback. It outputs `Диагноз: <QA прав | QA придирается | контракт некорректны> — <why>` plus one concrete recommendation, which is auto-appended to the developer's repair feedback for the next attempt. Information only — never a gate.
+- **Diagnostician** — one cheap LLM judgement (default sonnet-5) of the verdict vs the ACTUAL diff + the full pytest traceback. It only runs for *semantic* disputes (`qa_failed` / `template_validation_failed`) — a mechanical failure was already caught for free upstream. It outputs `Диагноз: <QA прав | QA придирается | контракт некорректны> — <why>`, one concrete recommendation (auto-appended to the developer's repair feedback), and an `Эскалация: ДА|НЕТ` verdict. Information only — never a gate.
+- **Analysis-gated model escalation** — the edit agents run on a cheap model first (`gpt-5.6-luna`). The *diagnosis*, not the attempt counter, decides whether to climb the ladder: only `Эскалация: ДА` (the model was handed concrete, correct feedback and still couldn't apply it — a capability ceiling, not an information gap) promotes the next attempt `luna → sonnet-5 → opus-5`. So the expensive model is paid for rarely, and only when a cheaper tier provably plateaued. The **test-developer is deliberately excluded** — escalating the test author lets a stronger model "pass" a failing test by weakening it to match wrong code; grounded tests must stay fixed, only the CODE producers climb.
+- **Surgical patch mode** (`workflow.surgical_patch_retry`) — when the diagnosis is a concrete localized fix, the next attempt is pinned to small `apply_patch` hunks against the exact target file, dodging whole-file rewrites and the "nothing to change" loop, so even the cheap first tier lands the fix.
 - **Arbiter** (`workflow.supervisor_arbiter: auto|ask`) — overrules a taste-level LLM rejection **only** when every objective signal already says done. It accepts a `qa_failed` when the deterministic gates are green and the diagnosis is "QA придирается" (style, e.g. import placement); and a `template_validation_failed` when the deterministic gates are green, QA already **passed**, and the diagnosis flags no real defect (the tertiary template reviewer is the lone objector). Deterministic gates (pytest / must_contain / scope) stay absolute — a real failure is never accepted.
 - **Escalation card** — when retries are exhausted or a hard status blocks, one actionable card ("Требуется решение") states the task, attempts, the recurring blocker, the diagnosis, and concrete decisions — instead of a silent expensive loop.
 
@@ -171,4 +175,4 @@ Each run writes JSON+Markdown per agent, a phase summary, `run_summary.json` (to
 venv\Scripts\python.exe -m pytest
 ```
 
-410+ tests; live-run regressions get a test named after the run id that exposed them.
+438 tests; live-run regressions get a test named after the run id that exposed them.
