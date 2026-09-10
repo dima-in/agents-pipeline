@@ -9993,6 +9993,21 @@ class WorkflowOrchestrator:
             self.logger.error("Task designer output is invalid", self._task_designer_rejection_reason or "unknown_error")
             self._phase_failure_status = "task_designer_invalid"
             return False
+        # Ordering, not contract quality: the contract calls a function that does not exist yet
+        # and another PENDING task promises it. Re-emitting the contract cannot fix that, so stop
+        # instead of paying the designer again, and record the edge the planner omitted.
+        out_of_order = self._detect_out_of_order_contract(contract_item)
+        if out_of_order:
+            blocking_ids = list(dict.fromkeys(task_id for task_id, _ in out_of_order))
+            self._record_inferred_task_dependency(str(contract_item.get("id") or ""), blocking_ids)
+            detail = ", ".join(f"{symbol}() → {task_id}" for task_id, symbol in out_of_order[:5])
+            self._phase_failure_status = "task_out_of_order"
+            self.logger.error(
+                "Нарушен порядок задач",
+                f"{contract_item.get('id')} вызывает {detail}, но эти задачи ещё не выполнены. "
+                "Зависимость записана в бэклог — следующий выбор возьмёт их первыми.",
+            )
+            return False
         self._selected_implementation_item = contract_item
         self._set_agent_report_extras(
             "implementation",
@@ -10265,11 +10280,36 @@ class WorkflowOrchestrator:
                 return False
         return True
 
+    @staticmethod
+    def _first_actionable_backlog_item(
+        backlog: list[dict[str, Any]], completed: set[str]
+    ) -> dict[str, Any] | None:
+        """First incomplete task whose declared dependencies are all satisfied.
+
+        Selection used to take the first incomplete task in LIST order and ignore depends_on
+        entirely, so a backlog that numbers an integration task before its parts sent the
+        developer at a task whose helpers did not exist yet (Oil: TASK-003, the
+        /api/analytics/assistant endpoint, sits before TASK-004/005 whose functions it calls).
+
+        A dependency counts as satisfied when it is completed OR absent from this backlog — an id
+        carried over from another slice must never deadlock selection. When every remaining task
+        is blocked (circular depends_on), fall back to list order instead of stalling the run.
+        """
+        incomplete = [item for item in backlog if str(item.get("id") or "").strip() not in completed]
+        if not incomplete:
+            return None
+        known_ids = {str(item.get("id") or "").strip() for item in backlog}
+        for item in incomplete:
+            dependencies = [str(dep).strip() for dep in (item.get("depends_on") or []) if str(dep).strip()]
+            if all(dep in completed or dep not in known_ids for dep in dependencies):
+                return item
+        return incomplete[0]
+
     def _resolve_selected_implementation_item(self, backlog: list[dict[str, Any]]) -> dict[str, Any] | None:
         if not backlog:
             return None
         completed = set(self._completed_implementation_task_ids())
-        first_incomplete = next((item for item in backlog if str(item.get("id")) not in completed), None)
+        first_incomplete = self._first_actionable_backlog_item(backlog, completed)
         self._skipped_completed_task_ids = [
             str(item.get("id") or "").strip()
             for item in backlog
@@ -10463,6 +10503,81 @@ class WorkflowOrchestrator:
             "do NOT add a second one."
             for name, line in sorted(existing.items(), key=lambda pair: pair[1])
         ]
+
+    def _detect_out_of_order_contract(self, item: dict[str, Any]) -> list[tuple[str, str]]:
+        """(blocking_task_id, symbol) for each symbol this contract CALLS that does not exist yet
+        and that an INCOMPLETE backlog task promises to create.
+
+        The planner can number an integration task before its parts: Oil TASK-003 (the
+        /api/analytics/assistant endpoint, whose own purpose says it "orchestrates SQL generation
+        and execution") sits before TASK-004/005 which define exactly those functions, and its
+        depends_on omits them. Regenerating the contract cannot fix an ordering mistake, so this
+        is reported as an ordering blocker instead. Deterministic — no LLM call.
+        """
+        target_file = item.get("target_file") or {}
+        rel_path = (
+            self._normalize_repo_relative_path(target_file.get("path"))
+            if isinstance(target_file, dict)
+            else ""
+        )
+        must_contain = [str(value).strip() for value in (item.get("must_contain") or []) if str(value).strip()]
+        if not rel_path or not must_contain:
+            return []
+        defined = set(self._contract_definition_names(must_contain))
+        called: list[str] = []
+        for value in must_contain:
+            for name in re.findall(r"\b([A-Za-z_]\w{3,})\s*\(", value):
+                if name not in defined and name not in called:
+                    called.append(name)
+        missing = [name for name in called if not self._existing_definition_lines(rel_path, [name])]
+        if not missing:
+            return []
+        completed = set(self._completed_implementation_task_ids())
+        own_id = str(item.get("id") or "").strip()
+        blockers: list[tuple[str, str]] = []
+        for task in self._load_canonical_implementation_backlog():
+            task_id = str(task.get("id") or "").strip()
+            if not task_id or task_id == own_id or task_id in completed:
+                continue
+            promised = " ".join(
+                [str(task.get("title") or "")]
+                + [str(value) for value in (task.get("acceptance_criteria") or [])]
+                + [str(value) for value in (task.get("must_contain") or [])]
+            )
+            for name in missing:
+                if re.search(r"\b" + re.escape(name) + r"\b", promised) and (task_id, name) not in blockers:
+                    blockers.append((task_id, name))
+        return blockers
+
+    def _record_inferred_task_dependency(self, task_id: str, dependency_ids: list[str]) -> None:
+        """Persist an inferred depends_on edge so the NEXT selection runs the producer task first
+        (see _first_actionable_backlog_item). The planner's omission is corrected once, in place."""
+        task_id = str(task_id or "").strip()
+        dependency_ids = [str(value).strip() for value in dependency_ids if str(value).strip()]
+        if not task_id or not dependency_ids or not self.canonical_backlog_path.exists():
+            return
+        try:
+            payload = json.loads(self.canonical_backlog_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        tasks = payload.get("tasks")
+        if not isinstance(tasks, list):
+            return
+        changed = False
+        for task in tasks:
+            if not isinstance(task, dict) or str(task.get("id") or "").strip() != task_id:
+                continue
+            dependencies = [str(value).strip() for value in (task.get("depends_on") or []) if str(value).strip()]
+            for dependency in dependency_ids:
+                if dependency != task_id and dependency not in dependencies:
+                    dependencies.append(dependency)
+                    changed = True
+            task["depends_on"] = dependencies
+        if not changed:
+            return
+        self.canonical_backlog_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._canonical_backlog_payload = dict(payload)
+        self._canonical_backlog_loaded = True
 
     def _build_selected_task_contract_context(self, limit: int = 4000) -> str:
         if not self._selected_implementation_item:
@@ -10821,6 +10936,11 @@ class WorkflowOrchestrator:
             ],
             "scope_violation": [
                 "Расширить allowed_paths задачи или сузить саму задачу.",
+            ],
+            "task_out_of_order": [
+                "Запустить сначала задачу, которая создаёт недостающую функцию (зависимость уже записана в бэклог).",
+                "Проверить порядок бэклога: интеграционная задача не должна стоять раньше своих частей.",
+                "Пропустить задачу.",
             ],
         }
         return options.get(status, [

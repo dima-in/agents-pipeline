@@ -1,3 +1,4 @@
+import json
 import types
 
 from workflow.multi_developer_constraints import parse_and_validate
@@ -446,6 +447,101 @@ def test_duplicate_definition_findings_flags_duplicate_defs(tmp_path) -> None:
 
     (tmp_path / "clean.py").write_text("def a():\n    return 1\n\ndef b():\n    return 2\n", encoding="utf-8")
     assert orchestrator._duplicate_definition_findings(["clean.py"]) == []
+
+
+def test_selection_skips_task_whose_dependencies_are_not_done() -> None:
+    # The exact Oil backlog that forced manual reordering: TASK-003 is the endpoint that
+    # orchestrates TASK-004/005, but it is numbered before them. With depends_on honoured,
+    # selection must not hand the developer a task whose parts do not exist yet.
+    backlog = [
+        {"id": "TASK-001", "depends_on": []},
+        {"id": "TASK-002", "depends_on": []},
+        {"id": "TASK-003", "depends_on": ["TASK-001", "TASK-002", "TASK-004", "TASK-005"]},
+        {"id": "TASK-004", "depends_on": ["TASK-001", "TASK-002"]},
+        {"id": "TASK-005", "depends_on": ["TASK-001"]},
+    ]
+
+    picked = WorkflowOrchestrator._first_actionable_backlog_item(backlog, {"TASK-001", "TASK-002"})
+
+    assert picked["id"] == "TASK-004"
+
+
+def test_selection_treats_foreign_and_circular_dependencies_as_unblocking() -> None:
+    # A depends_on id from another slice must not deadlock selection...
+    foreign = [{"id": "TASK-001", "depends_on": ["SLICE-001-TASK-009"]}]
+    assert WorkflowOrchestrator._first_actionable_backlog_item(foreign, set())["id"] == "TASK-001"
+
+    # ...and a circular backlog falls back to list order rather than stalling the run.
+    circular = [
+        {"id": "TASK-001", "depends_on": ["TASK-002"]},
+        {"id": "TASK-002", "depends_on": ["TASK-001"]},
+    ]
+    assert WorkflowOrchestrator._first_actionable_backlog_item(circular, set())["id"] == "TASK-001"
+
+    assert WorkflowOrchestrator._first_actionable_backlog_item([{"id": "TASK-001"}], {"TASK-001"}) is None
+
+
+def test_out_of_order_contract_names_the_task_that_must_run_first(tmp_path) -> None:
+    # TASK-003's contract calls generate_sql_from_question, which does not exist in main.py yet
+    # and which pending TASK-004 promises. That is an ordering fault, not a bad contract.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    (tmp_path / "main.py").write_text("def validate_sql_query(q):\n    return True\n", encoding="utf-8")
+    orchestrator._completed_implementation_task_ids = lambda: ["TASK-001", "TASK-002"]
+    orchestrator._load_canonical_implementation_backlog = lambda: [
+        {"id": "TASK-003", "title": "Add /api/analytics/assistant endpoint to main.py"},
+        {
+            "id": "TASK-004",
+            "title": "Add LLM SQL generation function to main.py",
+            "acceptance_criteria": ["generate_sql_from_question converts natural language to SQL"],
+        },
+    ]
+    contract = {
+        "id": "TASK-003",
+        "target_file": {"path": "main.py", "action": "update"},
+        "must_contain": [
+            "def analytics_assistant(question, username):",
+            "sql = generate_sql_from_question(question)",
+            "validate_sql_query(sql)",
+        ],
+    }
+
+    blockers = orchestrator._detect_out_of_order_contract(contract)
+
+    assert blockers == [("TASK-004", "generate_sql_from_question")]
+
+
+def test_out_of_order_contract_ignores_symbols_that_already_exist(tmp_path) -> None:
+    # validate_sql_query IS already in main.py, so calling it is correct wiring, not bad ordering.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    (tmp_path / "main.py").write_text("def validate_sql_query(q):\n    return True\n", encoding="utf-8")
+    orchestrator._completed_implementation_task_ids = lambda: ["TASK-001"]
+    orchestrator._load_canonical_implementation_backlog = lambda: [
+        {"id": "TASK-001", "acceptance_criteria": ["validate_sql_query blocks non-SELECT statements"]},
+    ]
+    contract = {
+        "id": "TASK-003",
+        "target_file": {"path": "main.py", "action": "update"},
+        "must_contain": ["def analytics_assistant(q):", "validate_sql_query(sql)"],
+    }
+
+    assert orchestrator._detect_out_of_order_contract(contract) == []
+
+
+def test_record_inferred_task_dependency_persists_the_missing_edge(tmp_path) -> None:
+    # The recorded edge is what lets the NEXT selection pick the producer first.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    backlog_path = tmp_path / "implementation_backlog.json"
+    backlog_path.write_text(
+        json.dumps({"tasks": [{"id": "TASK-003", "depends_on": ["TASK-001"]}, {"id": "TASK-004"}]}),
+        encoding="utf-8",
+    )
+    orchestrator.canonical_backlog_path = backlog_path
+
+    orchestrator._record_inferred_task_dependency("TASK-003", ["TASK-004", "TASK-001", "TASK-003"])
+
+    tasks = json.loads(backlog_path.read_text(encoding="utf-8"))["tasks"]
+    # TASK-004 appended, TASK-001 not duplicated, self-reference refused.
+    assert tasks[0]["depends_on"] == ["TASK-001", "TASK-004"]
 
 
 def test_contract_definition_names_extracts_only_real_definitions() -> None:
