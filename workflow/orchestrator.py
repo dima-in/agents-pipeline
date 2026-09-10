@@ -27,6 +27,7 @@ import yaml
 from tools.repo_map import compare_repo_maps, generate_repo_map, is_excluded_path, validate_agent_paths
 from workflow.logger import WorkflowLogger
 from workflow.multi_developer_dispatcher import filter_paths_for_agent, route_paths
+from workflow.operator_reporter import OperatorReporter
 from workflow.run_explainer import find_latest_implementation_run, generate_human_report
 from workflow.runtime import has_provider_credentials, load_runtime_config, required_key_env, resolve_runner_path
 
@@ -11114,8 +11115,32 @@ class WorkflowOrchestrator:
                 lines.append("Скажи номер или своё решение — доведу.")
             title = "Итог супервайзера (авто): задача остановлена" if auto_mode else "Требуется решение (супервайзер)"
             self.logger.operator_box(title, lines, color="red")
+            # The card IS the blocker event: same task, same text, same decisions. Reported
+            # outbound so the operator chat can reach the owner wherever he is.
+            self.operator_reporter.send(
+                "blocker",
+                " / ".join(lines[:4]),
+                task=task_ref,
+                needs_human=True,
+                options=self._supervisor_decision_options(status),
+            )
         except Exception:
             self.logger.info(f"Требуется решение: {status}")
+
+    @property
+    def operator_reporter(self) -> OperatorReporter:
+        """Outbound bridge to the operator chat. Built once per run, inert unless configured."""
+        reporter = getattr(self, "_operator_reporter", None)
+        if reporter is None:
+            try:
+                run_id = self.logger.run_dir.name
+            except Exception:
+                run_id = ""
+            reporter = OperatorReporter.from_config(
+                getattr(self, "config", None), project=str(getattr(self, "project_id", "")), run_id=run_id
+            )
+            self._operator_reporter = reporter
+        return reporter
 
     def _detect_app_entrypoint(self) -> str:
         """Best-effort ASGI/WSGI app entrypoint module of the target (e.g. 'main' for a top-level
