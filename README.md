@@ -85,6 +85,8 @@ Slices reuse generic task ids (`TASK-001`...), so starting a new slice archives 
 
 - `must_contain` gate: def/class symbols matched by AST name, decorators (e.g. `@app.get("/api/...")`) by quote/whitespace-normalized substring against the FULL file — immune to truncated read excerpts. Runs both post-hoc and **within-turn** (a developer cannot finalize while required symbols are missing).
 - Free AST **duplicate-definition** gate: a second top-level `def`/`class` re-declaring a name already defined in the file is flagged — catches a developer that ADDed a new function where it should have MODIFIED the existing one, before the shadowed dead code ships.
+- **MODIFY-not-ADD grounding** (upstream of that gate): the target file is grepped for free while the contract is rendered, and every `must_contain` symbol that already exists is named to the developer as `existing_symbols_modify_not_add` with its line — so the duplicate is never written in the first place.
+- **Ordering gates.** Task selection picks the first incomplete task whose `depends_on` are satisfied (a dependency absent from the backlog counts as satisfied; a circular backlog falls back to list order — neither can deadlock a run). And when a contract calls a symbol that is missing from the target file while a PENDING task promises it, that is an ordering fault, not a bad contract: the run stops with `task_out_of_order` instead of re-paying the designer, and the `depends_on` edge the planner omitted is recorded so the next selection runs the producer first.
 - Write-reserved turns: reads can spend the retrieval budget, but edit agents always keep extra turns where read requests are bounced with a force-write instruction — reads can no longer starve the write.
 - Truncated-write repair: a tool-request-looking final answer that failed to parse (e.g. a whole-file `write_file` cut by max_tokens) is never accepted; the loop demands small `apply_patch` hunks instead.
 - QA/validator verdicts are **fail-closed**: an unrecognized verdict phrasing is a rejection by default; a validator report full of `**FAILED**` sections fails even without a status line. Import placement (module-level vs function-local) is non-blocking style, not a violation.
@@ -175,4 +177,4 @@ Each run writes JSON+Markdown per agent, a phase summary, `run_summary.json` (to
 venv\Scripts\python.exe -m pytest
 ```
 
-438 tests; live-run regressions get a test named after the run id that exposed them.
+447 tests; live-run regressions get a test named after the run id that exposed them.
