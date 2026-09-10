@@ -449,6 +449,87 @@ def test_duplicate_definition_findings_flags_duplicate_defs(tmp_path) -> None:
     assert orchestrator._duplicate_definition_findings(["clean.py"]) == []
 
 
+class _FakeReporter:
+    """Stands in for the outbound bridge: scripted polls, recorded sends."""
+
+    def __init__(self, polls):
+        self.enabled = True
+        self.polls = list(polls)
+        self.sent = []
+
+    def poll_commands(self, wait=25):
+        return self.polls.pop(0) if self.polls else []
+
+    def send(self, kind, text, *, task="", needs_human=False, options=None, reply_to=""):
+        self.sent.append({"kind": kind, "text": text, "task": task, "reply_to": reply_to})
+        return True
+
+
+def test_operator_command_answer_renders_backlog_state(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator._completed_implementation_task_ids = lambda: ["TASK-001"]
+    orchestrator._selected_implementation_item = {"id": "TASK-003"}
+    orchestrator._load_canonical_implementation_backlog = lambda: [
+        {"id": "TASK-001", "title": "SQL validator"},
+        {"id": "TASK-003", "title": "Assistant endpoint"},
+        {"id": "TASK-004", "title": "LLM SQL generation"},
+    ]
+
+    answer = orchestrator._operator_command_answer("tasks")
+
+    assert "TASK-001 [готово]" in answer
+    assert "TASK-003 [сейчас]" in answer
+    assert "TASK-004 [ждёт]" in answer
+
+
+def test_operator_command_answer_never_raises(tmp_path) -> None:
+    # An introspection answer is a side channel: a broken data source must degrade to text,
+    # never propagate into the run.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+
+    def boom():
+        raise RuntimeError("git is unavailable")
+
+    orchestrator._build_target_git_diff_excerpt = lambda limit=0: boom()
+
+    assert "Не смог собрать ответ" in orchestrator._operator_command_answer("diff")
+    assert "Неизвестная команда" in orchestrator._operator_command_answer("rm -rf")
+
+
+def test_serve_operator_commands_answers_reads_then_returns_the_choice(tmp_path) -> None:
+    # The owner asks a question from his phone, gets the answer threaded back by reply_to, then
+    # picks one of the offered options — the loop ends on his choice.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator._selected_implementation_item = {"id": "TASK-003"}
+    orchestrator._last_supervisor_diagnosis = "Диагноз: контракт некорректен"
+    reporter = _FakeReporter(
+        [
+            [{"id": "c1", "cmd": "diagnosis", "args": {}}],
+            [{"id": "c2", "cmd": "answer", "args": {"choice": "Пропустить задачу."}}],
+        ]
+    )
+    orchestrator._operator_reporter = reporter
+
+    choice = orchestrator._serve_operator_commands(60)
+
+    assert choice == "Пропустить задачу."
+    assert len(reporter.sent) == 1
+    assert reporter.sent[0]["reply_to"] == "c1"
+    assert reporter.sent[0]["task"] == "TASK-003"
+    assert "контракт некорректен" in reporter.sent[0]["text"]
+
+
+def test_serve_operator_commands_is_skipped_when_the_bridge_is_off(tmp_path) -> None:
+    # A green run must never sit in this loop.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    reporter = _FakeReporter([])
+    reporter.enabled = False
+    orchestrator._operator_reporter = reporter
+
+    assert orchestrator._serve_operator_commands(60) == ""
+    assert orchestrator._serve_operator_commands(0) == ""
+
+
 def test_selection_skips_task_whose_dependencies_are_not_done() -> None:
     # The exact Oil backlog that forced manual reordering: TASK-003 is the endpoint that
     # orchestrates TASK-004/005, but it is numbered before them. With depends_on honoured,

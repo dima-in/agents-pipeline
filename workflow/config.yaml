@@ -45,11 +45,17 @@ workflow:
   # surface (the pipeline sits behind NAT, so nothing can reach IN). Fire-and-forget — a dead or
   # unconfigured bridge NEVER fails a run. Disabled until a url is set; while disabled the events
   # are still recorded on the reporter, so the contract can be inspected without a server.
+  # commands_url defaults to the events url's sibling (.../operator/commands). The workstation
+  # cannot be reached from outside, so it ASKS: one outbound long-poll the chat holds open, which
+  # needs no new port and no Redis exposed to the internet. command_window_seconds > 0 makes the
+  # engine answer read-only questions (diff/diagnosis/cost/tasks) while a blocked run waits on a
+  # human — a green run never waits.
   operator_bridge:
-    enabled: false
-    url: ""
+    enabled: true
+    url: https://novpnai.ru/v1/operator/events
     token_env: OPERATOR_BRIDGE_TOKEN
     timeout_seconds: 3
+    command_window_seconds: 120
   max_phase_cost_usd:
   default_implementation_scope: "Implement one small, safe, backend-first improvement that fits the target repository's existing architecture and conventions."
   # Scope policy is project-agnostic by default (see _default_implementation_scope_policy):

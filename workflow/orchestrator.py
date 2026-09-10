@@ -11124,8 +11124,68 @@ class WorkflowOrchestrator:
                 needs_human=True,
                 options=self._supervisor_decision_options(status),
             )
+            # The run is stopped here anyway, so this is the one moment where waiting is free:
+            # serve the owner's read-only questions from his phone and capture his choice.
+            bridge = (self.config.get("workflow") or {}).get("operator_bridge") or {}
+            choice = self._serve_operator_commands(int(bridge.get("command_window_seconds") or 0))
+            if choice:
+                self._operator_answer = choice
+                self.logger.info(f"Оператор выбрал: {choice}")
         except Exception:
             self.logger.info(f"Требуется решение: {status}")
+
+    def _operator_command_answer(self, cmd: str, args: dict[str, Any] | None = None) -> str:
+        """Text answer to one READ-ONLY operator command. Never raises, never changes run state."""
+        command = str(cmd or "").strip().lower()
+        try:
+            if command == "diff":
+                return self._build_target_git_diff_excerpt(limit=1800) or "Изменений в рабочем дереве нет."
+            if command == "diagnosis":
+                return str(getattr(self, "_last_supervisor_diagnosis", "") or "").strip() or "Диагноза пока нет."
+            if command == "cost":
+                totals = self.logger.get_run_totals()
+                return f"Стоимость прогона: {self._format_cost(totals.get('estimated_cost_usd'))}"
+            if command == "tasks":
+                completed = set(self._completed_implementation_task_ids())
+                selected = str((self._selected_implementation_item or {}).get("id") or "")
+                lines = []
+                for task in self._load_canonical_implementation_backlog():
+                    task_id = str(task.get("id") or "")
+                    state = "готово" if task_id in completed else ("сейчас" if task_id == selected else "ждёт")
+                    lines.append(f"{task_id} [{state}] {str(task.get('title') or '')[:60]}")
+                return "\n".join(lines) or "Бэклог пуст."
+        except Exception as exc:  # an introspection answer must never break the run
+            return f"Не смог собрать ответ: {exc}"
+        return f"Неизвестная команда: {command}"
+
+    def _serve_operator_commands(self, seconds: int) -> str:
+        """Answer read-only operator commands for up to `seconds`; return the owner's choice when
+        an `answer` command arrives (empty string otherwise).
+
+        Only called where the run has ALREADY stopped and is waiting on a human, so the wait costs
+        a normal run nothing — a green run never enters this loop.
+        """
+        reporter = self.operator_reporter
+        if not reporter.enabled or seconds <= 0:
+            return ""
+        deadline = time.monotonic() + seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return ""
+            for command in reporter.poll_commands(wait=int(min(25, max(1, remaining)))):
+                name = str(command.get("cmd") or "").strip().lower()
+                if name == "answer":
+                    choice = str((command.get("args") or {}).get("choice") or "").strip()
+                    if choice:
+                        return choice
+                    continue
+                reporter.send(
+                    "status",
+                    self._operator_command_answer(name, command.get("args") or {}),
+                    task=str((self._selected_implementation_item or {}).get("id") or ""),
+                    reply_to=str(command.get("id") or ""),
+                )
 
     @property
     def operator_reporter(self) -> OperatorReporter:
