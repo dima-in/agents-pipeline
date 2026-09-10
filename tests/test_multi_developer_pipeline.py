@@ -448,6 +448,95 @@ def test_duplicate_definition_findings_flags_duplicate_defs(tmp_path) -> None:
     assert orchestrator._duplicate_definition_findings(["clean.py"]) == []
 
 
+def test_contract_definition_names_extracts_only_real_definitions() -> None:
+    # Decorators and bare call tokens are NOT definitions — flagging them would produce
+    # false "already exists" directives on every route contract.
+    names = WorkflowOrchestrator._contract_definition_names(
+        [
+            "def get_customer_analytics(start_date=None):",
+            "async def fetch_all(session):",
+            "class PerformanceMonitor:",
+            "export function fetchCustomerAnalytics(params) {",
+            "const API_BASE_URL =",
+            '@app.get("/api/analytics/customers")',
+            "cursor.execute(",
+        ]
+    )
+    assert names == [
+        "get_customer_analytics",
+        "fetch_all",
+        "PerformanceMonitor",
+        "fetchCustomerAnalytics",
+        "API_BASE_URL",
+    ]
+
+
+def test_existing_symbol_directives_demand_modify_not_add(tmp_path) -> None:
+    # Root cause of the duplicate-definition defect: the contract says "the file must contain X"
+    # while X is ALREADY defined, so the developer satisfies it by adding a second definition.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    (tmp_path / "main.py").write_text(
+        "def other():\n    return 1\n\n\ndef analytics_assistant(request):\n    return 2\n",
+        encoding="utf-8",
+    )
+    item = {
+        "target_file": {"path": "main.py", "action": "update"},
+        "must_contain": [
+            "def analytics_assistant(question, username):",
+            "def brand_new_helper(value):",
+        ],
+    }
+
+    directives = orchestrator._existing_symbol_directives(item)
+
+    assert len(directives) == 1
+    assert "analytics_assistant" in directives[0]
+    assert "ALREADY EXISTS in main.py:5" in directives[0]
+    assert "MODIFY" in directives[0]
+    # A symbol that does not exist yet must NOT be flagged — that one really is an addition.
+    assert "brand_new_helper" not in " ".join(directives)
+
+
+def test_existing_symbol_directives_cover_non_python_targets(tmp_path) -> None:
+    # The same defect in a JS client (api.js already exports the function the contract demands).
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    api_path = tmp_path / "frontend" / "src" / "lib"
+    api_path.mkdir(parents=True)
+    (api_path / "api.js").write_text(
+        "const request = (p) => fetch(p)\n\nexport function fetchCustomerAnalytics(params) {\n  return request('/x')\n}\n",
+        encoding="utf-8",
+    )
+    item = {
+        "target_file": {"path": "frontend/src/lib/api.js", "action": "update"},
+        "must_contain": ["export function fetchCustomerAnalytics(params) {"],
+    }
+
+    directives = orchestrator._existing_symbol_directives(item)
+
+    assert len(directives) == 1
+    assert "fetchCustomerAnalytics" in directives[0]
+    assert "MODIFY" in directives[0]
+
+
+def test_selected_task_contract_context_surfaces_existing_symbol_directive(tmp_path) -> None:
+    # The directive is worthless unless the DEVELOPER sees it: it must render inside the
+    # contract block, right after must_contain so the length cap never truncates it away.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    (tmp_path / "main.py").write_text("def analytics_assistant(request):\n    return 1\n", encoding="utf-8")
+    orchestrator._selected_implementation_item = {
+        "id": "TASK-003",
+        "title": "Text-to-SQL assistant",
+        "target_file": {"path": "main.py", "action": "update"},
+        "must_contain": ["def analytics_assistant(question, username):"],
+    }
+
+    context = orchestrator._build_selected_task_contract_context()
+
+    assert "existing_symbols_modify_not_add:" in context
+    assert "ALREADY EXISTS in main.py:1" in context
+    assert context.index("existing_symbols_modify_not_add:") > context.index("must_contain:")
+
+
 def test_test_developer_static_constraints_reject_format_sensitive_migration_assertions(tmp_path) -> None:
     test_path = tmp_path / "gateway-v4" / "tests" / "test_provider_metrics_migration.py"
     test_path.parent.mkdir(parents=True)

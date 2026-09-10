@@ -10378,6 +10378,92 @@ class WorkflowOrchestrator:
             )
         return "\n".join(lines)
 
+    @staticmethod
+    def _contract_definition_names(must_contain: list[str]) -> list[str]:
+        """Definition names declared by must_contain items (def/class/function/const).
+
+        Decorators (`@app.get("/api/...")`), bare call tokens (`cursor.execute(`) and prose
+        yield nothing — only an item that DEFINES a named symbol counts.
+        """
+        patterns = (
+            r"^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(",
+            r"^\s*class\s+([A-Za-z_]\w*)\s*[\(:]",
+            r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(",
+            r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=",
+        )
+        names: list[str] = []
+        for value in must_contain:
+            for pattern in patterns:
+                match = re.search(pattern, str(value))
+                if match:
+                    name = match.group(1)
+                    if name not in names:
+                        names.append(name)
+                    break
+        return names
+
+    def _existing_definition_lines(self, rel_path: str, names: list[str]) -> dict[str, int]:
+        """{name: 1-based line} for names already defined at top level in rel_path."""
+        if not names:
+            return {}
+        candidate = self.target_workspace / rel_path
+        if not self._safe_is_file(candidate):
+            return {}
+        try:
+            text = candidate.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return {}
+        wanted = set(names)
+        found: dict[str, int] = {}
+        if rel_path.endswith(".py"):
+            import ast as _ast
+
+            try:
+                tree = _ast.parse(text)
+            except SyntaxError:
+                tree = None
+            if tree is not None:
+                for node in tree.body:
+                    if (
+                        isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef))
+                        and node.name in wanted
+                    ):
+                        found.setdefault(node.name, node.lineno)
+                return found
+        # Non-Python (or unparseable Python): scan declaration lines textually.
+        for index, line in enumerate(text.splitlines(), start=1):
+            for name in wanted - set(found):
+                if re.search(
+                    r"(?:^|\W)(?:async\s+)?(?:def|class|function)\s+" + re.escape(name) + r"\b"
+                    r"|(?:^|\W)(?:const|let|var)\s+" + re.escape(name) + r"\s*=",
+                    line,
+                ):
+                    found[name] = index
+        return found
+
+    def _existing_symbol_directives(self, item: dict[str, Any]) -> list[str]:
+        """MODIFY-not-ADD directives for contract symbols that ALREADY exist in the target file.
+
+        A contract states "this file must contain X". When X is already defined, a developer
+        reading only that line satisfies it by ADDING a second definition, which silently shadows
+        the first (Oil TASK-003 grew a second `analytics_assistant` this way). The post-hoc
+        duplicate gate catches that only AFTER the paid write; naming it in the contract prevents
+        the write. Deterministic — no LLM call.
+        """
+        target_file = item.get("target_file") or {}
+        if not isinstance(target_file, dict):
+            return []
+        rel_path = self._normalize_repo_relative_path(target_file.get("path"))
+        if not rel_path:
+            return []
+        must_contain = [str(value).strip() for value in (item.get("must_contain") or []) if str(value).strip()]
+        existing = self._existing_definition_lines(rel_path, self._contract_definition_names(must_contain))
+        return [
+            f"'{name}' ALREADY EXISTS in {rel_path}:{line} — MODIFY that definition in place; "
+            "do NOT add a second one."
+            for name, line in sorted(existing.items(), key=lambda pair: pair[1])
+        ]
+
     def _build_selected_task_contract_context(self, limit: int = 4000) -> str:
         if not self._selected_implementation_item:
             return ""
@@ -10421,6 +10507,10 @@ class WorkflowOrchestrator:
         lines.append(f"  target_file.purpose: {target_file.get('purpose', '')}")
         lines.append("  must_contain:")
         lines.extend(f"  - {value}" for value in (item.get("must_contain") or []))
+        existing_symbols = self._existing_symbol_directives(item)
+        if existing_symbols:
+            lines.append("  existing_symbols_modify_not_add:")
+            lines.extend(f"  - {value}" for value in existing_symbols)
         lines.append("  must_import:")
         lines.extend(f"  - {value}" for value in (item.get("must_import") or []))
         lines.append("  integration:")
