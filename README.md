@@ -102,6 +102,25 @@ After every failed attempt, before the git rollback erases the diff:
 - **Arbiter** (`workflow.supervisor_arbiter: auto|ask`) — overrules a taste-level LLM rejection **only** when every objective signal already says done. It accepts a `qa_failed` when the deterministic gates are green and the diagnosis is "QA придирается" (style, e.g. import placement); and a `template_validation_failed` when the deterministic gates are green, QA already **passed**, and the diagnosis flags no real defect (the tertiary template reviewer is the lone objector). Deterministic gates (pytest / must_contain / scope) stay absolute — a real failure is never accepted.
 - **Escalation card** — when retries are exhausted or a hard status blocks, one actionable card ("Требуется решение") states the task, attempts, the recurring blocker, the diagnosis, and concrete decisions — instead of a silent expensive loop.
 
+## Operator bridge (the run talks to a chat)
+
+A run can report into an operator chat (novpnai: one «Оператор: <project>» chat per project) and take the owner's answers from his phone. The workstation sits behind NAT, so the bridge is **outbound-only**, and it is **fire-and-forget**: a dead, slow or misconfigured bridge never fails a run.
+
+- **Events out** — `POST <url>` with `Authorization: Bearer <$token_env>` and `{run_id, project, task, kind: status|blocker|done, text, needs_human, options}`. The escalation card *is* the `blocker` event: `needs_human: true` plus the supervisor's decision options as buttons. Every run ends with exactly **one** `done` — a one-line summary (tasks completed / with errors, duration, cost) or, for a blocked run, the escalation's own `done` when its answer window closes — so the chat's "waiting for an answer" mark is always released, even on Ctrl+C.
+- **Commands in** — the engine *asks* instead of listening: a long-poll `GET <…/commands>?project=&wait=`, opened only while a blocked run waits (`command_window_seconds`), so a green run never waits. Read-only `diff | diagnosis | cost | tasks` are answered as a `status` event carrying `reply_to: <command id>`. `answer` (the owner's choice, as the option's text) is accepted only for the current `run_id` — commands queue while nobody polls, and an answer to an older run's blocker must not be applied to a new one. The choice is recorded; executing it is not automated yet.
+- Disabled until a url is set; while disabled, events are still recorded on the reporter, so the contract can be inspected without a server.
+
+```yaml
+workflow:
+  operator_bridge:
+    enabled: true
+    url: https://novpnai.ru/v1/operator/events   # commands_url defaults to the …/commands sibling
+    token_env: OPERATOR_BRIDGE_TOKEN
+    command_window_seconds: 120
+```
+
+A malformed `.env` line (e.g. a value pasted without its `KEY=`) is reported on start by file and line number — never by content, since such a line is usually the secret itself — and a `.env` saved with a BOM no longer hides its first key.
+
 ## Behavioral tests for the target
 
 For application/API code the test-developer writes **real behavioral tests**: it adds the repo root to `sys.path`, imports the app, drives it with FastAPI `TestClient`, and asserts actual HTTP status codes and JSON — mocking only the external boundaries (`mock.patch("main.requests.post")`, `mock.patch("main.UseDatabase")`). Migration files stay on the static-AST path (parse, never execute). These tests run in the **target's own virtualenv**: `resolve_python_executable` prefers `target_workspace/.venv` (which has the app's dependencies) over the engine venv, so `import main` and the app's stack resolve. For the mocks to bind, the code-developer imports external boundaries at module level (so `main.<name>` exists).
@@ -177,4 +196,4 @@ Each run writes JSON+Markdown per agent, a phase summary, `run_summary.json` (to
 venv\Scripts\python.exe -m pytest
 ```
 
-447 tests; live-run regressions get a test named after the run id that exposed them.
+478 tests; live-run regressions get a test named after the run id that exposed them.
