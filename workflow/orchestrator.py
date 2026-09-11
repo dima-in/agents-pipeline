@@ -348,7 +348,17 @@ class WorkflowOrchestrator:
 
     def run_phase(self, phase_key: str) -> bool:
         if phase_key == "implementation":
-            return self._run_implementation_phase()
+            # One summary `done` per run, whichever of the phase's many exits it takes — and even
+            # when it crashes. The phase re-enters itself for corrective retries, so the start time
+            # and the one-done guard live HERE, outside the recursion, not in its reset block.
+            self._operator_done_sent = False
+            self._run_started_monotonic = time.monotonic()
+            ok = False
+            try:
+                ok = self._run_implementation_phase()
+                return ok
+            finally:
+                self._send_run_summary_done(ok)
         return self._run_standard_phase(phase_key)
 
     def _run_standard_phase(self, phase_key: str) -> bool:
@@ -11141,11 +11151,73 @@ class WorkflowOrchestrator:
                     else "Окно ответа закрыто без выбора; прогон остановлен.",
                     task=task_ref,
                 )
+                self._operator_done_sent = True
             if choice:
                 self._operator_answer = choice
                 self.logger.info(f"Оператор выбрал: {choice}")
         except Exception:
             self.logger.info(f"Требуется решение: {status}")
+
+    @staticmethod
+    def _format_run_duration(seconds: float) -> str:
+        seconds = max(0, int(round(seconds)))
+        minutes, secs = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours} ч {minutes} мин"
+        if minutes:
+            return f"{minutes} мин {secs} с"
+        return f"{secs} с"
+
+    def _send_run_summary_done(self, ok: bool) -> None:
+        """One-line `done` summary at the end of an implementation run, green or red.
+
+        Opening the operator chat in the morning should show that the run finished and how,
+        instead of leaving the owner to guess from silence whether it ran at all. needs_human stays
+        False and no options are attached, so the chat renders a plain line and never pushes to the
+        phone. Skipped when the escalation already closed the run with its own done — one done per
+        run. Never raises: a summary must not turn a finished run into a crash.
+        """
+        try:
+            if getattr(self, "_operator_done_sent", False):
+                return
+            reporter = self.operator_reporter
+            item = getattr(self, "_selected_implementation_item", None) or {}
+            task_ref = str(item.get("id") or "").strip()
+            # A green task can chain into the next one in the same run ("next" re-enters the phase),
+            # so count what THIS run completed from the registry, which stamps every task with its run.
+            done_ids: list[str] = []
+            if reporter.run_id:
+                try:
+                    done_ids = [
+                        str(record.get("task_id") or "").strip()
+                        for record in self._load_completed_implementation_task_records()
+                        if str(record.get("run_id") or "").strip() == reporter.run_id
+                        and str(record.get("task_id") or "").strip()
+                    ]
+                except Exception:
+                    done_ids = []
+            if ok:
+                detail = ", ".join(done_ids) or task_ref or "задача"
+                outcome = f"задач готово {len(done_ids)}, с ошибками 0 — {detail}"
+            else:
+                status = str(getattr(self, "_phase_failure_status", "") or "").strip()
+                status_ru = self.logger._translate_status(status) if status else "ошибка"
+                failed = f"{task_ref or 'задача не выбрана'}: {status_ru}"
+                detail = f"{', '.join(done_ids)}; {failed}" if done_ids else failed
+                outcome = f"задач готово {len(done_ids)}, с ошибками 1 — {detail}"
+            parts = [f"Прогон завершён: {outcome}"]
+            started = getattr(self, "_run_started_monotonic", None)
+            if started is not None:
+                parts.append(self._format_run_duration(time.monotonic() - started))
+            try:
+                parts.append(self._format_cost(self.logger.get_run_totals().get("estimated_cost_usd")))
+            except Exception:
+                pass  # cost is a nice-to-have in the summary line, not a reason to drop it
+            self.operator_reporter.send("done", " · ".join(parts), task=task_ref)
+            self._operator_done_sent = True
+        except Exception:
+            pass
 
     def _operator_command_answer(self, cmd: str, args: dict[str, Any] | None = None) -> str:
         """Text answer to one READ-ONLY operator command. Never raises, never changes run state."""

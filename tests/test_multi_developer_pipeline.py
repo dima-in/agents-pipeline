@@ -611,6 +611,117 @@ def test_escalation_sends_done_even_when_the_wait_is_interrupted(tmp_path) -> No
     assert [event["kind"] for event in reporter.sent] == ["blocker", "done"]
 
 
+def test_run_summary_done_is_a_plain_line_for_a_green_run(tmp_path) -> None:
+    # A green run used to end in silence; the owner should find "прогон завершён" in the chat.
+    # No needs_human and no options, so the chat shows a line and never pushes to the phone.
+    import time
+
+    from workflow.operator_reporter import OperatorReporter
+
+    reporter = OperatorReporter(url="", project="github.com-dima-in-oil", run_id="run_now")
+    orchestrator = _escalation_ready_orchestrator(tmp_path, reporter)
+    orchestrator.logger.get_run_totals = lambda: {"estimated_cost_usd": 0.18}
+    orchestrator._selected_implementation_item = {"id": "TASK-004"}
+    orchestrator._run_started_monotonic = time.monotonic() - 192
+    # The registry stamps each completed task with its run; an older run's task must not count.
+    orchestrator._load_completed_implementation_task_records = lambda: [
+        {"task_id": "TASK-001", "run_id": "run_old"},
+        {"task_id": "TASK-004", "run_id": "run_now"},
+    ]
+
+    orchestrator._send_run_summary_done(True)
+
+    (done,) = reporter.sent
+    assert done["kind"] == "done"
+    assert done["needs_human"] is False and done["options"] == []
+    assert done["run_id"] == "run_now" and done["task"] == "TASK-004"
+    assert "задач готово 1, с ошибками 0 — TASK-004" in done["text"]
+    assert "TASK-001" not in done["text"]
+    assert "3 мин 12 с" in done["text"]
+    assert WorkflowOrchestrator._format_cost(0.18) in done["text"]
+
+
+def test_run_summary_done_counts_every_task_a_chained_run_completed(tmp_path) -> None:
+    # After a green task the phase can chain into the next one in the same run, so the summary
+    # must count what the whole run completed, not just the last selected task.
+    from workflow.operator_reporter import OperatorReporter
+
+    reporter = OperatorReporter(url="", project="p", run_id="run_now")
+    orchestrator = _escalation_ready_orchestrator(tmp_path, reporter)
+    orchestrator.logger.get_run_totals = lambda: {"estimated_cost_usd": 0.3}
+    orchestrator._selected_implementation_item = {"id": "TASK-006"}
+    orchestrator._phase_failure_status = "qa_failed"
+    orchestrator._load_completed_implementation_task_records = lambda: [
+        {"task_id": "TASK-004", "run_id": "run_now"},
+        {"task_id": "TASK-005", "run_id": "run_now"},
+    ]
+
+    orchestrator._send_run_summary_done(False)
+
+    (done,) = reporter.sent
+    assert "задач готово 2, с ошибками 1 — TASK-004, TASK-005; TASK-006: qa_failed" in done["text"]
+
+
+def test_run_summary_done_names_the_failure_for_a_red_run(tmp_path) -> None:
+    from workflow.operator_reporter import OperatorReporter
+
+    reporter = OperatorReporter(url="", project="p", run_id="run_now")
+    orchestrator = _escalation_ready_orchestrator(tmp_path, reporter)
+    orchestrator.logger.get_run_totals = lambda: {"estimated_cost_usd": 0.05}
+    orchestrator._selected_implementation_item = {"id": "TASK-003"}
+    orchestrator._phase_failure_status = "task_out_of_order"
+    orchestrator._load_completed_implementation_task_records = lambda: []
+
+    orchestrator._send_run_summary_done(False)
+
+    (done,) = reporter.sent
+    # The logger stub translates statuses as identity, so the raw status shows through.
+    assert "задач готово 0, с ошибками 1 — TASK-003: task_out_of_order" in done["text"]
+    assert done["needs_human"] is False
+
+
+def test_run_summary_done_is_skipped_when_the_escalation_already_closed_the_run(tmp_path) -> None:
+    # The escalation sends its own done when the answer window closes; a second one would put
+    # two "finished" lines in the chat for a single run.
+    from workflow.operator_reporter import OperatorReporter
+
+    reporter = OperatorReporter(url="", project="p", run_id="run_now")
+    orchestrator = _escalation_ready_orchestrator(tmp_path, reporter)
+    orchestrator.logger.get_run_totals = lambda: {"estimated_cost_usd": 0.0}
+
+    orchestrator._emit_supervisor_escalation("TASK-003", "qa_failed", 3, 3)
+    orchestrator._send_run_summary_done(False)
+
+    assert [event["kind"] for event in reporter.sent] == ["blocker", "done"]
+
+
+def test_implementation_phase_ends_with_exactly_one_summary_done(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    summaries = []
+    orchestrator._run_implementation_phase = lambda: True
+    orchestrator._send_run_summary_done = lambda ok: summaries.append(ok)
+
+    assert orchestrator.run_phase("implementation") is True
+    assert summaries == [True]
+
+
+def test_implementation_phase_summary_is_sent_even_when_the_phase_crashes(tmp_path) -> None:
+    import pytest
+
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    summaries = []
+
+    def crash():
+        raise RuntimeError("boom")
+
+    orchestrator._run_implementation_phase = crash
+    orchestrator._send_run_summary_done = lambda ok: summaries.append(ok)
+
+    with pytest.raises(RuntimeError):
+        orchestrator.run_phase("implementation")
+    assert summaries == [False]
+
+
 def test_selection_skips_task_whose_dependencies_are_not_done() -> None:
     # The exact Oil backlog that forced manual reordering: TASK-003 is the endpoint that
     # orchestrates TASK-004/005, but it is numbered before them. With depends_on honoured,
