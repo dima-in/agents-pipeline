@@ -164,9 +164,14 @@ def main(argv: list[str] | None = None) -> int:
     launch_cwd = Path(os.environ.get("AGENTS_PIPELINE_LAUNCH_CWD") or os.getcwd()).resolve()
     # Optional .env support: fill missing env vars (e.g. OPENROUTER_API_KEY) from a .env file
     # next to start.py or in the launch directory. Real environment variables always win.
-    loaded_env = load_env_files([engine_root, launch_cwd])
+    env_problems: list[str] = []
+    loaded_env = load_env_files([engine_root, launch_cwd], problems=env_problems)
     if loaded_env:
         print(f"Loaded environment from: {', '.join(loaded_env)}")
+    # A malformed line (e.g. a value pasted without its KEY=) used to be dropped silently, so the
+    # key just looked "not found". Name the line, never its content — it may well be the secret.
+    for problem in env_problems:
+        print(f"Предупреждение .env: {problem}", file=sys.stderr)
     config_path = Path(args.config)
     if not config_path.is_absolute():
         config_path = engine_root / config_path

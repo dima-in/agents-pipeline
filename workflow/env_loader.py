@@ -1,23 +1,44 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
+_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
-def _parse_env_text(text: str) -> dict[str, str]:
-    """Parse simple KEY=VALUE lines (optionally `export KEY=VALUE`), ignoring blanks/comments."""
+
+def _parse_env_text(text: str, problems: list[str] | None = None) -> dict[str, str]:
+    """Parse simple KEY=VALUE lines (optionally `export KEY=VALUE`), ignoring blanks/comments.
+
+    A line that cannot be a KEY=VALUE pair is skipped and — when `problems` is given — reported
+    by LINE NUMBER ONLY. Its content is never echoed: a line without `=` is exactly what a secret
+    pasted without its key name looks like (a bare token), so printing it would leak the value.
+    That is how the operator-bridge token was pasted, and silently skipping it made the key just
+    look "not found".
+    """
+    if text.startswith("﻿"):
+        # A BOM (Notepad's "UTF-8 with BOM") would otherwise glue itself onto the first key and
+        # hide it: OPENROUTER_API_KEY would become "﻿OPENROUTER_API_KEY".
+        text = text[1:]
     values: dict[str, str] = {}
-    for raw_line in text.splitlines():
+    for number, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
         if line.startswith("export "):
             line = line[len("export "):].lstrip()
         if "=" not in line:
+            if problems is not None:
+                problems.append(f"строка {number}: нет «=» — пропущена (ожидается КЛЮЧ=значение)")
             continue
         key, _, value = line.partition("=")
         key = key.strip()
-        if not key:
+        if not _KEY_RE.fullmatch(key):
+            # An empty or non-identifier name is a paste mistake (a value typed before "=", a stray
+            # quote from a keyboard layout). Loading it would put a possibly secret-bearing NAME
+            # into os.environ, where names are far more visible than values.
+            if problems is not None:
+                problems.append(f"строка {number}: имя ключа не похоже на имя переменной — пропущена")
             continue
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
@@ -26,12 +47,15 @@ def _parse_env_text(text: str) -> dict[str, str]:
     return values
 
 
-def load_env_files(directories, *, filename: str = ".env") -> list[str]:
+def load_env_files(
+    directories, *, filename: str = ".env", problems: list[str] | None = None
+) -> list[str]:
     """Load `<dir>/.env` files into os.environ WITHOUT overriding existing variables.
 
     Real environment variables always win — a `.env` only fills what is missing — so a key
     exported on the server/CI is never shadowed by a stale file. No third-party dependency.
-    Returns the list of files actually applied (for logging).
+    Returns the list of files actually applied (for logging); lines that were skipped as
+    malformed are appended to `problems` as "<file>: строка N: ..." without their content.
     """
     loaded: list[str] = []
     seen: set[str] = set()
@@ -49,11 +73,15 @@ def load_env_files(directories, *, filename: str = ".env") -> list[str]:
         try:
             if not path.is_file():
                 continue
-            text = path.read_text(encoding="utf-8", errors="replace")
+            text = path.read_text(encoding="utf-8-sig", errors="replace")
         except OSError:
             continue
+        file_problems: list[str] = []
+        parsed = _parse_env_text(text, file_problems)
+        if problems is not None:
+            problems.extend(f"{path}: {problem}" for problem in file_problems)
         applied = False
-        for key, value in _parse_env_text(text).items():
+        for key, value in parsed.items():
             if key not in os.environ:
                 os.environ[key] = value
                 applied = True
