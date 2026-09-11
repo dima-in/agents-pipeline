@@ -11127,7 +11127,20 @@ class WorkflowOrchestrator:
             # The run is stopped here anyway, so this is the one moment where waiting is free:
             # serve the owner's read-only questions from his phone and capture his choice.
             bridge = (self.config.get("workflow") or {}).get("operator_bridge") or {}
-            choice = self._serve_operator_commands(int(bridge.get("command_window_seconds") or 0))
+            choice = ""
+            try:
+                choice = self._serve_operator_commands(int(bridge.get("command_window_seconds") or 0))
+            finally:
+                # The chat marks this run "waiting for an answer" from the needs_human blocker
+                # until a done event with the SAME run_id; without it the mark lingers up to a day
+                # and the buttons promise a listener that is already gone. Sent even on Ctrl+C.
+                self.operator_reporter.send(
+                    "done",
+                    f"Оператор выбрал: {choice}. Выбор записан; прогон остановлен."
+                    if choice
+                    else "Окно ответа закрыто без выбора; прогон остановлен.",
+                    task=task_ref,
+                )
             if choice:
                 self._operator_answer = choice
                 self.logger.info(f"Оператор выбрал: {choice}")

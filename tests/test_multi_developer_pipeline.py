@@ -546,6 +546,71 @@ def test_serve_operator_commands_is_skipped_when_the_bridge_is_off(tmp_path) -> 
     assert orchestrator._serve_operator_commands(0) == ""
 
 
+def _escalation_ready_orchestrator(tmp_path, reporter):
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator.logger = types.SimpleNamespace(
+        _translate_status=lambda status: status,
+        operator_box=lambda *args, **kwargs: None,
+        info=lambda *args, **kwargs: None,
+    )
+    orchestrator.config = {"workflow": {"mode": "auto", "operator_bridge": {"command_window_seconds": 60}}}
+    orchestrator._attempt_blockers = ["qa_failed"]
+    orchestrator._selected_implementation_item = {"id": "TASK-003", "title": "Assistant endpoint"}
+    orchestrator._operator_reporter = reporter
+    return orchestrator
+
+
+def test_escalation_releases_the_waiting_mark_with_done_on_the_same_run(tmp_path) -> None:
+    # The chat marks a run "waiting for an answer" from its needs_human blocker until a done
+    # event with the SAME run_id — without it the mark lingers up to a day and the buttons promise
+    # a listener that is already gone. Uses the real reporter so the run_id is the real one.
+    from workflow.operator_reporter import OperatorReporter
+
+    reporter = OperatorReporter(url="", project="github.com-dima-in-oil", run_id="run_now")
+    orchestrator = _escalation_ready_orchestrator(tmp_path, reporter)
+
+    orchestrator._emit_supervisor_escalation("TASK-003", "qa_failed", 3, 3)
+
+    assert [event["kind"] for event in reporter.sent] == ["blocker", "done"]
+    blocker, done = reporter.sent
+    assert blocker["needs_human"] is True
+    assert done["run_id"] == blocker["run_id"] == "run_now"
+    assert done["task"] == blocker["task"] == "TASK-003"
+    assert done["needs_human"] is False
+
+
+def test_escalation_done_event_reports_the_owner_choice(tmp_path) -> None:
+    reporter = _FakeReporter(
+        [[{"id": "a1", "cmd": "answer", "args": {"run_id": "run_now", "choice": "Пропустить задачу."}}]],
+        run_id="run_now",
+    )
+    orchestrator = _escalation_ready_orchestrator(tmp_path, reporter)
+
+    orchestrator._emit_supervisor_escalation("TASK-003", "qa_failed", 3, 3)
+
+    assert [event["kind"] for event in reporter.sent] == ["blocker", "done"]
+    assert "Пропустить задачу." in reporter.sent[1]["text"]
+    assert orchestrator._operator_answer == "Пропустить задачу."
+
+
+def test_escalation_sends_done_even_when_the_wait_is_interrupted(tmp_path) -> None:
+    # Ctrl+C in the middle of the command window must still release the chat's waiting mark.
+    import pytest
+
+    reporter = _FakeReporter([], run_id="run_now")
+    orchestrator = _escalation_ready_orchestrator(tmp_path, reporter)
+
+    def interrupted(seconds):
+        raise KeyboardInterrupt
+
+    orchestrator._serve_operator_commands = interrupted
+
+    with pytest.raises(KeyboardInterrupt):
+        orchestrator._emit_supervisor_escalation("TASK-003", "qa_failed", 3, 3)
+
+    assert [event["kind"] for event in reporter.sent] == ["blocker", "done"]
+
+
 def test_selection_skips_task_whose_dependencies_are_not_done() -> None:
     # The exact Oil backlog that forced manual reordering: TASK-003 is the endpoint that
     # orchestrates TASK-004/005, but it is numbered before them. With depends_on honoured,
