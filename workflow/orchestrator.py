@@ -11176,7 +11176,14 @@ class WorkflowOrchestrator:
             for command in reporter.poll_commands(wait=int(min(25, max(1, remaining)))):
                 name = str(command.get("cmd") or "").strip().lower()
                 if name == "answer":
-                    choice = str((command.get("args") or {}).get("choice") or "").strip()
+                    args = command.get("args") if isinstance(command.get("args"), dict) else {}
+                    choice = str(args.get("choice") or "").strip()
+                    answered_run = str(args.get("run_id") or "").strip()
+                    # Commands are delivered exactly once and QUEUE while nobody polls, so a choice
+                    # made for an OLD run's blocker can surface in a later run's window. Applying
+                    # it would act on a decision the owner never made for this blocker.
+                    if answered_run and reporter.run_id and answered_run != reporter.run_id:
+                        continue
                     if choice:
                         return choice
                     continue

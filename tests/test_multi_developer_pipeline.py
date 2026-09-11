@@ -452,8 +452,9 @@ def test_duplicate_definition_findings_flags_duplicate_defs(tmp_path) -> None:
 class _FakeReporter:
     """Stands in for the outbound bridge: scripted polls, recorded sends."""
 
-    def __init__(self, polls):
+    def __init__(self, polls, run_id=""):
         self.enabled = True
+        self.run_id = run_id
         self.polls = list(polls)
         self.sent = []
 
@@ -463,6 +464,21 @@ class _FakeReporter:
     def send(self, kind, text, *, task="", needs_human=False, options=None, reply_to=""):
         self.sent.append({"kind": kind, "text": text, "task": task, "reply_to": reply_to})
         return True
+
+
+def test_serve_operator_commands_ignores_an_answer_left_over_from_another_run(tmp_path) -> None:
+    # Commands queue while nobody polls and are delivered exactly once, so a choice made for an
+    # OLD run's blocker surfaces in a later run's window. It must be skipped, not applied.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator._operator_reporter = _FakeReporter(
+        [
+            [{"id": "old", "cmd": "answer", "args": {"run_id": "run_old", "choice": "Пропустить задачу."}}],
+            [{"id": "new", "cmd": "answer", "args": {"run_id": "run_now", "choice": "Доделать вручную."}}],
+        ],
+        run_id="run_now",
+    )
+
+    assert orchestrator._serve_operator_commands(60) == "Доделать вручную."
 
 
 def test_operator_command_answer_renders_backlog_state(tmp_path) -> None:
