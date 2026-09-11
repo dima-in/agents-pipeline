@@ -11219,25 +11219,56 @@ class WorkflowOrchestrator:
         except Exception:
             pass
 
+    @staticmethod
+    def _markdown_fence(content: str, language: str = "") -> str:
+        """Fence `content` as a markdown code block that its own backticks cannot close early
+        (a diff of a markdown file contains ``` itself): the fence outgrows the longest run."""
+        longest = max((len(run) for run in re.findall(r"`+", content)), default=0)
+        fence = "`" * max(3, longest + 1)
+        return f"{fence}{language}\n{content.rstrip()}\n{fence}"
+
+    @staticmethod
+    def _markdown_inline(text: str) -> str:
+        """Escape what would turn a plain title into emphasis, code or a link."""
+        return re.sub(r"([\\`*_\[\]])", r"\\\1", text)
+
     def _operator_command_answer(self, cmd: str, args: dict[str, Any] | None = None) -> str:
-        """Text answer to one READ-ONLY operator command. Never raises, never changes run state."""
+        """Markdown answer to one READ-ONLY operator command. Never raises, never changes run state.
+
+        The chat renders replies with ReactMarkdown and no remark-breaks, i.e. CommonMark: a lone
+        newline inside a paragraph collapses into a space. So the structure is spelled out in
+        markdown — a fenced ```diff block, a list for tasks, blank-line paragraphs for a diagnosis.
+        """
         command = str(cmd or "").strip().lower()
         try:
             if command == "diff":
-                return self._build_target_git_diff_excerpt(limit=1800) or "Изменений в рабочем дереве нет."
+                diff = self._build_target_git_diff_excerpt(limit=3500) or ""
+                return self._markdown_fence(diff, "diff") if diff.strip() else "Изменений в рабочем дереве нет."
             if command == "diagnosis":
-                return str(getattr(self, "_last_supervisor_diagnosis", "") or "").strip() or "Диагноза пока нет."
+                diagnosis = str(getattr(self, "_last_supervisor_diagnosis", "") or "").strip()
+                if not diagnosis:
+                    return "Диагноза пока нет."
+                paragraphs = []
+                for line in diagnosis.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    label, separator, rest = line.partition(":")
+                    short_label = separator and 0 < len(label.strip()) <= 30
+                    paragraphs.append(f"**{label.strip()}:** {rest.strip()}" if short_label else line)
+                return "\n\n".join(paragraphs)
             if command == "cost":
                 totals = self.logger.get_run_totals()
-                return f"Стоимость прогона: {self._format_cost(totals.get('estimated_cost_usd'))}"
+                return f"**Стоимость прогона:** {self._format_cost(totals.get('estimated_cost_usd'))}"
             if command == "tasks":
                 completed = set(self._completed_implementation_task_ids())
-                selected = str((self._selected_implementation_item or {}).get("id") or "")
+                selected = str((getattr(self, "_selected_implementation_item", None) or {}).get("id") or "")
                 lines = []
                 for task in self._load_canonical_implementation_backlog():
                     task_id = str(task.get("id") or "")
                     state = "готово" if task_id in completed else ("сейчас" if task_id == selected else "ждёт")
-                    lines.append(f"{task_id} [{state}] {str(task.get('title') or '')[:60]}")
+                    title = self._markdown_inline(str(task.get("title") or "")[:60])
+                    lines.append(f"- {task_id}: {state} — {title}" if title else f"- {task_id}: {state}")
                 return "\n".join(lines) or "Бэклог пуст."
         except Exception as exc:  # an introspection answer must never break the run
             return f"Не смог собрать ответ: {exc}"

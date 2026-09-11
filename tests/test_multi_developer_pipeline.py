@@ -504,26 +504,55 @@ def test_serve_operator_commands_does_not_answer_a_read_command_from_another_run
     assert orchestrator._serve_operator_commands(60) == "Пропустить задачу."
 
     stale, fresh = reporter.sent
-    assert stale["reply_to"] == "c-old" and "Диагноз: текущий прогон" not in stale["text"]
-    assert fresh["reply_to"] == "c-now" and "Диагноз: текущий прогон" in fresh["text"]
+    assert stale["reply_to"] == "c-old" and "текущий прогон" not in stale["text"]
+    assert fresh["reply_to"] == "c-now" and "текущий прогон" in fresh["text"]
     assert fresh["task"] == "TASK-003"
 
 
-def test_operator_command_answer_renders_backlog_state(tmp_path) -> None:
+def test_operator_command_answer_renders_backlog_state_as_a_markdown_list(tmp_path) -> None:
+    # One list item per task: in CommonMark plain lines would collapse into a single paragraph.
     orchestrator = make_orchestrator_with_workspace(tmp_path)
     orchestrator._completed_implementation_task_ids = lambda: ["TASK-001"]
     orchestrator._selected_implementation_item = {"id": "TASK-003"}
     orchestrator._load_canonical_implementation_backlog = lambda: [
         {"id": "TASK-001", "title": "SQL validator"},
         {"id": "TASK-003", "title": "Assistant endpoint"},
-        {"id": "TASK-004", "title": "LLM SQL generation"},
+        {"id": "TASK-004", "title": "Add get_database_schema"},
     ]
 
     answer = orchestrator._operator_command_answer("tasks")
 
-    assert "TASK-001 [готово]" in answer
-    assert "TASK-003 [сейчас]" in answer
-    assert "TASK-004 [ждёт]" in answer
+    assert answer.splitlines() == [
+        "- TASK-001: готово — SQL validator",
+        "- TASK-003: сейчас — Assistant endpoint",
+        # Escaped, so the underscores render literally instead of as emphasis.
+        "- TASK-004: ждёт — Add get\\_database\\_schema",
+    ]
+
+
+def test_operator_diff_answer_is_a_fenced_diff_block(tmp_path) -> None:
+    # A fenced ```diff block is monospace with +/- highlighting in the chat. A diff that itself
+    # contains ``` (e.g. of a markdown file) must not close the fence early.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+
+    orchestrator._build_target_git_diff_excerpt = lambda limit=0: "+ added\n- removed\n"
+    assert orchestrator._operator_command_answer("diff") == "```diff\n+ added\n- removed\n```"
+
+    orchestrator._build_target_git_diff_excerpt = lambda limit=0: "+ ```js\n+ x = 1"
+    fenced = orchestrator._operator_command_answer("diff")
+    assert fenced.startswith("````diff\n") and fenced.endswith("\n````")
+
+    orchestrator._build_target_git_diff_excerpt = lambda limit=0: ""
+    assert orchestrator._operator_command_answer("diff") == "Изменений в рабочем дереве нет."
+
+
+def test_operator_diagnosis_answer_is_markdown_paragraphs(tmp_path) -> None:
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator._last_supervisor_diagnosis = "Диагноз: QA прав — нет теста\nРекомендация: добавить тест\n"
+
+    assert orchestrator._operator_command_answer("diagnosis") == (
+        "**Диагноз:** QA прав — нет теста\n\n**Рекомендация:** добавить тест"
+    )
 
 
 def test_operator_command_answer_never_raises(tmp_path) -> None:

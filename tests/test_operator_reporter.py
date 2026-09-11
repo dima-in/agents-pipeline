@@ -135,6 +135,25 @@ def test_reply_to_is_attached_only_when_answering_a_command() -> None:
     assert "reply_to" not in reporter.build_event("status", "x", reply_to="   ")
 
 
+def test_command_answers_keep_their_markdown_other_events_stay_one_line() -> None:
+    # The chat renders replies as markdown, so a reply's newlines ARE its structure (a ```diff
+    # fence, a task list) — and leading indentation is meaningful in a diff. A blocker or a run
+    # summary is still read at a glance: one line.
+    reporter = make_reporter()
+
+    reply = reporter.build_event("status", "\n```diff\n+ added\n context  \n- removed\n```\n\n", reply_to="cmd-1")
+    assert reply["text"] == "```diff\n+ added\n context\n- removed\n```"
+
+    assert reporter.build_event("status", "line one\nline two")["text"] == "line one line two"
+
+
+def test_command_answers_stay_under_the_chat_limit() -> None:
+    # The chat caps an event at 8000 characters.
+    reply = make_reporter().build_event("status", "x" * 20000, reply_to="cmd-1")
+
+    assert len(reply["text"]) <= 8000
+
+
 def test_commands_url_defaults_to_the_events_sibling() -> None:
     assert make_reporter().commands_url == "https://example.invalid/api/pipeline/commands"
     assert make_reporter(commands_url="https://other/cmds").commands_url == "https://other/cmds"

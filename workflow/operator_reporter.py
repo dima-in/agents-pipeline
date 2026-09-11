@@ -23,6 +23,8 @@ from typing import Any
 
 EVENT_KINDS = ("status", "blocker", "done")
 _MAX_RECORDED_EVENTS = 50
+# The chat caps an event at 8000 characters; keep a margin so a fence is never cut mid-way.
+_MAX_REPLY_CHARS = 7000
 
 
 class OperatorReporter:
@@ -80,19 +82,33 @@ class OperatorReporter:
         options: list[str] | None = None,
         reply_to: str = "",
     ) -> dict[str, Any]:
+        reply_to = str(reply_to or "").strip()
+        if reply_to:
+            # An answer to an operator command is MARKDOWN — the chat renders it with ReactMarkdown —
+            # so its newlines are its structure (a ```diff fence, a task list) and must survive.
+            # Only trailing blanks go; leading indentation stays, it is meaningful in a diff.
+            lines = [line.rstrip() for line in str(text or "").splitlines()]
+            while lines and not lines[0]:
+                lines.pop(0)
+            while lines and not lines[-1]:
+                lines.pop()
+            body = "\n".join(lines)[:_MAX_REPLY_CHARS]
+        else:
+            # A blocker or a run summary is read at a glance: one line.
+            body = " ".join(str(text or "").split())[:2000]
         event = {
             "run_id": self.run_id,
             "project": self.project,
             "task": str(task or ""),
             "kind": kind if kind in EVENT_KINDS else "status",
-            "text": " ".join(str(text or "").split())[:2000],
+            "text": body,
             "needs_human": bool(needs_human),
             "options": [str(option).strip() for option in (options or []) if str(option).strip()][:6],
         }
         # The answer to a read command travels as an ordinary status event tagged with the command
         # id, so neither side needs a second endpoint (the chat threads it back to the question).
-        if str(reply_to or "").strip():
-            event["reply_to"] = str(reply_to).strip()
+        if reply_to:
+            event["reply_to"] = reply_to
         return event
 
     def send(
