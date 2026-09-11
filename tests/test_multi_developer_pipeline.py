@@ -470,15 +470,43 @@ def test_serve_operator_commands_ignores_an_answer_left_over_from_another_run(tm
     # Commands queue while nobody polls and are delivered exactly once, so a choice made for an
     # OLD run's blocker surfaces in a later run's window. It must be skipped, not applied.
     orchestrator = make_orchestrator_with_workspace(tmp_path)
-    orchestrator._operator_reporter = _FakeReporter(
+    reporter = _FakeReporter(
         [
             [{"id": "old", "cmd": "answer", "args": {"run_id": "run_old", "choice": "Пропустить задачу."}}],
             [{"id": "new", "cmd": "answer", "args": {"run_id": "run_now", "choice": "Доделать вручную."}}],
         ],
         run_id="run_now",
     )
+    orchestrator._operator_reporter = reporter
 
     assert orchestrator._serve_operator_commands(60) == "Доделать вручную."
+    # ...but not silently: the owner's stale button gets a threaded "not applied" reply.
+    assert [event["reply_to"] for event in reporter.sent] == ["old"]
+    assert "run_old" in reporter.sent[0]["text"] and "не выполняю" in reporter.sent[0]["text"]
+
+
+def test_serve_operator_commands_does_not_answer_a_read_command_from_another_run(tmp_path) -> None:
+    # The chat stamps every command with the run it was issued for. Answering an OLD run's
+    # "diagnosis" with THIS run's state would thread fresh data under a stale question.
+    orchestrator = make_orchestrator_with_workspace(tmp_path)
+    orchestrator._selected_implementation_item = {"id": "TASK-003"}
+    orchestrator._last_supervisor_diagnosis = "Диагноз: текущий прогон"
+    reporter = _FakeReporter(
+        [
+            [{"id": "c-old", "cmd": "diagnosis", "args": {"run_id": "run_old"}}],
+            [{"id": "c-now", "cmd": "diagnosis", "args": {"run_id": "run_now"}}],
+            [{"id": "a-now", "cmd": "answer", "args": {"run_id": "run_now", "choice": "Пропустить задачу."}}],
+        ],
+        run_id="run_now",
+    )
+    orchestrator._operator_reporter = reporter
+
+    assert orchestrator._serve_operator_commands(60) == "Пропустить задачу."
+
+    stale, fresh = reporter.sent
+    assert stale["reply_to"] == "c-old" and "Диагноз: текущий прогон" not in stale["text"]
+    assert fresh["reply_to"] == "c-now" and "Диагноз: текущий прогон" in fresh["text"]
+    assert fresh["task"] == "TASK-003"
 
 
 def test_operator_command_answer_renders_backlog_state(tmp_path) -> None:

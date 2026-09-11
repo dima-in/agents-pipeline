@@ -11258,25 +11258,35 @@ class WorkflowOrchestrator:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return ""
+            task = str((getattr(self, "_selected_implementation_item", None) or {}).get("id") or "")
             for command in reporter.poll_commands(wait=int(min(25, max(1, remaining)))):
                 name = str(command.get("cmd") or "").strip().lower()
+                args = command.get("args") if isinstance(command.get("args"), dict) else {}
+                command_id = str(command.get("id") or "")
+                issued_for = str(args.get("run_id") or "").strip()
+                # Commands are delivered exactly once and QUEUE while nobody polls, so one issued for
+                # an OLD run can surface in a later run's window. Applying it would act on a choice
+                # the owner never made for this blocker; answering it would thread THIS run's state
+                # under a stale question. Refuse either way — but say so, or the button goes silent.
+                if issued_for and reporter.run_id and issued_for != reporter.run_id:
+                    reporter.send(
+                        "status",
+                        f"Команда «{name[:20]}» относится к прогону {issued_for}, а ответа сейчас ждёт "
+                        f"{reporter.run_id} — не выполняю.",
+                        task=task,
+                        reply_to=command_id,
+                    )
+                    continue
                 if name == "answer":
-                    args = command.get("args") if isinstance(command.get("args"), dict) else {}
                     choice = str(args.get("choice") or "").strip()
-                    answered_run = str(args.get("run_id") or "").strip()
-                    # Commands are delivered exactly once and QUEUE while nobody polls, so a choice
-                    # made for an OLD run's blocker can surface in a later run's window. Applying
-                    # it would act on a decision the owner never made for this blocker.
-                    if answered_run and reporter.run_id and answered_run != reporter.run_id:
-                        continue
                     if choice:
                         return choice
                     continue
                 reporter.send(
                     "status",
-                    self._operator_command_answer(name, command.get("args") or {}),
-                    task=str((self._selected_implementation_item or {}).get("id") or ""),
-                    reply_to=str(command.get("id") or ""),
+                    self._operator_command_answer(name, args),
+                    task=task,
+                    reply_to=command_id,
                 )
 
     @property
